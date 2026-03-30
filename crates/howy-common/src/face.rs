@@ -8,6 +8,10 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const FACE_EMBEDDING_DIM: usize = 512;
+/// File extension for bincode model files.
+pub const MODEL_FILE_EXT: &str = "bin";
+/// Legacy file extension for JSON model files.
+pub const LEGACY_MODEL_FILE_EXT: &str = "json";
 
 /// A detected face with bounding box, landmarks, and optional embedding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,18 +88,40 @@ impl UserModels {
         }
     }
 
-    /// Load from a JSON file on disk.
+    /// Load from disk. Tries bincode (.bin) first, falls back to legacy JSON (.json).
     pub fn load(path: &std::path::Path) -> Result<Self, std::io::Error> {
-        let contents = std::fs::read_to_string(path)?;
-        let models: Self = serde_json::from_str(&contents)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        Ok(models)
+        // Try bincode first
+        if path.exists() {
+            let data = std::fs::read(path)?;
+            if let Ok(models) = bincode::deserialize::<Self>(&data) {
+                return Ok(models);
+            }
+            // If bincode fails, try JSON (legacy format or wrong extension)
+            let contents = String::from_utf8(data)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let models: Self = serde_json::from_str(&contents)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            return Ok(models);
+        }
+
+        // Try legacy JSON path (swap extension)
+        let json_path = path.with_extension(LEGACY_MODEL_FILE_EXT);
+        if json_path.exists() {
+            let contents = std::fs::read_to_string(&json_path)?;
+            let models: Self = serde_json::from_str(&contents)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            return Ok(models);
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("model file not found: {}", path.display()),
+        ))
     }
 
-    /// Save to a JSON file on disk.
+    /// Save to disk using bincode format (atomic write via temp file + rename).
     pub fn save(&self, path: &Path) -> Result<(), std::io::Error> {
-        let contents = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let data = bincode::serialize(self).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 
         let parent = path.parent().ok_or_else(|| {
             Error::new(
@@ -125,7 +151,7 @@ impl UserModels {
             .create_new(true)
             .open(&tmp_path)?;
         file.set_permissions(Permissions::from_mode(0o600))?;
-        file.write_all(contents.as_bytes())?;
+        file.write_all(&data)?;
         file.sync_all()?;
         drop(file);
 

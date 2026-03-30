@@ -5,8 +5,14 @@ use std::path::{Path, PathBuf};
 /// Runtime directory (created by systemd or manually).
 pub const RUNTIME_DIR: &str = "/run/howy";
 
-/// Unix domain socket path for daemon IPC.
+/// Default Unix domain socket path for daemon IPC.
 pub const SOCKET_PATH: &str = "/run/howy/howy.sock";
+
+/// Effective socket path: honors `HOWY_SOCKET` env override for development,
+/// falls back to the default production path.
+pub fn socket_path() -> String {
+    std::env::var("HOWY_SOCKET").unwrap_or_else(|_| SOCKET_PATH.to_string())
+}
 
 /// System configuration directory.
 pub const CONFIG_DIR: &str = "/etc/howy";
@@ -38,6 +44,11 @@ pub fn validate_username(username: &str) -> bool {
 
 /// User face model file for a given username.
 pub fn user_model_path(username: &str) -> Option<PathBuf> {
+    validate_username(username).then(|| Path::new(MODELS_DIR).join(format!("{username}.bin")))
+}
+
+/// Legacy JSON model path (for migration fallback).
+pub fn user_model_path_legacy(username: &str) -> Option<PathBuf> {
     validate_username(username).then(|| Path::new(MODELS_DIR).join(format!("{username}.json")))
 }
 

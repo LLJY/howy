@@ -173,6 +173,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.65.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -598,6 +607,7 @@ name = "howy-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "clap",
  "howy-common",
  "libc",
@@ -613,6 +623,7 @@ dependencies = [
 name = "howy-common"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "linux-keyutils",
  "ndarray",
  "prost",
@@ -629,6 +640,7 @@ name = "howy-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "hex",
  "howy-common",
  "image",
