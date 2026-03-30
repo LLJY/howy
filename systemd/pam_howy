@@ -1,0 +1,22 @@
+# SAFE INTEGRATION EXAMPLE ONLY.
+#
+# DO NOT copy this file over a real PAM service file in /etc/pam.d/.
+# PAM stacks are service-specific and normally contain multiple auth/account/
+# session/password rules. Replacing a full file with a single howy rule can
+# lock you out of the system.
+#
+# Instead, insert the following line into an EXISTING PAM stack:
+#
+#   auth    sufficient    pam_howy.so
+#
+# Example: /etc/pam.d/sudo
+#   # Insert before the distro's normal password auth include.
+#   auth    sufficient    pam_howy.so
+#   @include common-auth
+#
+# Example: /etc/pam.d/system-auth or another distro auth stack
+#   auth    sufficient    pam_howy.so
+#   auth    include       system-auth
+#
+# Keep the rest of the PAM file unchanged so password fallback and account/
+# session handling still work.

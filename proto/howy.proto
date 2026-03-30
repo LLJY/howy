@@ -1,0 +1,179 @@
+// howy IPC protocol
+//
+// Wire format: 4-byte big-endian length prefix + serialized protobuf.
+// Transport: Unix domain socket at /run/howy/howy.sock
+//
+// This file is the single source of truth for all IPC between:
+//   - howyd   (daemon)
+//   - pam_howy.so (PAM module)
+//   - howy    (CLI tool)
+
+syntax = "proto3";
+package howy;
+
+// ============================================================
+// Top-level envelope messages
+// ============================================================
+
+// Client → Daemon request.
+message Request {
+  oneof cmd {
+    AuthenticateReq   authenticate       = 1;
+    EnrollReq         enroll             = 2;
+    DetectReq         detect             = 3;
+    PingReq           ping               = 4;
+    InfoReq           info               = 5;
+    ShutdownReq       shutdown           = 6;
+    CheckCredentialReq  check_credential = 7;
+    RevokeCredentialReq revoke_credential = 8;
+  }
+}
+
+// Daemon → Client response.
+message Response {
+  oneof result {
+    AuthSuccess         success            = 1;
+    AuthFailed          auth_failed        = 2;
+    EnrollSuccess       enrolled           = 3;
+    DetectResult        detected           = 4;
+    Pong                pong               = 5;
+    DaemonInfo          info               = 6;
+    CredentialValid     credential_valid   = 7;
+    CredentialInvalid   credential_invalid = 8;
+    Error               error              = 9;
+  }
+}
+
+// ============================================================
+// Request messages
+// ============================================================
+
+// Authenticate a user via face recognition.
+// The daemon captures frames, detects faces, and matches
+// against stored models for the given user.
+message AuthenticateReq {
+  string username = 1;
+  // Timeout override in seconds. 0 = use daemon config default.
+  uint32 timeout  = 2;
+}
+
+// Enroll a new face model for a user.
+// The daemon captures frames and returns the best face embedding.
+message EnrollReq {
+  string username = 1;
+  // Human-readable label (e.g. "laptop IR", "office webcam").
+  string label    = 2;
+}
+
+// Detect faces in a single raw frame (for testing/preview).
+message DetectReq {
+  // Raw BGR pixel data.
+  bytes  frame   = 1;
+  // Frame height in pixels.
+  uint32 height  = 2;
+  // Frame width in pixels.
+  uint32 width   = 3;
+}
+
+// Health check.
+message PingReq {}
+
+// Request daemon status info.
+message InfoReq {}
+
+// Request graceful shutdown (requires root).
+message ShutdownReq {}
+
+// Check if a cached credential is valid for a user.
+message CheckCredentialReq {
+  string username   = 1;
+}
+
+// Revoke a cached credential for a user session.
+message RevokeCredentialReq {
+  string username   = 1;
+  string session_id = 2;
+}
+
+// ============================================================
+// Response messages
+// ============================================================
+
+// Authentication succeeded.
+message AuthSuccess {
+  // Index of the matched face model.
+  uint32 model_index = 1;
+  // Model label.
+  string model_label = 2;
+  // Cosine similarity score.
+  float  score       = 3;
+  // Total recognition time in milliseconds.
+  double elapsed_ms  = 4;
+}
+
+// Authentication failed (timeout or no match).
+message AuthFailed {
+  // Best similarity score achieved (below threshold).
+  float  best_score       = 1;
+  // Number of camera frames processed.
+  uint32 frames_processed = 2;
+  // Human-readable failure reason.
+  string reason           = 3;
+}
+
+// Face enrollment succeeded.
+message EnrollSuccess {
+  // The 512-dimensional ArcFace embedding.
+  repeated float embedding = 1;
+  // Face detection confidence score.
+  float det_score          = 2;
+}
+
+// Face detection result (for testing).
+message DetectResult {
+  repeated DetectedFace faces = 1;
+  double elapsed_ms           = 2;
+}
+
+// A single detected face.
+message DetectedFace {
+  // Bounding box: x1, y1, x2, y2 in pixels.
+  int32 x1 = 1;
+  int32 y1 = 2;
+  int32 x2 = 3;
+  int32 y2 = 4;
+  // 5-point landmarks: [lx0,ly0, lx1,ly1, ..., lx4,ly4].
+  repeated float landmarks = 5;
+  // Detection confidence.
+  float score = 6;
+  // Face embedding (populated only if requested).
+  repeated float embedding = 7;
+}
+
+// Pong response to health check.
+message Pong {}
+
+// Daemon status information.
+message DaemonInfo {
+  // Active execution provider name.
+  string provider        = 1;
+  // Path to the face detector ONNX model.
+  string detector_model  = 2;
+  // Path to the face recognizer ONNX model.
+  string recognizer_model = 3;
+  // Embedding dimensionality (512 for ArcFace).
+  uint32 embedding_dim   = 4;
+  // Daemon uptime in seconds.
+  uint64 uptime_secs     = 5;
+}
+
+// Cached credential is valid — face scan can be skipped.
+message CredentialValid {}
+
+// Cached credential is not valid or not found.
+message CredentialInvalid {}
+
+// Error response.
+message Error {
+  string message = 1;
+}

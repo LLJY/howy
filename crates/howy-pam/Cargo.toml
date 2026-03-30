@@ -1,0 +1,16 @@
+[package]
+name = "howy-pam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PAM module for howy face authentication"
+
+[lib]
+name = "pam_howy"
+crate-type = ["cdylib"]
+
+[dependencies]
+howy-common = { path = "../howy-common" }
+libc = { workspace = true }
+prost = { workspace = true }
+tracing = { workspace = true }

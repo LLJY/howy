@@ -1,0 +1,73 @@
+[package]
+name = "howy-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Face recognition daemon for howy — preloads SCRFD + ArcFace models"
+
+[lib]
+name = "howy_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "howyd"
+path = "src/main.rs"
+
+[[bin]]
+name = "smoke_test"
+path = "../../tests/smoke_test.rs"
+
+[[bin]]
+name = "real_face_test"
+path = "../../tests/real_face_test.rs"
+
+[[bin]]
+name = "debug_scrfd"
+path = "../../tests/debug_scrfd.rs"
+
+[[bin]]
+name = "camera_read_test"
+path = "../../tests/camera_read_test.rs"
+
+[[bin]]
+name = "capture_bench"
+path = "../../tests/capture_bench.rs"
+
+[dependencies]
+howy-common = { path = "../howy-common" }
+
+# Inference
+ort = { workspace = true }
+ndarray = { workspace = true }
+
+# Image processing
+image = { workspace = true }
+
+# Camera
+v4l = { workspace = true }
+opencv = { workspace = true }
+
+# System
+nix = { workspace = true }
+libc = { workspace = true }
+
+# Daemon runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Credential caching
+linux-keyutils = { workspace = true }
+
+# Hex encoding for frame data
+hex = "0.4"

@@ -1,0 +1,51 @@
+# Build artifacts
+/target/
+/build/
+/dist/
+
+# ONNX models (large binaries, downloaded separately)
+/models/
+*.onnx
+*.mxr
+
+# Legacy howdy source (reference only, not part of howy)
+/howdy/
+
+# Legacy exploration scripts & specs
+build_complete.sh
+build_full_bundle.sh
+build_minimal.sh
+build_native.sh
+build_standalone.sh
+docker_test.sh
+setup_venv.sh
+*.spec
+
+# Legacy test scripts (Python)
+test_auth.py
+test_backend.py
+test_camera.py
+test_ir.py
+
+# Legacy planning docs (superseded by docs/)
+DLIB_REPLACEMENT_PLAN.md
+ROCM_SETUP.md
+TEST_PLAN.md
+TEST_PLAN_INTEGRATED.md
+
+# Legacy systemd unit from howdy exploration
+howdy-daemon.service
+
+# Logs
+*.log
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

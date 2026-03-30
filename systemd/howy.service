@@ -1,0 +1,60 @@
+[Unit]
+Description=howy Face Authentication Daemon
+Documentation=https://github.com/howy/howy
+After=network.target
+Requires=howy.socket
+
+[Service]
+Type=simple
+# Installed by scripts/install-local.sh for local machine testing.
+# ExecStart assumes the binary has been copied to /usr/bin/howyd.
+ExecStart=/usr/bin/howyd
+Restart=on-failure
+RestartSec=5
+
+# Systemd credentials: encrypted config and model keys
+# Uncomment the following lines ONLY after provisioning encrypted credentials:
+#   systemd-creds encrypt --name=howy.config /etc/howy/config.toml /etc/credstore.encrypted/howy.config
+# LoadCredentialEncrypted=howy.config
+# ImportCredential=howy.*
+
+# Environment
+Environment="RUST_LOG=info"
+# Best-effort ROCm compatibility override for gfx1103 / Radeon 780M.
+# If GPU startup remains unstable on this host, howyd will continue to fall back to CPU.
+Environment="HSA_OVERRIDE_GFX_VERSION=11.0.2"
+# MIGraphX writes compiled .mxr files here. Treat them as persistent cache, not
+# immutable artifacts: clear /var/cache/howy/*.mxr after model, ORT, ROCm/MIGraphX,
+# or GPU-arch changes when you need a fresh compile.
+Environment="ORT_MIGRAPHX_MODEL_CACHE_PATH=/var/cache/howy"
+Environment="ORT_MIGRAPHX_CACHE_PATH=/var/cache/howy"
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/cache/howy /run/howy /etc/howy/models /var/log/howy
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX
+MemoryDenyWriteExecute=no
+LockPersonality=yes
+UMask=0077
+
+# Camera access: local-test install assumes /etc/howy/config.toml uses /dev/video2.
+# If you change the configured camera node, update DeviceAllow to match exactly.
+# MIGraphX/ROCm also needs access to /dev/kfd and the render node.
+SupplementaryGroups=video render
+DeviceAllow=/dev/video2 rw
+DeviceAllow=/dev/kfd rw
+DeviceAllow=/dev/dri/renderD128 rw
+
+# Allow kernel keyring access for credential caching
+KeyringMode=shared
+
+[Install]
+WantedBy=multi-user.target

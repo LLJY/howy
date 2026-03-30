@@ -1,0 +1,17 @@
+[Unit]
+Description=howy Face Authentication Socket
+Documentation=https://github.com/howy/howy
+
+[Socket]
+# Installed by scripts/install-local.sh for local machine testing.
+# The daemon, CLI, and PAM module all expect this installed socket path.
+ListenStream=/run/howy/howy.sock
+# World-accessible socket. The daemon validates all requests server-side.
+# This is required so non-root PAM callers (e.g. Plasma lock screen,
+# kscreenlocker) can connect — they run as the session user, not root.
+SocketMode=0666
+DirectoryMode=0755
+RuntimeDirectory=howy
+
+[Install]
+WantedBy=sockets.target
