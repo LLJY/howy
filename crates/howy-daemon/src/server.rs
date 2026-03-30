@@ -44,26 +44,27 @@ pub async fn run(engine: Arc<InferenceEngine>, config: HowyConfig) -> Result<()>
             listener
         }
         None => {
-            // Manual socket creation
-            let socket_path = paths::SOCKET_PATH;
+            // Manual socket creation — honors HOWY_SOCKET override.
+            let socket_path = paths::socket_path();
 
-            // Ensure runtime directory exists
-            let runtime_dir = Path::new(paths::RUNTIME_DIR);
-            if !runtime_dir.exists() {
-                std::fs::create_dir_all(runtime_dir)
-                    .context("failed to create runtime directory")?;
+            // Ensure parent directory exists
+            if let Some(parent) = Path::new(&socket_path).parent() {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)
+                        .context("failed to create runtime directory")?;
+                }
             }
 
             // Remove stale socket
-            if Path::new(socket_path).exists() {
-                std::fs::remove_file(socket_path)?;
+            if Path::new(&socket_path).exists() {
+                std::fs::remove_file(&socket_path)?;
             }
 
-            let listener = UnixListener::bind(socket_path)
+            let listener = UnixListener::bind(&socket_path)
                 .context("failed to bind Unix socket")?;
 
             // Allow all users to connect (PAM runs as various users)
-            set_socket_permissions(socket_path)?;
+            set_socket_permissions(&socket_path)?;
 
             info!("Listening on {socket_path}");
             listener
@@ -137,6 +138,15 @@ fn handle_connection(
                 Response::error("permission denied")
             } else {
                 handle_enroll(engine, config, camera_lock, &req.username, &req.label)
+            }
+        }
+        Some(Cmd::EnrollBatch(req)) => {
+            if !is_valid_username(&req.username) {
+                Response::error("invalid username")
+            } else if peer_uid != Some(0) {
+                Response::error("permission denied")
+            } else {
+                handle_enroll_batch(engine, &req.username, &req.session_dir, &req.label)
             }
         }
         Some(Cmd::Detect(req)) => {
@@ -472,6 +482,232 @@ fn handle_enroll(
     }
 }
 
+/// Handle a batch enrollment request.
+///
+/// For each image in the session directory:
+/// 1. Load image and decode to BGR
+/// 2. Run SCRFD face detection
+/// 3. If exactly one face with score > 0.5: compute embedding, append to user models
+/// 4. If no face or multiple faces: record rejection
+/// 5. Save updated models to disk
+fn handle_enroll_batch(
+    engine: &InferenceEngine,
+    username: &str,
+    session_dir: &str,
+    label: &str,
+) -> Response {
+    if !is_valid_username(username) {
+        return Response::error("invalid username");
+    }
+
+    let dir = std::path::Path::new(session_dir);
+    if !dir.is_dir() {
+        return Response::error(&format!("session directory not found: {session_dir}"));
+    }
+
+    let start = std::time::Instant::now();
+
+    // Collect image files, sorted by name
+    let mut image_files: Vec<std::path::PathBuf> = Vec::new();
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    match ext.to_ascii_lowercase().as_str() {
+                        "png" | "jpg" | "jpeg" | "bmp" => image_files.push(path),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            return Response::error(&format!("failed to read session directory: {e}"));
+        }
+    }
+    image_files.sort();
+
+    let frames_found = image_files.len() as u32;
+    if frames_found == 0 {
+        return Response::error("no image files found in session directory");
+    }
+
+    // Reject symlinks and non-regular files in the session directory
+    for image_path in &image_files {
+        match std::fs::symlink_metadata(image_path) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_file() => {
+                let name = image_path.file_name().unwrap_or_default().to_string_lossy();
+                return Response::error(&format!(
+                    "session directory contains non-regular file: {name}"
+                ));
+            }
+            Err(e) => {
+                let name = image_path.file_name().unwrap_or_default().to_string_lossy();
+                return Response::error(&format!("cannot stat {name}: {e}"));
+            }
+            _ => {}
+        }
+    }
+
+    // Load or create user models — fail hard on corrupt files to avoid
+    // silently overwriting existing enrollments.
+    let model_path = match paths::user_model_path(username) {
+        Some(p) => p,
+        None => return Response::error("invalid username"),
+    };
+    let mut user_models = if model_path.exists() {
+        match UserModels::load(&model_path) {
+            Ok(m) => m,
+            Err(e) => {
+                return Response::error(&format!(
+                    "failed to load existing models (refusing to overwrite): {e}"
+                ));
+            }
+        }
+    } else {
+        // Check legacy JSON path for migration
+        match paths::user_model_path_legacy(username) {
+            Some(legacy) if legacy.exists() => match UserModels::load(&legacy) {
+                Ok(m) => m,
+                Err(e) => {
+                    return Response::error(&format!(
+                        "failed to load legacy models (refusing to overwrite): {e}"
+                    ));
+                }
+            },
+            _ => UserModels::new(username),
+        }
+    };
+
+    let mut frames_accepted = 0u32;
+    let mut frames_rejected = 0u32;
+    let mut rejection_details: Vec<String> = Vec::new();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    for image_path in &image_files {
+        let file_name = image_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        // Load and decode image to BGR
+        let bgr_result = load_image_as_bgr(image_path);
+        let (bgr_data, width, height) = match bgr_result {
+            Ok(data) => data,
+            Err(e) => {
+                frames_rejected += 1;
+                rejection_details.push(format!("{file_name}: failed to load: {e}"));
+                continue;
+            }
+        };
+
+        // Detect faces
+        let faces = match engine.analyze(&bgr_data, width, height) {
+            Ok(f) => f,
+            Err(e) => {
+                frames_rejected += 1;
+                rejection_details.push(format!("{file_name}: detection error: {e}"));
+                continue;
+            }
+        };
+
+        if faces.is_empty() {
+            frames_rejected += 1;
+            rejection_details.push(format!("{file_name}: no face detected"));
+            continue;
+        }
+
+        if faces.len() > 1 {
+            frames_rejected += 1;
+            rejection_details.push(format!(
+                "{file_name}: multiple faces detected ({})",
+                faces.len()
+            ));
+            continue;
+        }
+
+        let face = &faces[0];
+        if face.score < 0.5 {
+            frames_rejected += 1;
+            rejection_details.push(format!(
+                "{file_name}: detection score too low ({:.2})",
+                face.score
+            ));
+            continue;
+        }
+
+        match &face.embedding {
+            Some(embedding) => {
+                // Validate embedding dimension and values
+                if embedding.len() != face::FACE_EMBEDDING_DIM {
+                    frames_rejected += 1;
+                    rejection_details.push(format!(
+                        "{file_name}: wrong embedding dim ({}, expected {})",
+                        embedding.len(),
+                        face::FACE_EMBEDDING_DIM
+                    ));
+                    continue;
+                }
+                if embedding.iter().any(|v| !v.is_finite()) {
+                    frames_rejected += 1;
+                    rejection_details.push(format!("{file_name}: embedding contains NaN/Inf"));
+                    continue;
+                }
+
+                user_models.models.push(face::FaceModel {
+                    label: label.to_string(),
+                    created: now,
+                    embedding: embedding.clone(),
+                });
+                frames_accepted += 1;
+                info!(
+                    username,
+                    file = %file_name,
+                    det_score = face.score,
+                    "Enrolled frame"
+                );
+            }
+            None => {
+                frames_rejected += 1;
+                rejection_details.push(format!("{file_name}: no embedding computed"));
+            }
+        }
+    }
+
+    // Save models to disk
+    if frames_accepted > 0 {
+        if let Some(parent) = model_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Response::error(&format!("failed to create models directory: {e}"));
+            }
+        }
+        if let Err(e) = user_models.save(&model_path) {
+            return Response::error(&format!("failed to save models: {e}"));
+        }
+        info!(
+            username,
+            label,
+            frames_accepted,
+            total_models = user_models.models.len(),
+            "Batch enrollment complete"
+        );
+    }
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    Response::enroll_batch_done(
+        frames_found,
+        frames_accepted,
+        frames_rejected,
+        elapsed_ms,
+        rejection_details,
+    )
+}
+
 /// Handle a detection-only request (for testing).
 fn handle_detect(
     engine: &InferenceEngine,
@@ -604,6 +840,25 @@ fn is_dark_frame(bgr_data: &[u8], threshold: f32) -> bool {
 
     let dark_pct = (dark_count as f32 / total as f32) * 100.0;
     dark_pct > threshold
+}
+
+/// Load an image file from disk and convert to BGR pixel data.
+fn load_image_as_bgr(path: &std::path::Path) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    let img = image::open(path)
+        .with_context(|| format!("failed to open image: {}", path.display()))?;
+    let rgb = img.to_rgb8();
+    let width = rgb.width();
+    let height = rgb.height();
+
+    // Convert RGB to BGR
+    let mut bgr = Vec::with_capacity((width * height * 3) as usize);
+    for pixel in rgb.pixels() {
+        bgr.push(pixel[2]);
+        bgr.push(pixel[1]);
+        bgr.push(pixel[0]);
+    }
+
+    Ok((bgr, width, height))
 }
 
 /// Try to get a listener from systemd socket activation.
