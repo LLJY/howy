@@ -26,6 +26,7 @@ message Request {
     ShutdownReq       shutdown           = 6;
     CheckCredentialReq  check_credential = 7;
     RevokeCredentialReq revoke_credential = 8;
+    EnrollBatchReq    enroll_batch       = 9;
   }
 }
 
@@ -41,6 +42,7 @@ message Response {
     CredentialValid     credential_valid   = 7;
     CredentialInvalid   credential_invalid = 8;
     Error               error              = 9;
+    EnrollBatchResult   enroll_batch_done  = 10;
   }
 }
 
@@ -93,6 +95,17 @@ message CheckCredentialReq {
 message RevokeCredentialReq {
   string username   = 1;
   string session_id = 2;
+}
+
+// Process a batch of enrollment frames from a session directory.
+// The daemon reads images from the directory, detects faces, computes
+// embeddings, and returns results for each frame.
+message EnrollBatchReq {
+  string username    = 1;
+  // Path to the session directory containing frame images.
+  string session_dir = 2;
+  // Human-readable label for this enrollment session.
+  string label       = 3;
 }
 
 // ============================================================
@@ -176,4 +189,18 @@ message CredentialInvalid {}
 // Error response.
 message Error {
   string message = 1;
+}
+
+// Result of batch enrollment processing.
+message EnrollBatchResult {
+  // Number of frames found in the session directory.
+  uint32 frames_found     = 1;
+  // Number of frames where a face was detected and embedding computed.
+  uint32 frames_accepted  = 2;
+  // Number of frames rejected (no face, multiple faces, etc).
+  uint32 frames_rejected  = 3;
+  // Total processing time in milliseconds.
+  double elapsed_ms       = 4;
+  // Human-readable per-frame rejection reasons (frame_name: reason).
+  repeated string rejection_details = 5;
 }

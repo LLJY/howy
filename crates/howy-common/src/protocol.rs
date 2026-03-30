@@ -20,8 +20,9 @@ pub use pb::Response;
 // Re-export all message types.
 pub use pb::{
     AuthFailed, AuthSuccess, AuthenticateReq, CheckCredentialReq, CredentialInvalid,
-    CredentialValid, DaemonInfo, DetectReq, DetectResult, DetectedFace, EnrollReq, EnrollSuccess,
-    Error, InfoReq, PingReq, Pong, RevokeCredentialReq, ShutdownReq,
+    CredentialValid, DaemonInfo, DetectReq, DetectResult, DetectedFace, EnrollBatchReq,
+    EnrollBatchResult, EnrollReq, EnrollSuccess, Error, InfoReq, PingReq, Pong,
+    RevokeCredentialReq, ShutdownReq,
 };
 
 /// PAM exit codes (matching howdy conventions for backward compatibility).
@@ -99,6 +100,16 @@ impl Request {
             })),
         }
     }
+
+    pub fn enroll_batch(username: &str, session_dir: &str, label: &str) -> Self {
+        Self {
+            cmd: Some(Cmd::EnrollBatch(EnrollBatchReq {
+                username: username.to_string(),
+                session_dir: session_dir.to_string(),
+                label: label.to_string(),
+            })),
+        }
+    }
 }
 
 impl Response {
@@ -172,6 +183,24 @@ impl Response {
         Self {
             result: Some(RespResult::Error(Error {
                 message: message.to_string(),
+            })),
+        }
+    }
+
+    pub fn enroll_batch_done(
+        frames_found: u32,
+        frames_accepted: u32,
+        frames_rejected: u32,
+        elapsed_ms: f64,
+        rejection_details: Vec<String>,
+    ) -> Self {
+        Self {
+            result: Some(RespResult::EnrollBatchDone(EnrollBatchResult {
+                frames_found,
+                frames_accepted,
+                frames_rejected,
+                elapsed_ms,
+                rejection_details,
             })),
         }
     }
