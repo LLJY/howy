@@ -1,282 +1,151 @@
-# Enrollment Design (Post-PAM Deployment)
+# Enrollment Design
 
-This note captures the proposed direction for **guided face enrollment** now that the basic PAM path is working. It is intentionally focused on architecture and operator flow, not on implementation details yet.
+Revised design for face enrollment. Supersedes the earlier over-engineered
+version that pushed pose estimation and quality logic into the backend.
 
-## Goal
+## Principle
 
-Build a simple enrollment frontend that:
+**The backend is a dumb embedding store with a face gate.**
 
-- shows a live preview
-- guides the user through a pose sequence
-- captures multiple high-quality embeddings per user
-- allows multiple registrations per user (for natural variation over time)
-- reuses the existing howy inference backend wherever possible
+If SCRFD finds a face in an image, compute the ArcFace embedding and store it
+under the target user. That's it. No pose estimation, no quality scoring, no
+sharpness checks on the backend side. The frontend owns all enrollment UX
+intelligence.
 
-The immediate target is **pose-guided enrollment**, not a full identity-management suite.
+## Pipeline
 
-## What we want from enrollment
-
-- Ask the user to:
-  - look straight
-  - turn left
-  - turn right
-  - look up slightly
-  - look down slightly
-  - optionally continue through a smooth rotation sweep
-- Keep only frames that meet quality thresholds
-- Store **multiple embeddings per user**, not a single template
-- Allow multiple registration sessions per user, so real-world variation (glasses, hair, lighting, time) is naturally covered without special-case logic
-
-That already handles “glasses/no glasses” better than a single-template design.
-
-## Capture / inference model
-
-The UI should **not** become the inference engine.
-
-Recommended split:
-
-- **Backend**
-  - owns camera capture and inference
-  - runs SCRFD + ArcFace repeatedly
-  - estimates pose and quality
-  - decides when a frame is accepted
-- **Frontend**
-  - renders preview and guide overlays
-  - shows current target pose and progress
-  - displays accepted captures / remaining steps
-
-This keeps the hot path close to the current daemon architecture and avoids duplicating camera/inference logic inside the UI toolkit.
-
-## Recommended handoff architecture
-
-The cleanest near-term enrollment flow is:
-
-1. **Frontend captures frames** into a temporary enrollment session directory
-2. **Backend processes the session as a batch** using the same inference stack as auth
-3. **Backend stores embeddings + metadata** for the user
-4. **Temporary session images are deleted** after successful import
-
-This keeps enrollment UX flexible while ensuring the backend remains the single source of truth for detection, alignment, embedding generation, and acceptance rules.
-
-### Why use a temporary session directory
-
-This is preferable to shoving a giant batch through IPC because:
-
-- frame batches can exceed reasonable IPC payload sizes
-- the backend can process incrementally or in batch without protocol complexity
-- the frontend can be written in Python now and replaced later without changing backend semantics
-- raw frames stay ephemeral and are easy to clean up
-
-### Suggested session layout
-
-Example temporary session directory:
-
-```text
-/run/user/$UID/howy-enroll/<session-id>/
-  manifest.json
-  frame_0001.png
-  frame_0002.png
-  ...
+```
+Python frontend          CLI                     Daemon
+ (camera + UX)     (enroll-batch)            (inference only)
+     |                    |                        |
+     |  capture frames    |                        |
+     |  w/ pose guide     |                        |
+     |  (Apple FaceID     |                        |
+     |   style: "roll     |                        |
+     |   your head")      |                        |
+     |                    |                        |
+     |  write frames to   |                        |
+     |  temp session dir  |                        |
+     |  (/tmp/howy-...)   |                        |
+     | -----------------> |                        |
+     |                    |  EnrollBatchReq        |
+     |                    |  (session_dir, user,   |
+     |                    |   label)               |
+     |                    | ---------------------> |
+     |                    |                        |
+     |                    |  for each image:       |
+     |                    |    load image          |
+     |                    |    detect face (SCRFD) |
+     |                    |    if face found:      |
+     |                    |      encode (ArcFace)  |
+     |                    |      append to store   |
+     |                    |    else: skip          |
+     |                    |                        |
+     |                    |  EnrollBatchResult     |
+     |                    | <--------------------- |
+     |                    |                        |
+     |  print summary     |                        |
+     | <----------------- |                        |
 ```
 
-If root-owned backend access becomes simpler with a global spool, a system path like this is also viable:
+## Components
 
-```text
-/var/lib/howy/enroll-spool/<session-id>/
-```
+### 1. Python enrollment frontend
 
-### Suggested manifest contents
+- Opens the IR/webcam and shows a live preview
+- Apple FaceID-style UX: "Look straight, now slowly roll your head around"
+- Captures frames at intervals into a temporary session directory
+- Writes standard image files (PNG) to: `/tmp/howy-enroll-<session-id>/`
+- No inference, no embedding, no ONNX models in Python
+- When capture is done, invokes `sudo howy enroll-batch`
 
-Keep the manifest lightweight. Useful fields:
-
-- `session_id`
-- `user`
-- `label`
-- `capture_device`
-- `created_at`
-- optional per-frame metadata:
-  - pose target requested by the UI
-  - capture order
-  - timestamp
-
-## Batch enrollment CLI shape
-
-Recommended backend entry point:
+### 2. `howy enroll-batch` CLI command
 
 ```bash
-howy enroll-batch \
+sudo howy enroll-batch \
   --user lucas \
-  --session-dir /run/user/1000/howy-enroll/abc123 \
-  --label default \
+  --session-dir /tmp/howy-enroll-abc123 \
+  --label "laptop IR" \
   --delete-on-success
 ```
 
-Possible future flags:
+- Sends an `EnrollBatchReq` to the daemon via IPC
+- Daemon processes each image file in the session directory
+- Reports summary: N frames found, M accepted, K rejected
+- Optionally deletes the session directory on success
 
-- `--keep-input`
-- `--max-frames 40`
-- `--min-pose-buckets 5`
-- `--dry-run`
+### 3. Daemon `EnrollBatchReq` handler
 
-### Backend responsibilities for `enroll-batch`
+For each image file in the session directory:
+1. Read image, decode to BGR
+2. Run SCRFD face detection
+3. If exactly one face detected with reasonable confidence (>0.5):
+   - Run ArcFace to get 512-dim embedding
+   - Append a `FaceModel` to the user's `UserModels`
+4. If no face or multiple faces: skip, record in rejection details
+5. Save the updated `UserModels` to disk (bincode format)
+6. Return `EnrollBatchResult` with counts and rejection details
 
-For each frame in the session directory, the backend should:
+**The daemon does NOT:**
+- Estimate head pose
+- Score frame quality (blur, brightness, sharpness)
+- Deduplicate similar embeddings
+- Validate pose coverage
 
-1. detect face
-2. align face
-3. generate embedding
-4. estimate pose / quality
-5. reject bad frames
-6. dedupe near-identical accepted samples
-7. store accepted embeddings and metadata under the target user
+All of that is the frontend's problem. The backend just asks: "is there a
+face?" and if yes, stores the embedding.
 
-The backend should remain authoritative for what counts as an acceptable enrollment sample.
+### 4. Auth path (unchanged)
 
-## Frontend recommendation
+Load all embeddings for the user, brute-force cosine scan. At 200 embeddings
+(~400KB of f32 data), this takes <0.1ms and fits in L2 cache.
 
-### Recommended: GTK4 + libadwaita
+## Storage
 
-Reasoning:
+### Format: bincode
 
-- best fit for a Linux-native desktop app
-- natural integration with GNOME-style UX and system themes
-- good long-term packaging story on Linux
-- easier to build a real enrollment window that feels native
+Switched from JSON to bincode (`bincode = "1"`). Same `UserModels` struct,
+same atomic temp-file + rename write pattern.
 
-Performance-wise, the frontend toolkit is **not** the bottleneck here. The expensive parts are:
+- ~3x smaller than JSON for packed f32 arrays
+- ~10x faster parse
+- Zero overhead for float arrays (stored as raw bytes)
+- JSON read fallback preserved for existing `.json` enrollments
 
-- camera capture
-- face detection
-- embedding generation
+File layout:
+```
+/etc/howy/models/
+  lucas.bin          # bincode UserModels
+  lucas.json         # legacy, read-only fallback
+```
 
-So the right question is not “which GUI is fastest?”, but “which GUI fits the architecture best?”. GTK4 wins there.
+### Why not a vector DB?
 
-### Not the first choice: egui
+At this scale (50-200 embeddings per user, one user at a time), brute-force
+cosine scan is faster than any index. Vector DBs (FAISS, usearch, HNSW)
+optimize for millions+ of vectors. At 200 vectors, the index construction
+and lookup overhead exceeds a raw scan.
 
-egui is viable, but it is less natural for a polished Linux-native enrollment tool.
+If the project ever needs to match across thousands of users with thousands
+of embeddings each, migrating to SQLite with a vector extension or a proper
+ANN index is straightforward. Not needed now.
 
-Pros:
+## Session directory layout
 
-- pure Rust
-- quick to prototype
+```
+/tmp/howy-enroll-<session-id>/
+  frame_0001.png
+  frame_0002.png
+  ...
+  frame_NNNN.png
+```
 
-Cons:
+No manifest file. The daemon just globs for image files (png/jpg/bmp) and
+processes them in sorted order. Simplicity over ceremony.
 
-- less native look/feel
-- immediate-mode redraw is not the problem, but it does not buy us anything important here
-- camera-preview plumbing is still a custom job either way
+## Future
 
-### Practical conclusion
-
-If we build an enrollment frontend, the best first serious implementation is:
-
-- **GTK4/libadwaita frontend**
-- backend-driven inference and pose/quality acceptance logic
-
-### Prototype path
-
-If speed of iteration matters more than polish for the first prototype, a **Python + OpenCV frontend** is reasonable **only for enrollment tooling**.
-
-In that model:
-
-- Python handles camera preview and guide overlays
-- Python writes a temporary enrollment session directory
-- Python invokes `howy enroll-batch ...`
-
-This keeps Python out of the PAM/auth hot path while letting us prototype UX quickly.
-
-## Pose guidance model
-
-We already have 5-point landmarks from SCRFD. That is enough to add coarse pose estimation.
-
-Near-term pose buckets:
-
-- frontal
-- left
-- right
-- up
-- down
-
-The frontend only needs to display the current target and some alignment hints.
-
-Examples:
-
-- draw a face oval / center box
-- draw a horizontal eye line target
-- show arrows like “turn left a little more”
-- show “hold still” when pose + quality are acceptable
-
-## Acceptance criteria per frame
-
-Each captured enrollment frame should pass checks such as:
-
-- one clear face only
-- detection confidence above threshold
-- face size above threshold
-- brightness within acceptable range
-- blur/sharpness acceptable
-- pose falls into the desired bucket
-- embedding is finite and normalized
-
-Only accepted frames should be stored.
-
-## Storage direction
-
-Near-term:
-
-- current JSON is acceptable for iteration
-
-Better long-term:
-
-- SQLite for registrations + metadata
-
-Suggested metadata per accepted frame:
-
-- user
-- registration/session label
-- timestamp
-- detector score
-- quality score
-- pose bucket
-- optional yaw/pitch/roll
-- embedding
-
-Raw input images should be treated as temporary enrollment material, not as the durable identity record.
-
-At current scale, exact cosine matching is still sufficient.
-
-## Matching implications
-
-Multiple registrations per user should be treated as normal.
-
-Recommended behavior:
-
-- keep all accepted embeddings
-- optionally group by registration session or pose bucket
-- match exact cosine against all stored embeddings first
-
-This naturally supports real-world variation like glasses/no-glasses without needing a special “glasses mode”.
-
-No vector DB is required for initial deployment.
-
-## Why not implement this immediately
-
-The current win is that PAM deployment now works.
-
-Enrollment should come next, but as a separate phase, because it adds:
-
-- UI/toolkit decisions
-- preview/rendering work
-- pose estimation work
-- persistence changes
-
-That is a distinct problem from “make PAM face auth stable and fast”.
-
-## Recommended implementation order
-
-1. keep current PAM path stable
-2. add `howy doctor` / `howy prewarm` / operational tooling
-3. add `howy enroll-batch` backend command
-4. implement temporary session-folder handoff
-5. build frontend (Python prototype or GTK4 production path)
-6. move persistence from JSON to SQLite if needed
+- GTK4/libadwaita frontend to replace the Python prototype
+- Multiple enrollment sessions per user (already supported by append semantics)
+- Optional dedup at the frontend level before writing frames
+- VitisAI / Ryzen AI NPU acceleration (exploration only)
