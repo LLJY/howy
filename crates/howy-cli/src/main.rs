@@ -42,6 +42,21 @@ enum Commands {
         label: Option<String>,
     },
 
+    /// Enroll face models from a batch of captured images.
+    EnrollBatch {
+        /// Path to the session directory containing captured frame images (png/jpg/bmp).
+        #[arg(short = 'd', long)]
+        session_dir: String,
+
+        /// Label for this enrollment session (e.g., "laptop IR", "default").
+        #[arg(short, long)]
+        label: Option<String>,
+
+        /// Delete session directory after successful enrollment.
+        #[arg(long)]
+        delete_on_success: bool,
+    },
+
     /// List enrolled face models.
     List,
 
@@ -84,6 +99,14 @@ fn main() -> Result<()> {
         Commands::Add { label } => {
             let user = resolve_target_user(user.as_deref())?;
             cmd_add(&user, label, yes)
+        }
+        Commands::EnrollBatch {
+            session_dir,
+            label,
+            delete_on_success,
+        } => {
+            let user = resolve_target_user(user.as_deref())?;
+            cmd_enroll_batch(&user, &session_dir, label, delete_on_success)
         }
         Commands::List => {
             let user = resolve_target_user(user.as_deref())?;
@@ -136,10 +159,15 @@ fn cmd_add(user: &str, label: Option<String>, _skip_confirm: bool) -> Result<()>
 
     match response.result {
         Some(RespResult::Enrolled(e)) => {
-            // Load or create user models
+            // Load or create user models — fail hard on corrupt files
+            // to avoid silently overwriting existing enrollments.
             let model_path = model_path_for_user(user)?;
             let mut models = if model_path.exists() {
-                UserModels::load(&model_path).unwrap_or_else(|_| UserModels::new(user))
+                UserModels::load(&model_path)?
+            } else if has_legacy_models(user) {
+                let legacy =
+                    paths::user_model_path_legacy(user).expect("has_legacy_models returned true");
+                UserModels::load(&legacy)?
             } else {
                 UserModels::new(user)
             };
@@ -178,10 +206,109 @@ fn cmd_add(user: &str, label: Option<String>, _skip_confirm: bool) -> Result<()>
     Ok(())
 }
 
+fn cmd_enroll_batch(
+    user: &str,
+    session_dir: &str,
+    label: Option<String>,
+    delete_on_success: bool,
+) -> Result<()> {
+    check_root()?;
+
+    let label = label.unwrap_or_else(|| "default".to_string());
+
+    let dir = Path::new(session_dir);
+    if !dir.is_dir() {
+        bail!("Session directory not found: {session_dir}");
+    }
+
+    // Count image files for user feedback
+    let image_count = std::fs::read_dir(dir)?
+        .flatten()
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| {
+                    matches!(
+                        ext.to_ascii_lowercase().as_str(),
+                        "png" | "jpg" | "jpeg" | "bmp"
+                    )
+                })
+                .unwrap_or(false)
+        })
+        .count();
+
+    if image_count == 0 {
+        bail!("No image files (png/jpg/bmp) found in {session_dir}");
+    }
+
+    println!("Enrolling {image_count} frame(s) for user '{user}' with label '{label}'...");
+
+    let client = DaemonClient::default_path().with_timeout(std::time::Duration::from_secs(120));
+
+    let response = client.request(&Request::enroll_batch(user, session_dir, &label))?;
+
+    match response.result {
+        Some(RespResult::EnrollBatchDone(r)) => {
+            println!("\nEnrollment complete:");
+            println!("  Frames found:    {}", r.frames_found);
+            println!("  Frames accepted: {}", r.frames_accepted);
+            println!("  Frames rejected: {}", r.frames_rejected);
+            println!("  Time: {:.1}ms", r.elapsed_ms);
+
+            if !r.rejection_details.is_empty() {
+                println!("\nRejected frames:");
+                for detail in &r.rejection_details {
+                    println!("  - {detail}");
+                }
+            }
+
+            if r.frames_accepted == 0 {
+                bail!("No frames were accepted. Check image quality and try again.");
+            }
+
+            if delete_on_success {
+                // Safety: only delete directories that look like howy enrollment
+                // session dirs (under /tmp with the howy-enroll- prefix) to
+                // prevent accidental recursive deletion of arbitrary paths.
+                let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+                let safe_prefix = std::path::Path::new("/tmp/howy-enroll-");
+                let is_safe = canonical
+                    .to_str()
+                    .map(|s| s.starts_with(safe_prefix.to_str().unwrap_or("/tmp/howy-enroll-")))
+                    .unwrap_or(false);
+                if is_safe {
+                    match std::fs::remove_dir_all(dir) {
+                        Ok(()) => println!("\nSession directory deleted: {session_dir}"),
+                        Err(e) => eprintln!("\nWarning: failed to delete session directory: {e}"),
+                    }
+                } else {
+                    eprintln!(
+                        "\nWarning: refusing to delete {session_dir} (not under /tmp/howy-enroll-*)"
+                    );
+                }
+            }
+
+            println!(
+                "\nSuccessfully enrolled {} embedding(s) for '{user}'.",
+                r.frames_accepted
+            );
+        }
+        Some(RespResult::Error(e)) => {
+            bail!("Enrollment failed: {}", e.message);
+        }
+        other => {
+            bail!("Unexpected response: {other:?}");
+        }
+    }
+
+    Ok(())
+}
+
 fn cmd_list(user: &str) -> Result<()> {
     let model_path = model_path_for_user(user)?;
 
-    if !model_path.exists() {
+    if !model_path.exists() && !has_legacy_models(user) {
         println!("No face models enrolled for user '{user}'");
         return Ok(());
     }
@@ -249,7 +376,7 @@ fn cmd_clear(user: &str, skip_confirm: bool) -> Result<()> {
 
     let model_path = model_path_for_user(user)?;
 
-    if !model_path.exists() {
+    if !model_path.exists() && !has_legacy_models(user) {
         println!("No face models to clear for user '{user}'");
         return Ok(());
     }
@@ -265,8 +392,21 @@ fn cmd_clear(user: &str, skip_confirm: bool) -> Result<()> {
         }
     }
 
-    std::fs::remove_file(&model_path)?;
-    println!("All face models removed for '{user}'");
+    // Remove both bincode and legacy JSON files.
+    let mut removed_any = false;
+    if model_path.exists() {
+        std::fs::remove_file(&model_path)?;
+        removed_any = true;
+    }
+    if let Some(legacy) = paths::user_model_path_legacy(user) {
+        if legacy.exists() {
+            std::fs::remove_file(&legacy)?;
+            removed_any = true;
+        }
+    }
+    if removed_any {
+        println!("All face models removed for '{user}'");
+    }
     Ok(())
 }
 
@@ -547,6 +687,13 @@ fn model_path_for_user(user: &str) -> Result<std::path::PathBuf> {
         Some(path) => Ok(path),
         None => bail!("Invalid username '{user}'"),
     }
+}
+
+/// Check if legacy JSON models exist for a user.
+fn has_legacy_models(user: &str) -> bool {
+    paths::user_model_path_legacy(user)
+        .map(|p| p.exists())
+        .unwrap_or(false)
 }
 
 fn find_howyd_binary() -> PathBuf {
