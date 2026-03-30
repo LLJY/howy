@@ -163,13 +163,19 @@ unsafe fn authenticate_user(pamh: *mut PamHandle) -> libc::c_int {
             return PAM_AUTHINFO_UNAVAIL;
         }
 
-        // Check if user has face models
+        // Check if user has face models (.bin or legacy .json)
         let model_path = match howy_common::paths::user_model_path(&username) {
             Some(p) => p,
             None => return PAM_USER_UNKNOWN, // invalid username
         };
         if !model_path.exists() {
-            return PAM_AUTHINFO_UNAVAIL;
+            // Also check legacy JSON path
+            let has_legacy = howy_common::paths::user_model_path_legacy(&username)
+                .map(|p| p.exists())
+                .unwrap_or(false);
+            if !has_legacy {
+                return PAM_AUTHINFO_UNAVAIL;
+            }
         }
 
         // Connect to daemon
