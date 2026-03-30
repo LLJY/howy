@@ -65,9 +65,10 @@ impl DaemonClient {
         }
     }
 
-    /// Create a client with default socket path.
+    /// Create a client with the effective socket path.
+    /// Honors `HOWY_SOCKET` env override for development.
     pub fn default_path() -> Self {
-        Self::new(crate::paths::SOCKET_PATH)
+        Self::new(&crate::paths::socket_path())
     }
 
     /// Set the timeout for read/write operations.
