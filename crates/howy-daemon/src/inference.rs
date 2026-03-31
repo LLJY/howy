@@ -361,13 +361,9 @@ fn preprocess_detection_into(
 ) {
     const NORM_SUB: f32 = 127.5;
     const NORM_DIV: f32 = 1.0 / 128.0;
-    const PAD: f32 = (0.0 - NORM_SUB) * NORM_DIV;
+    const PAD: f32 = -NORM_SUB * NORM_DIV;
 
     let plane = det_w * det_h;
-    for v in dst.iter_mut() {
-        *v = PAD;
-    }
-
     let scale = f32::min(det_w as f32 / src_w as f32, det_h as f32 / src_h as f32);
     let new_w = (src_w as f32 * scale) as usize;
     let new_h = (src_h as f32 * scale) as usize;
@@ -375,6 +371,76 @@ fn preprocess_detection_into(
     let (r_plane, rest) = dst.split_at_mut(plane);
     let (g_plane, b_plane) = rest.split_at_mut(plane);
 
+    // --- Identity-scale fast path (common case: 640xN → 640x640) ---
+    if src_w == det_w && new_w == det_w {
+        // Source rows map 1:1 — no X remap needed, just copy+normalize.
+        if is_gray {
+            for y in 0..new_h.min(src_h) {
+                let src_row = y * src_w;
+                let dst_row = y * det_w;
+                for x in 0..src_w {
+                    let val = (src[src_row + x] as f32 - NORM_SUB) * NORM_DIV;
+                    r_plane[dst_row + x] = val;
+                    g_plane[dst_row + x] = val;
+                    b_plane[dst_row + x] = val;
+                }
+            }
+        } else {
+            for y in 0..new_h.min(src_h) {
+                let src_row = y * src_w * 3;
+                let dst_row = y * det_w;
+                for x in 0..src_w {
+                    let si = src_row + x * 3;
+                    let di = dst_row + x;
+                    r_plane[di] = (src[si + 2] as f32 - NORM_SUB) * NORM_DIV;
+                    g_plane[di] = (src[si + 1] as f32 - NORM_SUB) * NORM_DIV;
+                    b_plane[di] = (src[si] as f32 - NORM_SUB) * NORM_DIV;
+                }
+            }
+        }
+
+        // Pad only the bottom rows (new_h..det_h) — right side doesn't need
+        // padding because src_w == det_w.
+        if new_h < det_h {
+            for y in new_h..det_h {
+                let dst_row = y * det_w;
+                for x in 0..det_w {
+                    r_plane[dst_row + x] = PAD;
+                    g_plane[dst_row + x] = PAD;
+                    b_plane[dst_row + x] = PAD;
+                }
+            }
+        }
+        return;
+    }
+
+    // --- Generic scaled path (with partial padding) ---
+
+    // Fill only the padding regions, not the image region.
+    // Right padding: columns new_w..det_w for rows 0..new_h
+    if new_w < det_w {
+        for y in 0..new_h {
+            let dst_row = y * det_w;
+            for x in new_w..det_w {
+                r_plane[dst_row + x] = PAD;
+                g_plane[dst_row + x] = PAD;
+                b_plane[dst_row + x] = PAD;
+            }
+        }
+    }
+    // Bottom padding: all columns for rows new_h..det_h
+    if new_h < det_h {
+        for y in new_h..det_h {
+            let dst_row = y * det_w;
+            for x in 0..det_w {
+                r_plane[dst_row + x] = PAD;
+                g_plane[dst_row + x] = PAD;
+                b_plane[dst_row + x] = PAD;
+            }
+        }
+    }
+
+    // Remap with coordinate computation
     if is_gray {
         for y in 0..new_h {
             let src_y = ((y as f32 / scale) as usize).min(src_h - 1);

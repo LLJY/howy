@@ -181,6 +181,16 @@ fn validate_embedding(embedding: &[f32]) -> Result<(), String> {
     Ok(())
 }
 
+/// Dot product of two 512-dimensional vectors without validation.
+/// Caller must guarantee both slices are exactly FACE_EMBEDDING_DIM long
+/// and contain only finite values.
+#[inline(always)]
+fn dot_product_512(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), FACE_EMBEDDING_DIM);
+    debug_assert_eq!(b.len(), FACE_EMBEDDING_DIM);
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
 /// Cosine similarity between two normalized embedding vectors.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32, String> {
     validate_embedding(a)?;
@@ -225,5 +235,43 @@ pub fn find_best_match(
         Ok((Some(best_idx), best_score))
     } else {
         Ok((None, best_score))
+    }
+}
+
+/// Find the best matching embedding from a flat contiguous buffer of known embeddings.
+///
+/// `flat_known` is a contiguous buffer of `num_known * FACE_EMBEDDING_DIM` floats.
+/// All embeddings (query and known) must be pre-validated and L2-normalized.
+/// This skips per-comparison validation for maximum throughput.
+pub fn find_best_match_flat(
+    query: &[f32],
+    flat_known: &[f32],
+    num_known: usize,
+    threshold: f32,
+) -> (Option<usize>, f32) {
+    debug_assert_eq!(query.len(), FACE_EMBEDDING_DIM);
+    debug_assert_eq!(flat_known.len(), num_known * FACE_EMBEDDING_DIM);
+
+    if num_known == 0 {
+        return (None, 0.0);
+    }
+
+    let mut best_idx = 0usize;
+    let mut best_score = f32::NEG_INFINITY;
+
+    for i in 0..num_known {
+        let offset = i * FACE_EMBEDDING_DIM;
+        let known = &flat_known[offset..offset + FACE_EMBEDDING_DIM];
+        let score = dot_product_512(query, known);
+        if score > best_score {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+
+    if best_score >= threshold {
+        (Some(best_idx), best_score)
+    } else {
+        (None, best_score)
     }
 }
