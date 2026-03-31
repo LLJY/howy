@@ -36,7 +36,7 @@ provider = "auto"
 # Not yet implemented.
 prefer_npu = false
 # Face detection confidence threshold (0.0 - 1.0)
-det_threshold = 0.5
+det_threshold = 0.6
 # Recognition threshold (cosine similarity, 0.0 - 1.0)
 # Higher = stricter. 0.4 - 0.6 recommended.
 recognition_threshold = 0.5

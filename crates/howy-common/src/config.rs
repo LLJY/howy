@@ -105,7 +105,7 @@ impl Default for MlConfig {
         Self {
             provider: "auto".into(),
             prefer_npu: false,
-            det_threshold: 0.5,
+            det_threshold: 0.6,
             recognition_threshold: 0.5,
             detector_model: String::new(),
             recognizer_model: String::new(),
