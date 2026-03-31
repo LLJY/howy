@@ -70,23 +70,19 @@ impl Frame {
 
 const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Pre-resolved camera parameters with a warm device fd.
-/// Computed once at daemon startup. The device fd is kept open (no streaming,
-/// no IR LED, no power draw) to skip the ~2-25ms format negotiation on each auth.
+/// Pre-resolved camera parameters.
+/// Computed once at daemon startup or lazily on first camera use.
 pub struct CameraProfile {
-    pub device_path: String,
-    pub width: u32,
-    pub height: u32,
-    pub format: CaptureFormat,
-    pub fps: i32,
-    pub exposure: i32,
-    /// Warm device fd. Held open to skip re-negotiation.
-    /// Protected by Mutex since Camera::from_profile borrows it from a thread.
-    device: Mutex<Option<v4l::Device>>,
+    device_path: String,
+    width: u32,
+    height: u32,
+    format: CaptureFormat,
+    fps: i32,
+    exposure: i32,
 }
 
 impl CameraProfile {
-    /// Probe the camera once and keep the device fd warm.
+    /// Probe the camera once and cache the negotiated settings.
     pub fn probe(
         device_path: &str,
         req_width: i32,
@@ -118,50 +114,7 @@ impl CameraProfile {
             format,
             fps,
             exposure,
-            device: Mutex::new(Some(device)),
         })
-    }
-
-    /// Take a warm device fd. Opens a fresh one if already taken.
-    /// Returns None only if opening fails. Always re-negotiates format
-    /// to ensure the device is in the expected state.
-    pub fn take_device(&self) -> Option<v4l::Device> {
-        // Try the cached device first
-        let dev = if let Ok(mut slot) = self.device.lock() {
-            slot.take()
-        } else {
-            None
-        };
-
-        let dev = match dev {
-            Some(d) => d,
-            None => {
-                // Cached device was already taken — open a fresh one.
-                match v4l::Device::with_path(&self.device_path) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        debug!("Failed to reopen camera device: {e}");
-                        return None;
-                    }
-                }
-            }
-        };
-
-        // Always re-negotiate format to ensure device state matches profile.
-        match negotiate_format(&dev, self.width as i32, self.height as i32) {
-            Ok(_) => Some(dev),
-            Err(e) => {
-                debug!("Format re-negotiation failed on warm device: {e}");
-                None
-            }
-        }
-    }
-
-    /// Return the device fd for reuse by the next auth request.
-    pub fn return_device(&self, device: v4l::Device) {
-        if let Ok(mut slot) = self.device.lock() {
-            *slot = Some(device);
-        }
     }
 }
 
@@ -173,7 +126,6 @@ pub struct Camera {
     device_path: String,
     fps: i32,
     exposure: i32,
-    warm_device: Option<v4l::Device>,
     worker: Option<CaptureWorker>,
 }
 
@@ -232,9 +184,7 @@ enum CaptureFormat {
 
 impl Camera {
     /// Create a camera from a pre-probed profile (skips device probe).
-    /// Takes the warm device fd from the profile if available.
     pub fn from_profile(profile: &CameraProfile) -> Self {
-        let warm_device = profile.take_device();
         Self {
             width: profile.width,
             height: profile.height,
@@ -242,7 +192,6 @@ impl Camera {
             device_path: profile.device_path.clone(),
             fps: profile.fps,
             exposure: profile.exposure,
-            warm_device,
             worker: None,
         }
     }
@@ -265,8 +214,9 @@ impl Camera {
     /// Start the capture backend.
     ///
     /// Strategy:
-    /// 1. Try OpenCV CAP_V4L first (matches howdy's default working path)
-    /// 2. Fall back to a persistent ffmpeg sidecar if OpenCV cannot open the device
+    /// 1. Try V4L2 mmap first
+    /// 2. Fall back to OpenCV CAP_V4L
+    /// 3. Fall back to a persistent ffmpeg sidecar
     pub fn start(&mut self) -> Result<()> {
         if self.worker.is_some() {
             return Ok(());
@@ -278,7 +228,6 @@ impl Camera {
         let format = self.format;
         let fps = self.fps;
         let exposure = self.exposure;
-        let warm_device = self.warm_device.take();
 
         let latest_message = Arc::new(Mutex::new(None));
         let latest_message_worker = Arc::clone(&latest_message);
@@ -293,7 +242,6 @@ impl Camera {
                 format,
                 fps,
                 exposure,
-                warm_device,
                 latest_message_worker,
                 notify_tx,
                 stop_rx,
@@ -308,6 +256,31 @@ impl Camera {
         });
 
         Ok(())
+    }
+
+    /// Stop the active capture worker, if any.
+    pub fn stop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            // Signal the worker to stop and wait with a bounded timeout.
+            // If the worker is stuck on blocking I/O, we don't want to
+            // wedge the auth thread (and hold the camera lock) forever.
+            let _ = worker.stop_tx.send(());
+            if let Some(handle) = worker.thread_handle {
+                // Park for up to 500ms for a clean shutdown.
+                let deadline = std::time::Instant::now() + Duration::from_millis(500);
+                loop {
+                    if handle.is_finished() {
+                        let _ = handle.join();
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        warn!("Camera worker did not stop within 500ms; abandoning join");
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
     }
 
     /// Capture a single frame with pixel format metadata.
@@ -349,27 +322,7 @@ impl Camera {
 
 impl Drop for Camera {
     fn drop(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            // Signal the worker to stop and wait with a bounded timeout.
-            // If the worker is stuck on blocking I/O, we don't want to
-            // wedge the auth thread (and hold the camera lock) forever.
-            let _ = worker.stop_tx.send(());
-            if let Some(handle) = worker.thread_handle {
-                // Park for up to 500ms for a clean shutdown.
-                let deadline = std::time::Instant::now() + Duration::from_millis(500);
-                loop {
-                    if handle.is_finished() {
-                        let _ = handle.join();
-                        break;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        warn!("Camera worker did not stop within 500ms; abandoning join");
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-        }
+        self.stop();
     }
 }
 
@@ -380,20 +333,11 @@ fn capture_worker_loop(
     format: CaptureFormat,
     fps: i32,
     exposure: i32,
-    warm_device: Option<v4l::Device>,
     latest_message: Arc<Mutex<Option<CaptureMessage>>>,
     notify_tx: mpsc::SyncSender<()>,
     stop_rx: mpsc::Receiver<()>,
 ) {
-    let mut backend = match start_backend(
-        &device_path,
-        width,
-        height,
-        format,
-        fps,
-        exposure,
-        warm_device,
-    ) {
+    let mut backend = match start_backend(&device_path, width, height, format, fps, exposure) {
         Ok(backend) => backend,
         Err(e) => {
             warn!("Failed to start camera backend: {e:#}");
@@ -480,21 +424,7 @@ fn start_backend(
     format: CaptureFormat,
     fps: i32,
     exposure: i32,
-    warm_device: Option<v4l::Device>,
 ) -> Result<Backend> {
-    // Priority: warm V4L2 mmap (fastest) → cold V4L2 mmap → OpenCV → ffmpeg
-    if let Some(dev) = warm_device {
-        match V4l2MmapBackend::from_device(dev, width, height, format) {
-            Ok(backend) => {
-                debug!("Using V4L2 mmap backend (warm device fd)");
-                return Ok(Backend::V4l2Mmap(backend));
-            }
-            Err(e) => {
-                debug!("V4L2 mmap warm path failed: {e:#}; trying cold open");
-            }
-        }
-    }
-
     match V4l2MmapBackend::new(device_path, width, height, format) {
         Ok(backend) => {
             return Ok(Backend::V4l2Mmap(backend));
@@ -554,36 +484,16 @@ fn decode_capture_message(message: CaptureMessage) -> Result<Frame> {
 }
 
 impl V4l2MmapBackend {
-    /// Create from an existing pre-opened device (warm path).
-    fn from_device(
-        dev: v4l::Device,
-        width: u32,
-        height: u32,
-        format: CaptureFormat,
-    ) -> Result<Self> {
-        let device = Box::pin(dev);
-        Self::create_stream(device, width, height, format)
-    }
-
-    /// Create by opening a fresh device (cold path / fallback).
-    fn new(device_path: &str, width: u32, height: u32, format: CaptureFormat) -> Result<Self> {
-        use v4l::format::Format;
-        use v4l::FourCC;
-
+    /// Create by opening a fresh device.
+    fn new(device_path: &str, width: u32, height: u32, _format: CaptureFormat) -> Result<Self> {
         let dev =
             v4l::Device::with_path(device_path).context("failed to open V4L2 device for mmap")?;
 
-        let fourcc = match format {
-            CaptureFormat::Grey => FourCC::new(b"GREY"),
-            CaptureFormat::Yuyv => FourCC::new(b"YUYV"),
-            CaptureFormat::Mjpeg => FourCC::new(b"MJPG"),
-        };
-        let fmt = Format::new(width, height, fourcc);
-        let _actual = CaptureTraitImport::set_format(&dev, &fmt)
+        let (actual_w, actual_h, actual_fmt) = negotiate_format(&dev, width as i32, height as i32)
             .context("V4L2 mmap: failed to set format")?;
 
         let device = Box::pin(dev);
-        Self::create_stream(device, width, height, format)
+        Self::create_stream(device, actual_w, actual_h, actual_fmt)
     }
 
     fn create_stream(
@@ -845,15 +755,35 @@ impl Drop for FfmpegBackend {
 fn find_camera_device() -> Result<String> {
     let by_path = Path::new("/dev/v4l/by-path");
     if by_path.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(by_path) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.contains("ir") || name.contains("infrared") {
-                    if let Ok(resolved) = std::fs::canonicalize(entry.path()) {
-                        return Ok(resolved.to_string_lossy().to_string());
-                    }
+        let mut entries: Vec<_> = std::fs::read_dir(by_path)
+            .context("failed to read /dev/v4l/by-path")?
+            .flatten()
+            .collect();
+        entries.sort_by(|a, b| {
+            a.file_name()
+                .to_string_lossy()
+                .cmp(&b.file_name().to_string_lossy())
+        });
+
+        if !entries.is_empty() {
+            for entry in &entries {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                let path = entry.path();
+                if (name.contains("ir") || name.contains("infrared"))
+                    && is_video_capture_device(&path)
+                {
+                    return Ok(path.to_string_lossy().to_string());
                 }
             }
+
+            for entry in entries {
+                let path = entry.path();
+                if is_video_capture_device(&path) {
+                    return Ok(path.to_string_lossy().to_string());
+                }
+            }
+
+            bail!("No usable capture device found in /dev/v4l/by-path. Set video.device_path in config.");
         }
     }
 
@@ -874,6 +804,18 @@ fn find_camera_device() -> Result<String> {
     }
 
     bail!("No camera device found. Set video.device_path in config.")
+}
+
+fn is_video_capture_device(path: &Path) -> bool {
+    match v4l::Device::with_path(path) {
+        Ok(dev) => match dev.query_caps() {
+            Ok(caps) => caps
+                .capabilities
+                .contains(v4l::capability::Flags::VIDEO_CAPTURE),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
 }
 
 /// Negotiate the best capture format.

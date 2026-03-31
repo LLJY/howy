@@ -28,6 +28,14 @@ static PASSWD_LOOKUP_LOCK: Mutex<()> = Mutex::new(());
 const CAMERA_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Cached user face models with pre-validated flat embeddings.
+#[derive(Debug, Clone)]
+struct ModelSourceState {
+    bin_exists: bool,
+    bin_mtime: Option<std::time::SystemTime>,
+    json_exists: bool,
+    json_mtime: Option<std::time::SystemTime>,
+}
+
 struct CachedModels {
     models: UserModels,
     labels: Vec<String>,
@@ -36,10 +44,8 @@ struct CachedModels {
     flat_embeddings: Arc<Vec<f32>>,
     /// Number of embeddings (flat_embeddings.len() / 512).
     num_embeddings: usize,
-    /// File mtime when loaded, used to detect external modifications.
-    file_mtime: Option<std::time::SystemTime>,
-    /// Path the models were loaded from.
-    file_path: Option<std::path::PathBuf>,
+    /// Snapshot of both candidate model sources when loaded.
+    source_state: ModelSourceState,
 }
 
 /// In-memory cache for user face models.
@@ -55,11 +61,11 @@ impl ModelCache {
     }
 
     /// Get cached models for a user. Loads from disk on first access.
-    /// Re-loads if the file has been modified externally (CLI add/remove/clear).
+    /// Re-loads if model source state changed externally (CLI add/remove/clear).
     fn get_or_load(&mut self, username: &str) -> std::result::Result<&CachedModels, String> {
-        // Check if cached entry is stale (file modified externally)
+        // Check if cached entry is stale (preferred source created/updated/deleted externally)
         let stale = if let Some(cached) = self.entries.get(username) {
-            is_cache_stale(cached)
+            is_cache_stale(username, cached)
         } else {
             true // not cached at all
         };
@@ -67,14 +73,12 @@ impl ModelCache {
         if stale {
             self.entries.remove(username);
 
-            let (user_models, path, mtime) = load_user_models_with_meta(username)?;
+            let (user_models, source_state) = load_user_models_with_state(username)?;
             if user_models.models.is_empty() {
                 return Err("no face models enrolled".to_string());
             }
 
-            let mut cached = build_cached_models(user_models)?;
-            cached.file_mtime = mtime;
-            cached.file_path = path;
+            let cached = build_cached_models(user_models, source_state)?;
             self.entries.insert(username.to_string(), cached);
         }
 
@@ -87,58 +91,80 @@ impl ModelCache {
     }
 }
 
-/// Check if a cached entry is stale by comparing file mtime.
-fn is_cache_stale(cached: &CachedModels) -> bool {
-    let path = match &cached.file_path {
-        Some(p) => p,
-        None => return true,
+fn current_model_source_state(username: &str) -> std::result::Result<ModelSourceState, String> {
+    let bin_path =
+        paths::user_model_path(username).ok_or_else(|| "invalid username".to_string())?;
+    let json_path =
+        paths::user_model_path_legacy(username).ok_or_else(|| "invalid username".to_string())?;
+
+    let bin_exists = bin_path.exists();
+    let bin_mtime = if bin_exists {
+        std::fs::metadata(&bin_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+    } else {
+        None
     };
-    let cached_mtime = match cached.file_mtime {
-        Some(t) => t,
-        None => return true,
+
+    let json_exists = json_path.exists();
+    let json_mtime = if json_exists {
+        std::fs::metadata(&json_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+    } else {
+        None
     };
-    match std::fs::metadata(path) {
-        Ok(meta) => match meta.modified() {
-            Ok(disk_mtime) => disk_mtime != cached_mtime,
-            Err(_) => true,
-        },
-        Err(_) => true, // file deleted or inaccessible → stale
+
+    Ok(ModelSourceState {
+        bin_exists,
+        bin_mtime,
+        json_exists,
+        json_mtime,
+    })
+}
+
+/// Check if a cached entry is stale by comparing both model source candidates.
+fn is_cache_stale(username: &str, cached: &CachedModels) -> bool {
+    match current_model_source_state(username) {
+        Ok(current) => {
+            current.bin_exists != cached.source_state.bin_exists
+                || current.bin_mtime != cached.source_state.bin_mtime
+                || current.json_exists != cached.source_state.json_exists
+                || current.json_mtime != cached.source_state.json_mtime
+        }
+        Err(_) => true,
     }
 }
 
-/// Load user models from disk along with file metadata for cache validation.
-fn load_user_models_with_meta(
+/// Load user models from disk along with model source state for cache validation.
+fn load_user_models_with_state(
     username: &str,
-) -> std::result::Result<(UserModels, Option<std::path::PathBuf>, Option<std::time::SystemTime>), String> {
-    let model_path = paths::user_model_path(username)
-        .ok_or_else(|| "invalid username".to_string())?;
+) -> std::result::Result<(UserModels, ModelSourceState), String> {
+    let state = current_model_source_state(username)?;
 
-    if model_path.exists() {
-        let mtime = std::fs::metadata(&model_path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        let models = UserModels::load(&model_path)
-            .map_err(|e| format!("failed to load models: {e}"))?;
-        return Ok((models, Some(model_path), mtime));
+    if state.bin_exists {
+        let model_path =
+            paths::user_model_path(username).ok_or_else(|| "invalid username".to_string())?;
+        let models =
+            UserModels::load(&model_path).map_err(|e| format!("failed to load models: {e}"))?;
+        return Ok((models, state));
     }
 
-    if let Some(legacy) = paths::user_model_path_legacy(username) {
-        if legacy.exists() {
-            let mtime = std::fs::metadata(&legacy)
-                .ok()
-                .and_then(|m| m.modified().ok());
-            let models = UserModels::load(&legacy)
-                .map_err(|e| format!("failed to load legacy models: {e}"))?;
-            return Ok((models, Some(legacy), mtime));
-        }
+    if state.json_exists {
+        let legacy = paths::user_model_path_legacy(username)
+            .ok_or_else(|| "invalid username".to_string())?;
+        let models =
+            UserModels::load(&legacy).map_err(|e| format!("failed to load legacy models: {e}"))?;
+        return Ok((models, state));
     }
 
     Err("no face models enrolled".to_string())
 }
 
-
-
-fn build_cached_models(user_models: UserModels) -> std::result::Result<CachedModels, String> {
+fn build_cached_models(
+    user_models: UserModels,
+    source_state: ModelSourceState,
+) -> std::result::Result<CachedModels, String> {
     let mut labels = Vec::with_capacity(user_models.models.len());
     let mut flat = Vec::with_capacity(user_models.models.len() * face::FACE_EMBEDDING_DIM);
 
@@ -166,8 +192,7 @@ fn build_cached_models(user_models: UserModels) -> std::result::Result<CachedMod
         labels,
         flat_embeddings: Arc::new(flat),
         num_embeddings,
-        file_mtime: None,
-        file_path: None,
+        source_state,
     })
 }
 
@@ -177,17 +202,24 @@ pub async fn run(engine: Arc<InferenceEngine>, config: HowyConfig) -> Result<()>
     let camera_lock = Arc::new(Mutex::new(()));
     let model_cache = Arc::new(Mutex::new(ModelCache::new()));
 
-    // Probe camera once at startup — cached for all future auth requests.
-    let camera_profile = Arc::new(
-        CameraProfile::probe(
+    // Probe camera once at startup if available, but don't make daemon startup
+    // depend on camera availability. PAM should still fall through to password
+    // if the camera is missing/busy at boot.
+    let camera_profile = Arc::new(Mutex::new(
+        match CameraProfile::probe(
             &config.video.device_path,
             config.video.frame_width,
             config.video.frame_height,
             config.video.device_fps,
             config.video.exposure,
-        )
-        .context("failed to probe camera at startup")?,
-    );
+        ) {
+            Ok(profile) => Some(profile),
+            Err(e) => {
+                warn!("Initial camera probe failed; will retry lazily on first auth: {e:#}");
+                None
+            }
+        },
+    ));
 
     if config.credentials.enable_cache {
         warn!(
@@ -218,8 +250,8 @@ pub async fn run(engine: Arc<InferenceEngine>, config: HowyConfig) -> Result<()>
                 std::fs::remove_file(&socket_path)?;
             }
 
-            let listener = UnixListener::bind(&socket_path)
-                .context("failed to bind Unix socket")?;
+            let listener =
+                UnixListener::bind(&socket_path).context("failed to bind Unix socket")?;
 
             // Allow all users to connect (PAM runs as various users)
             set_socket_permissions(&socket_path)?;
@@ -247,9 +279,15 @@ pub async fn run(engine: Arc<InferenceEngine>, config: HowyConfig) -> Result<()>
 
                 // Handle in a thread (we're I/O bound on camera, not CPU)
                 std::thread::spawn(move || {
-                    if let Err(e) =
-                        handle_connection(stream, &engine, &config, &camera_lock, &model_cache, &camera_profile, uptime)
-                    {
+                    if let Err(e) = handle_connection(
+                        stream,
+                        &engine,
+                        &config,
+                        &camera_lock,
+                        &model_cache,
+                        &camera_profile,
+                        uptime,
+                    ) {
                         error!("Connection error: {e}");
                     }
                 });
@@ -270,7 +308,7 @@ fn handle_connection(
     config: &HowyConfig,
     camera_lock: &Mutex<()>,
     model_cache: &Mutex<ModelCache>,
-    camera_profile: &CameraProfile,
+    camera_profile: &Mutex<Option<CameraProfile>>,
     uptime: u64,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -324,7 +362,13 @@ fn handle_connection(
             } else if peer_uid != Some(0) {
                 Response::error("permission denied")
             } else {
-                handle_enroll_batch(engine, model_cache, &req.username, &req.session_dir, &req.label)
+                handle_enroll_batch(
+                    engine,
+                    model_cache,
+                    &req.username,
+                    &req.session_dir,
+                    &req.label,
+                )
             }
         }
         Some(Cmd::Detect(req)) => {
@@ -339,13 +383,7 @@ fn handle_connection(
             let provider = engine.active_provider().to_string();
             let detector_model = engine.detector_model_path();
             let recognizer_model = engine.recognizer_model_path();
-            Response::daemon_info(
-                &provider,
-                &detector_model,
-                &recognizer_model,
-                512,
-                uptime,
-            )
+            Response::daemon_info(&provider, &detector_model, &recognizer_model, 512, uptime)
         }
         Some(Cmd::Shutdown(_)) => {
             if peer_uid != Some(0) {
@@ -381,13 +419,102 @@ fn handle_connection(
     Ok(())
 }
 
+/// Open a camera from the cached profile, probing lazily if needed.
+fn open_camera_from_profile_cache(
+    config: &HowyConfig,
+    camera_profile: &Mutex<Option<CameraProfile>>,
+) -> Result<Camera> {
+    let mut slot = match camera_profile.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if slot.is_none() {
+        *slot = Some(CameraProfile::probe(
+            &config.video.device_path,
+            config.video.frame_width,
+            config.video.frame_height,
+            config.video.device_fps,
+            config.video.exposure,
+        )?);
+    }
+
+    Ok(Camera::from_profile(
+        slot.as_ref().expect("camera profile initialized"),
+    ))
+}
+
+/// Invalidate cached camera profile so next auth/enroll re-probes the device.
+fn invalidate_camera_profile(camera_profile: &Mutex<Option<CameraProfile>>) {
+    let mut slot = match camera_profile.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = None;
+}
+
+/// Open a camera from the cached profile and start it, invalidating and
+/// re-probing the profile once if startup fails.
+fn open_started_camera_from_profile_cache(
+    config: &HowyConfig,
+    camera_profile: &Mutex<Option<CameraProfile>>,
+) -> Result<Camera> {
+    let mut camera = open_camera_from_profile_cache(config, camera_profile)?;
+
+    if let Err(first_err) = camera.start() {
+        warn!(error = %first_err, "Camera start failed; invalidating cached profile and retrying once");
+        invalidate_camera_profile(camera_profile);
+
+        camera = open_camera_from_profile_cache(config, camera_profile)
+            .context("failed to reopen camera after invalidating cached profile")?;
+
+        camera
+            .start()
+            .map_err(|retry_err| {
+                warn!(error = %retry_err, first_error = %first_err, "Camera start failed after reprobe retry");
+                retry_err
+            })
+            .context("failed to start camera after reprobe")?;
+    }
+
+    Ok(camera)
+}
+
+/// Capture a frame, invalidating and re-probing the cached profile once if the
+/// active camera fails after startup.
+fn capture_frame_with_reprobe_retry(
+    camera: &mut Camera,
+    config: &HowyConfig,
+    camera_profile: &Mutex<Option<CameraProfile>>,
+) -> Result<Frame> {
+    match camera.capture_frame() {
+        Ok(frame) => Ok(frame),
+        Err(first_err) => {
+            warn!(error = %first_err, "Camera capture failed; invalidating cached profile and retrying once");
+            camera.stop();
+            invalidate_camera_profile(camera_profile);
+
+            *camera = open_started_camera_from_profile_cache(config, camera_profile)
+                .context("failed to reopen camera after capture failure")?;
+
+            camera
+                .capture_frame()
+                .map_err(|retry_err| {
+                    warn!(error = %retry_err, first_error = %first_err, "Camera capture failed after reprobe retry");
+                    retry_err
+                })
+                .context("failed to capture frame after reprobe retry")
+        }
+    }
+}
+
 /// Handle an authentication request.
 fn handle_authenticate(
     engine: &InferenceEngine,
     config: &HowyConfig,
     camera_lock: &Mutex<()>,
     model_cache: &Mutex<ModelCache>,
-    camera_profile: &CameraProfile,
+    camera_profile: &Mutex<Option<CameraProfile>>,
     username: &str,
     timeout_override: u32,
 ) -> Response {
@@ -439,18 +566,21 @@ fn handle_authenticate(
     let _camera_guard = match try_acquire_camera_lock(camera_lock, CAMERA_LOCK_TIMEOUT) {
         Ok(guard) => guard,
         Err(response) => {
-            warn!(username, "Authentication infrastructure failure: camera busy");
+            warn!(
+                username,
+                "Authentication infrastructure failure: camera busy"
+            );
             return response;
         }
     };
 
-    // Open camera from cached profile (skips device probe)
-    let mut camera = Camera::from_profile(camera_profile);
-
-    if let Err(e) = camera.start() {
-        warn!(username, error = %e, "Authentication infrastructure failure starting camera");
-        return Response::error(&format!("Failed to start camera: {e}"));
-    }
+    let mut camera = match open_started_camera_from_profile_cache(config, camera_profile) {
+        Ok(camera) => camera,
+        Err(e) => {
+            warn!(username, error = %e, "Authentication infrastructure failure opening/starting camera");
+            return Response::error(&format!("Camera error: {e}"));
+        }
+    };
 
     let deadline = Duration::from_secs(timeout as u64);
     let mut frames_processed = 0u32;
@@ -460,7 +590,7 @@ fn handle_authenticate(
     // Main recognition loop
     while start.elapsed() < deadline {
         // Capture frame
-        let frame = match camera.capture_frame() {
+        let frame = match capture_frame_with_reprobe_retry(&mut camera, config, camera_profile) {
             Ok(frame) => frame,
             Err(e) => {
                 warn!(username, error = %e, "Authentication infrastructure failure capturing frame");
@@ -476,8 +606,7 @@ fn handle_authenticate(
             if config.video.max_dark_frames > 0 && dark_frames >= config.video.max_dark_frames {
                 info!(
                     username,
-                    dark_frames,
-                    "Exceeded max consecutive dark frames — camera may be covered"
+                    dark_frames, "Exceeded max consecutive dark frames — camera may be covered"
                 );
                 return Response::auth_failed(
                     0.0,
@@ -525,11 +654,8 @@ fn handle_authenticate(
                 for i in 0..num_embeddings {
                     let offset = i * face::FACE_EMBEDDING_DIM;
                     let known = &flat_embeddings[offset..offset + face::FACE_EMBEDDING_DIM];
-                    let candidate: f32 = embedding
-                        .iter()
-                        .zip(known.iter())
-                        .map(|(a, b)| a * b)
-                        .sum();
+                    let candidate: f32 =
+                        embedding.iter().zip(known.iter()).map(|(a, b)| a * b).sum();
 
                     if candidate > score {
                         score = candidate;
@@ -603,7 +729,7 @@ fn handle_enroll(
     config: &HowyConfig,
     camera_lock: &Mutex<()>,
     model_cache: &Mutex<ModelCache>,
-    camera_profile: &CameraProfile,
+    camera_profile: &Mutex<Option<CameraProfile>>,
     username: &str,
     label: &str,
 ) -> Response {
@@ -616,12 +742,13 @@ fn handle_enroll(
         Err(response) => return response,
     };
 
-    let mut camera = Camera::from_profile(camera_profile);
-
-    if let Err(e) = camera.start() {
-        warn!(username, error = %e, "Enrollment infrastructure failure starting camera");
-        return Response::error(&format!("Failed to start camera: {e}"));
-    }
+    let mut camera = match open_started_camera_from_profile_cache(config, camera_profile) {
+        Ok(camera) => camera,
+        Err(e) => {
+            warn!(username, error = %e, "Enrollment infrastructure failure opening/starting camera");
+            return Response::error(&format!("Camera error: {e}"));
+        }
+    };
 
     // Capture several frames and pick the best face
     let mut best_face: Option<(Vec<f32>, f32)> = None;
@@ -629,7 +756,7 @@ fn handle_enroll(
     let start = Instant::now();
 
     while start.elapsed() < deadline {
-        let frame = match camera.capture_frame() {
+        let frame = match capture_frame_with_reprobe_retry(&mut camera, config, camera_profile) {
             Ok(frame) => frame,
             Err(e) => {
                 warn!(username, error = %e, "Enrollment infrastructure failure capturing frame");
@@ -647,9 +774,7 @@ fn handle_enroll(
                 for face_result in &faces {
                     if let Some(ref emb) = face_result.embedding {
                         let det_score = face_result.score;
-                        if best_face.is_none()
-                            || det_score > best_face.as_ref().unwrap().1
-                        {
+                        if best_face.is_none() || det_score > best_face.as_ref().unwrap().1 {
                             best_face = Some((emb.clone(), det_score));
                         }
                     }
@@ -757,11 +882,44 @@ fn handle_enroll_batch(
         let cache = lock_model_cache(model_cache);
 
         if let Some(cached) = cache.entries.get(username) {
-            cached.models.clone()
+            if !is_cache_stale(username, cached) {
+                cached.models.clone()
+            } else {
+                let existing_source_state = match current_model_source_state(username) {
+                    Ok(state) => state,
+                    Err(e) => return Response::error(&e),
+                };
+
+                if existing_source_state.bin_exists || existing_source_state.json_exists {
+                    match load_user_models_with_state(username) {
+                        Ok((models, _)) => models,
+                        Err(e) => {
+                            return Response::error(&format!(
+                                "{e} (refusing to overwrite existing enrollments)"
+                            ));
+                        }
+                    }
+                } else {
+                    UserModels::new(username)
+                }
+            }
         } else {
-            match load_user_models_with_meta(username) {
-                Ok((models, _, _)) => models,
-                Err(_) => UserModels::new(username),
+            let existing_source_state = match current_model_source_state(username) {
+                Ok(state) => state,
+                Err(e) => return Response::error(&e),
+            };
+
+            if existing_source_state.bin_exists || existing_source_state.json_exists {
+                match load_user_models_with_state(username) {
+                    Ok((models, _)) => models,
+                    Err(e) => {
+                        return Response::error(&format!(
+                            "{e} (refusing to overwrite existing enrollments)"
+                        ));
+                    }
+                }
+            } else {
+                UserModels::new(username)
             }
         }
     };
@@ -900,12 +1058,7 @@ fn handle_enroll_batch(
 }
 
 /// Handle a detection-only request (for testing).
-fn handle_detect(
-    engine: &InferenceEngine,
-    frame: &[u8],
-    height: u32,
-    width: u32,
-) -> Response {
+fn handle_detect(engine: &InferenceEngine, frame: &[u8], height: u32, width: u32) -> Response {
     let start = Instant::now();
 
     match engine.analyze(frame, width, height, false) {
@@ -951,11 +1104,7 @@ fn handle_check_credential(config: &HowyConfig, username: &str) -> Response {
     }
 }
 
-fn handle_revoke_credential(
-    config: &HowyConfig,
-    username: &str,
-    session_id: &str,
-) -> Response {
+fn handle_revoke_credential(config: &HowyConfig, username: &str, session_id: &str) -> Response {
     if !is_valid_username(username) {
         return Response::error("invalid username");
     }
@@ -1003,7 +1152,10 @@ fn try_acquire_camera_lock<'a>(
             }
             Err(TryLockError::WouldBlock) => {
                 if start.elapsed() >= timeout {
-                    warn!(timeout_secs = timeout.as_secs(), "Timed out waiting for camera lock");
+                    warn!(
+                        timeout_secs = timeout.as_secs(),
+                        "Timed out waiting for camera lock"
+                    );
                     return Err(Response::error("camera busy"));
                 }
 
@@ -1034,8 +1186,10 @@ fn is_dark_frame(frame: &Frame, threshold: f32) -> bool {
         FrameFormat::Bgr => {
             for i in (0..frame.data.len()).step_by(48) {
                 if i + 2 < frame.data.len() {
-                    let brightness =
-                        (frame.data[i] as u32 + frame.data[i + 1] as u32 + frame.data[i + 2] as u32) / 3;
+                    let brightness = (frame.data[i] as u32
+                        + frame.data[i + 1] as u32
+                        + frame.data[i + 2] as u32)
+                        / 3;
                     if brightness < 30 {
                         dark_count += 1;
                     }
@@ -1054,8 +1208,8 @@ fn is_dark_frame(frame: &Frame, threshold: f32) -> bool {
 
 /// Load an image file from disk and convert to BGR pixel data.
 fn load_image_as_bgr(path: &std::path::Path) -> anyhow::Result<(Vec<u8>, u32, u32)> {
-    let img = image::open(path)
-        .with_context(|| format!("failed to open image: {}", path.display()))?;
+    let img =
+        image::open(path).with_context(|| format!("failed to open image: {}", path.display()))?;
     let rgb = img.to_rgb8();
     let width = rgb.width();
     let height = rgb.height();
@@ -1116,11 +1270,7 @@ fn get_peer_uid(stream: &UnixStream) -> Option<u32> {
         )
     };
 
-    if ret == 0 {
-        Some(cred.uid)
-    } else {
-        None
-    }
+    if ret == 0 { Some(cred.uid) } else { None }
 }
 
 fn is_valid_username(username: &str) -> bool {
