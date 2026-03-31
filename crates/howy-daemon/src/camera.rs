@@ -15,6 +15,7 @@
 
 use std::io::{BufReader, Read};
 use std::path::Path;
+use std::pin::Pin;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -23,6 +24,8 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use opencv::{core, imgproc, prelude::*, videoio};
 use tracing::{debug, info, warn};
+use v4l::buffer::Type as BufType;
+use v4l::io::traits::CaptureStream;
 use v4l::video::Capture as CaptureTraitImport;
 
 /// Pixel format of a captured frame.
@@ -90,8 +93,25 @@ enum CaptureMessage {
 }
 
 enum Backend {
+    V4l2Mmap(V4l2MmapBackend),
     OpenCv(OpenCvBackend),
     Ffmpeg(FfmpegBackend),
+}
+
+/// V4L2 mmap streaming backend — ~70ms faster first-frame than OpenCV.
+///
+/// Uses raw V4L2 mmap buffers instead of OpenCV's VideoCapture.
+/// The `Device` is heap-pinned and the `Stream` borrows it; both are dropped
+/// together (stream first) so the borrow is always valid.
+struct V4l2MmapBackend {
+    // SAFETY: `stream` is dropped before `_device` because fields drop in
+    // declaration order. The stream borrows device's handle via Arc, so
+    // it remains valid for the stream's lifetime.
+    stream: v4l::io::mmap::Stream<'static>,
+    _device: Pin<Box<v4l::Device>>,
+    width: u32,
+    height: u32,
+    format: CaptureFormat,
 }
 
 struct OpenCvBackend {
@@ -276,8 +296,9 @@ fn capture_worker_loop(
             Err(mpsc::TryRecvError::Empty) => {}
         }
 
-        let using_opencv = matches!(&backend, Backend::OpenCv(_));
+        let can_fallback = matches!(&backend, Backend::V4l2Mmap(_) | Backend::OpenCv(_));
         let frame_result = match &mut backend {
+            Backend::V4l2Mmap(backend) => backend.next_frame(),
             Backend::OpenCv(backend) => backend.next_frame(),
             Backend::Ffmpeg(backend) => backend.next_frame(),
         };
@@ -289,22 +310,31 @@ fn capture_worker_loop(
                     return;
                 }
             }
-            Err(e) if using_opencv => {
-                warn!("OpenCV capture failed: {e:#}; falling back to ffmpeg");
+            Err(e) if can_fallback => {
+                warn!("Capture failed ({e:#}); falling back to next backend");
+                // Try OpenCV first, then ffmpeg
+                match OpenCvBackend::new(&device_path, width, height, fps, exposure) {
+                    Ok(opencv_backend) => {
+                        info!("Fell back to OpenCV camera backend");
+                        backend = Backend::OpenCv(opencv_backend);
+                        continue;
+                    }
+                    Err(opencv_err) => {
+                        debug!("OpenCV fallback failed: {opencv_err:#}");
+                    }
+                }
                 match FfmpegBackend::new(&device_path, width, height, format, fps) {
                     Ok(ffmpeg_backend) => {
-                        info!("Using ffmpeg camera backend");
+                        info!("Fell back to ffmpeg camera backend");
                         backend = Backend::Ffmpeg(ffmpeg_backend);
                     }
                     Err(fallback_error) => {
-                        warn!(
-                            "ffmpeg fallback failed after OpenCV capture error: {fallback_error:#}"
-                        );
+                        warn!("All backends failed: {e:#}; ffmpeg: {fallback_error:#}");
                         let _ = publish_message(
                             &latest_message,
                             &notify_tx,
                             CaptureMessage::Error(format!(
-                                "OpenCV capture failed: {e:#}; ffmpeg fallback failed: {fallback_error:#}"
+                                "All capture backends failed: {e:#}; ffmpeg: {fallback_error:#}"
                             )),
                         );
                         return;
@@ -332,6 +362,16 @@ fn start_backend(
     fps: i32,
     exposure: i32,
 ) -> Result<Backend> {
+    // Priority: V4L2 mmap (fastest) → OpenCV → ffmpeg
+    match V4l2MmapBackend::new(device_path, width, height, format) {
+        Ok(backend) => {
+            return Ok(Backend::V4l2Mmap(backend));
+        }
+        Err(e) => {
+            debug!("V4L2 mmap backend unavailable: {e:#}; trying OpenCV");
+        }
+    }
+
     match OpenCvBackend::new(device_path, width, height, fps, exposure) {
         Ok(backend) => {
             info!("Using OpenCV CAP_V4L camera backend");
@@ -378,6 +418,120 @@ fn decode_capture_message(message: CaptureMessage) -> Result<Frame> {
     match message {
         CaptureMessage::Frame(frame) => Ok(frame),
         CaptureMessage::Error(message) => Err(anyhow!(message)),
+    }
+}
+
+impl V4l2MmapBackend {
+    fn new(device_path: &str, width: u32, height: u32, format: CaptureFormat) -> Result<Self> {
+        use v4l::format::Format;
+        use v4l::FourCC;
+
+        let dev =
+            v4l::Device::with_path(device_path).context("failed to open V4L2 device for mmap")?;
+
+        let fourcc = match format {
+            CaptureFormat::Grey => FourCC::new(b"GREY"),
+            CaptureFormat::Yuyv => FourCC::new(b"YUYV"),
+            CaptureFormat::Mjpeg => FourCC::new(b"MJPG"),
+        };
+        let fmt = Format::new(width, height, fourcc);
+        let actual = CaptureTraitImport::set_format(&dev, &fmt)
+            .context("V4L2 mmap: failed to set format")?;
+
+        let actual_w = actual.width;
+        let actual_h = actual.height;
+        let actual_fmt = match &actual.fourcc.repr {
+            b"GREY" => CaptureFormat::Grey,
+            b"YUYV" => CaptureFormat::Yuyv,
+            b"MJPG" => CaptureFormat::Mjpeg,
+            other => {
+                bail!(
+                    "V4L2 mmap: unsupported format {:?}",
+                    std::str::from_utf8(other).unwrap_or("???")
+                );
+            }
+        };
+
+        // Pin the device on the heap so its address is stable.
+        let device = Box::pin(dev);
+
+        // SAFETY: We transmute the stream lifetime to 'static. This is safe
+        // because the stream is stored in the same struct as the device and
+        // fields drop in declaration order (stream before _device). The stream
+        // only holds an Arc<Handle> cloned from the device, not a direct reference.
+        let stream = unsafe {
+            let dev_ref: &v4l::Device = &*device;
+            let dev_ref_static: &'static v4l::Device = std::mem::transmute(dev_ref);
+            v4l::io::mmap::Stream::with_buffers(dev_ref_static, BufType::VideoCapture, 2)
+                .context("V4L2 mmap: failed to create stream")?
+        };
+
+        info!("Using V4L2 mmap backend: {actual_w}x{actual_h} ({actual_fmt:?})");
+
+        Ok(Self {
+            stream,
+            _device: device,
+            width: actual_w,
+            height: actual_h,
+            format: actual_fmt,
+        })
+    }
+
+    fn next_frame(&mut self) -> Result<Frame> {
+        let (buf, _meta) = self
+            .stream
+            .next()
+            .context("V4L2 mmap: failed to read frame")?;
+
+        match self.format {
+            CaptureFormat::Grey => Ok(Frame {
+                data: buf.to_vec(),
+                width: self.width,
+                height: self.height,
+                format: FrameFormat::Gray,
+            }),
+            CaptureFormat::Yuyv => {
+                // YUYV → BGR conversion: each 4 bytes = 2 pixels
+                let npixels = (self.width * self.height) as usize;
+                let mut bgr = Vec::with_capacity(npixels * 3);
+                for chunk in buf.chunks_exact(4) {
+                    let y0 = chunk[0] as f32;
+                    let u = chunk[1] as f32 - 128.0;
+                    let y1 = chunk[2] as f32;
+                    let v = chunk[3] as f32 - 128.0;
+                    for y in [y0, y1] {
+                        let r = (y + 1.402 * v).clamp(0.0, 255.0) as u8;
+                        let g = (y - 0.344 * u - 0.714 * v).clamp(0.0, 255.0) as u8;
+                        let b = (y + 1.772 * u).clamp(0.0, 255.0) as u8;
+                        bgr.push(b);
+                        bgr.push(g);
+                        bgr.push(r);
+                    }
+                }
+                Ok(Frame {
+                    data: bgr,
+                    width: self.width,
+                    height: self.height,
+                    format: FrameFormat::Bgr,
+                })
+            }
+            CaptureFormat::Mjpeg => {
+                // Decode MJPEG via OpenCV
+                let mat = core::Mat::from_slice(buf)
+                    .context("V4L2 mmap: failed to create Mat from MJPEG")?;
+                let decoded = opencv::imgcodecs::imdecode(&mat, opencv::imgcodecs::IMREAD_COLOR)
+                    .context("V4L2 mmap: MJPEG decode failed")?;
+                if decoded.empty() {
+                    bail!("V4L2 mmap: MJPEG decode returned empty frame");
+                }
+                Ok(Frame {
+                    data: decoded.data_bytes()?.to_vec(),
+                    width: decoded.cols() as u32,
+                    height: decoded.rows() as u32,
+                    format: FrameFormat::Bgr,
+                })
+            }
+        }
     }
 }
 

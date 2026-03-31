@@ -33,6 +33,10 @@ path = "../../tests/camera_read_test.rs"
 name = "capture_bench"
 path = "../../tests/capture_bench.rs"
 
+[[bin]]
+name = "camera_startup_bench"
+path = "../../tests/camera_startup_bench.rs"
+
 [dependencies]
 howy-common = { path = "../howy-common" }
 
