@@ -36,6 +36,10 @@ struct CachedModels {
     flat_embeddings: Arc<Vec<f32>>,
     /// Number of embeddings (flat_embeddings.len() / 512).
     num_embeddings: usize,
+    /// File mtime when loaded, used to detect external modifications.
+    file_mtime: Option<std::time::SystemTime>,
+    /// Path the models were loaded from.
+    file_path: Option<std::path::PathBuf>,
 }
 
 /// In-memory cache for user face models.
@@ -51,16 +55,26 @@ impl ModelCache {
     }
 
     /// Get cached models for a user. Loads from disk on first access.
+    /// Re-loads if the file has been modified externally (CLI add/remove/clear).
     fn get_or_load(&mut self, username: &str) -> std::result::Result<&CachedModels, String> {
-        if !self.entries.contains_key(username) {
-            let user_models = load_user_models_from_disk(username)?
-                .ok_or_else(|| "no face models enrolled".to_string())?;
+        // Check if cached entry is stale (file modified externally)
+        let stale = if let Some(cached) = self.entries.get(username) {
+            is_cache_stale(cached)
+        } else {
+            true // not cached at all
+        };
 
+        if stale {
+            self.entries.remove(username);
+
+            let (user_models, path, mtime) = load_user_models_with_meta(username)?;
             if user_models.models.is_empty() {
                 return Err("no face models enrolled".to_string());
             }
 
-            let cached = build_cached_models(user_models)?;
+            let mut cached = build_cached_models(user_models)?;
+            cached.file_mtime = mtime;
+            cached.file_path = path;
             self.entries.insert(username.to_string(), cached);
         }
 
@@ -73,26 +87,56 @@ impl ModelCache {
     }
 }
 
-fn load_user_models_from_disk(username: &str) -> std::result::Result<Option<UserModels>, String> {
+/// Check if a cached entry is stale by comparing file mtime.
+fn is_cache_stale(cached: &CachedModels) -> bool {
+    let path = match &cached.file_path {
+        Some(p) => p,
+        None => return true,
+    };
+    let cached_mtime = match cached.file_mtime {
+        Some(t) => t,
+        None => return true,
+    };
+    match std::fs::metadata(path) {
+        Ok(meta) => match meta.modified() {
+            Ok(disk_mtime) => disk_mtime != cached_mtime,
+            Err(_) => true,
+        },
+        Err(_) => true, // file deleted or inaccessible → stale
+    }
+}
+
+/// Load user models from disk along with file metadata for cache validation.
+fn load_user_models_with_meta(
+    username: &str,
+) -> std::result::Result<(UserModels, Option<std::path::PathBuf>, Option<std::time::SystemTime>), String> {
     let model_path = paths::user_model_path(username)
         .ok_or_else(|| "invalid username".to_string())?;
 
     if model_path.exists() {
-        return UserModels::load(&model_path)
-            .map(Some)
-            .map_err(|e| format!("failed to load models: {e}"));
+        let mtime = std::fs::metadata(&model_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let models = UserModels::load(&model_path)
+            .map_err(|e| format!("failed to load models: {e}"))?;
+        return Ok((models, Some(model_path), mtime));
     }
 
     if let Some(legacy) = paths::user_model_path_legacy(username) {
         if legacy.exists() {
-            return UserModels::load(&legacy)
-                .map(Some)
-                .map_err(|e| format!("failed to load legacy models: {e}"));
+            let mtime = std::fs::metadata(&legacy)
+                .ok()
+                .and_then(|m| m.modified().ok());
+            let models = UserModels::load(&legacy)
+                .map_err(|e| format!("failed to load legacy models: {e}"))?;
+            return Ok((models, Some(legacy), mtime));
         }
     }
 
-    Ok(None)
+    Err("no face models enrolled".to_string())
 }
+
+
 
 fn build_cached_models(user_models: UserModels) -> std::result::Result<CachedModels, String> {
     let mut labels = Vec::with_capacity(user_models.models.len());
@@ -122,6 +166,8 @@ fn build_cached_models(user_models: UserModels) -> std::result::Result<CachedMod
         labels,
         flat_embeddings: Arc::new(flat),
         num_embeddings,
+        file_mtime: None,
+        file_path: None,
     })
 }
 
@@ -713,14 +759,9 @@ fn handle_enroll_batch(
         if let Some(cached) = cache.entries.get(username) {
             cached.models.clone()
         } else {
-            match load_user_models_from_disk(username) {
-                Ok(Some(models)) => models,
-                Ok(None) => UserModels::new(username),
-                Err(e) => {
-                    return Response::error(&format!(
-                        "{e} (refusing to overwrite existing enrollments)"
-                    ));
-                }
+            match load_user_models_with_meta(username) {
+                Ok((models, _, _)) => models,
+                Err(_) => UserModels::new(username),
             }
         }
     };
