@@ -56,7 +56,9 @@ fn main() {
     println!("[3] Detection on blank frame (640x480)...");
     let blank = vec![128u8; 640 * 480 * 3]; // gray frame
     let t0 = Instant::now();
-    let faces = engine.detect(&blank, 640, 480).expect("Detection failed");
+    let faces = engine
+        .detect(&blank, 640, 480, false)
+        .expect("Detection failed");
     let det_time = t0.elapsed();
     println!(
         "    Found {} faces in {:.1}ms",
@@ -70,7 +72,7 @@ fn main() {
     let synthetic = make_synthetic_face(640, 480);
     let t0 = Instant::now();
     let faces = engine
-        .detect(&synthetic, 640, 480)
+        .detect(&synthetic, 640, 480, false)
         .expect("Detection failed");
     let det_time = t0.elapsed();
     println!(
@@ -98,7 +100,7 @@ fn main() {
     println!("[5] Full analyze pipeline (detect + encode)...");
     let t0 = Instant::now();
     let analyzed = engine
-        .analyze(&synthetic, 640, 480)
+        .analyze(&synthetic, 640, 480, false)
         .expect("Analyze failed");
     let full_time = t0.elapsed();
     println!(
@@ -137,10 +139,10 @@ fn main() {
     // 6. Consistency: same image should produce similar embeddings
     println!("[6] Consistency check (same image twice)...");
     let a1 = engine
-        .analyze(&synthetic, 640, 480)
+        .analyze(&synthetic, 640, 480, false)
         .expect("Analyze 1 failed");
     let a2 = engine
-        .analyze(&synthetic, 640, 480)
+        .analyze(&synthetic, 640, 480, false)
         .expect("Analyze 2 failed");
     if !a1.is_empty() && !a2.is_empty() {
         if let (Some(e1), Some(e2)) = (&a1[0].embedding, &a2[0].embedding) {
@@ -162,8 +164,12 @@ fn main() {
     println!("[7] Discrimination check (different patterns)...");
     let pattern_a = make_synthetic_face(640, 480);
     let pattern_b = make_different_pattern(640, 480);
-    let fa = engine.analyze(&pattern_a, 640, 480).unwrap_or_default();
-    let fb = engine.analyze(&pattern_b, 640, 480).unwrap_or_default();
+    let fa = engine
+        .analyze(&pattern_a, 640, 480, false)
+        .unwrap_or_default();
+    let fb = engine
+        .analyze(&pattern_b, 640, 480, false)
+        .unwrap_or_default();
     if !fa.is_empty() && !fb.is_empty() {
         if let (Some(ea), Some(eb)) = (&fa[0].embedding, &fb[0].embedding) {
             let sim: f32 = ea.iter().zip(eb.iter()).map(|(a, b)| a * b).sum();
@@ -182,7 +188,7 @@ fn main() {
     println!("\n[8] Throughput test (10 frames)...");
     let t0 = Instant::now();
     for _ in 0..10 {
-        let _ = engine.detect(&synthetic, 640, 480);
+        let _ = engine.detect(&synthetic, 640, 480, false);
     }
     let batch_time = t0.elapsed();
     let fps = 10.0 / batch_time.as_secs_f64();

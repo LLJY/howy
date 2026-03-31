@@ -131,12 +131,22 @@ pub struct VideoConfig {
     pub max_height: u32,
     /// Dark frame threshold (0-100). Higher = more tolerant of dark frames.
     pub dark_threshold: f32,
+    /// Maximum consecutive dark frames before failing auth early.
+    /// 0 = no limit (rely on timeout only). Useful for detecting a covered
+    /// or broken camera without burning the full timeout.
+    pub max_dark_frames: u32,
     /// Requested capture width (-1 = device default).
     pub frame_width: i32,
     /// Requested capture height (-1 = device default).
     pub frame_height: i32,
     /// Frame rotation mode: 0 = landscape only, 1 = both, 2 = portrait only.
     pub rotate: u8,
+    /// Requested capture FPS (-1 = device default).
+    /// Some IR emitters need a specific frame rate to function properly.
+    pub device_fps: i32,
+    /// Explicit exposure value (-1 = auto-exposure).
+    /// Disables auto-exposure when set. Use qv4l2 to find a good value.
+    pub exposure: i32,
 }
 
 impl Default for VideoConfig {
@@ -146,9 +156,12 @@ impl Default for VideoConfig {
             device_path: String::new(),
             max_height: 320,
             dark_threshold: 60.0,
+            max_dark_frames: 15,
             frame_width: -1,
             frame_height: -1,
             rotate: 0,
+            device_fps: -1,
+            exposure: -1,
         }
     }
 }

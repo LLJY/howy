@@ -153,7 +153,7 @@ fn cmd_add(user: &str, label: Option<String>, _skip_confirm: bool) -> Result<()>
     println!("Look directly at the camera...");
 
     // Connect to daemon and request enrollment
-    let client = DaemonClient::default_path().with_timeout(std::time::Duration::from_secs(10));
+    let mut client = DaemonClient::default_path().with_timeout(std::time::Duration::from_secs(10));
 
     let response = client.request(&Request::enroll(user, &label))?;
 
@@ -244,7 +244,7 @@ fn cmd_enroll_batch(
 
     println!("Enrolling {image_count} frame(s) for user '{user}' with label '{label}'...");
 
-    let client = DaemonClient::default_path().with_timeout(std::time::Duration::from_secs(120));
+    let mut client = DaemonClient::default_path().with_timeout(std::time::Duration::from_secs(120));
 
     let response = client.request(&Request::enroll_batch(user, session_dir, &label))?;
 
@@ -413,7 +413,7 @@ fn cmd_clear(user: &str, skip_confirm: bool) -> Result<()> {
 fn cmd_test(user: &str) -> Result<()> {
     println!("Testing face recognition for '{user}'...");
 
-    let client = DaemonClient::default_path().with_timeout(std::time::Duration::from_secs(10));
+    let mut client = DaemonClient::default_path().with_timeout(std::time::Duration::from_secs(10));
 
     let response = client.authenticate(user, 0)?;
 
@@ -445,7 +445,7 @@ fn cmd_test(user: &str) -> Result<()> {
 }
 
 fn cmd_status() -> Result<()> {
-    let client = DaemonClient::default_path();
+    let mut client = DaemonClient::default_path();
 
     if !client.ping() {
         println!("Daemon: NOT RUNNING");
@@ -518,7 +518,7 @@ fn cmd_doctor() -> Result<()> {
 
     println!("\nDaemon:");
     println!("  Socket path: {}", howy_common::paths::SOCKET_PATH);
-    let client = DaemonClient::default_path();
+    let mut client = DaemonClient::default_path();
     match client.request(&Request::info()) {
         Ok(response) => match response.result {
             Some(RespResult::Info(info)) => {

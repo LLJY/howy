@@ -18,7 +18,7 @@ use howy_common::ipc;
 use howy_common::paths;
 use howy_common::protocol::{self, Cmd, Request, RespResult, Response};
 
-use crate::camera::Camera;
+use crate::camera::{Camera, Frame, FrameFormat};
 use crate::inference::InferenceEngine;
 
 /// Serialize passwd lookups because getpwnam is not thread-safe.
@@ -273,6 +273,8 @@ fn handle_authenticate(
         &config.video.device_path,
         config.video.frame_width,
         config.video.frame_height,
+        config.video.device_fps,
+        config.video.exposure,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -294,8 +296,8 @@ fn handle_authenticate(
     // Main recognition loop
     while start.elapsed() < deadline {
         // Capture frame
-        let (bgr_data, width, height) = match camera.capture_frame() {
-            Ok(f) => f,
+        let frame = match camera.capture_frame() {
+            Ok(frame) => frame,
             Err(e) => {
                 warn!(username, error = %e, "Authentication infrastructure failure capturing frame");
                 return Response::error(&format!("Camera capture failed: {e}"));
@@ -305,13 +307,30 @@ fn handle_authenticate(
         frames_processed += 1;
 
         // Check for dark/black frames
-        if is_dark_frame(&bgr_data, config.video.dark_threshold) {
+        if is_dark_frame(&frame, config.video.dark_threshold) {
             dark_frames += 1;
+            if config.video.max_dark_frames > 0 && dark_frames >= config.video.max_dark_frames {
+                info!(
+                    username,
+                    dark_frames,
+                    "Exceeded max consecutive dark frames — camera may be covered"
+                );
+                return Response::auth_failed(
+                    0.0,
+                    frames_processed,
+                    &format!(
+                        "Too many dark frames ({dark_frames}) — camera may be covered or IR emitter not working"
+                    ),
+                );
+            }
             continue;
         }
+        // Reset dark frame counter on a good frame
+        dark_frames = 0;
 
         // Detect and encode faces
-        let faces = match engine.analyze(&bgr_data, width, height) {
+        let is_gray = frame.format == FrameFormat::Gray;
+        let faces = match engine.analyze(&frame.data, frame.width, frame.height, is_gray) {
             Ok(f) => f,
             Err(e) => {
                 debug!("Detection error: {e}");
@@ -416,6 +435,8 @@ fn handle_enroll(
         &config.video.device_path,
         config.video.frame_width,
         config.video.frame_height,
+        config.video.device_fps,
+        config.video.exposure,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -435,19 +456,20 @@ fn handle_enroll(
     let start = Instant::now();
 
     while start.elapsed() < deadline {
-        let (bgr_data, width, height) = match camera.capture_frame() {
-            Ok(f) => f,
+        let frame = match camera.capture_frame() {
+            Ok(frame) => frame,
             Err(e) => {
                 warn!(username, error = %e, "Enrollment infrastructure failure capturing frame");
                 return Response::error(&format!("Camera capture failed: {e}"));
             }
         };
 
-        if is_dark_frame(&bgr_data, config.video.dark_threshold) {
+        if is_dark_frame(&frame, config.video.dark_threshold) {
             continue;
         }
 
-        match engine.analyze(&bgr_data, width, height) {
+        let is_gray = frame.format == FrameFormat::Gray;
+        match engine.analyze(&frame.data, frame.width, frame.height, is_gray) {
             Ok(faces) => {
                 for face_result in &faces {
                     if let Some(ref emb) = face_result.embedding {
@@ -607,7 +629,7 @@ fn handle_enroll_batch(
         };
 
         // Detect faces
-        let faces = match engine.analyze(&bgr_data, width, height) {
+        let faces = match engine.analyze(&bgr_data, width, height, false) {
             Ok(f) => f,
             Err(e) => {
                 frames_rejected += 1;
@@ -717,7 +739,7 @@ fn handle_detect(
 ) -> Response {
     let start = Instant::now();
 
-    match engine.analyze(frame, width, height) {
+    match engine.analyze(frame, width, height, false) {
         Ok(faces) => Response {
             result: Some(RespResult::Detected(protocol::DetectResult {
                 faces: faces
@@ -813,24 +835,34 @@ fn try_acquire_camera_lock<'a>(
 }
 
 /// Check if a frame is too dark for face detection.
-fn is_dark_frame(bgr_data: &[u8], threshold: f32) -> bool {
-    if bgr_data.is_empty() {
+fn is_dark_frame(frame: &Frame, threshold: f32) -> bool {
+    if frame.data.is_empty() {
         return true;
     }
 
-    // Sample every 16th pixel for speed
     let mut dark_count = 0u32;
     let mut total = 0u32;
 
-    for i in (0..bgr_data.len()).step_by(48) {
-        // 16 pixels * 3 channels
-        if i + 2 < bgr_data.len() {
-            let brightness =
-                (bgr_data[i] as u32 + bgr_data[i + 1] as u32 + bgr_data[i + 2] as u32) / 3;
-            if brightness < 30 {
-                dark_count += 1;
+    match frame.format {
+        FrameFormat::Gray => {
+            for &g in frame.data.iter().step_by(16) {
+                if g < 30 {
+                    dark_count += 1;
+                }
+                total += 1;
             }
-            total += 1;
+        }
+        FrameFormat::Bgr => {
+            for i in (0..frame.data.len()).step_by(48) {
+                if i + 2 < frame.data.len() {
+                    let brightness =
+                        (frame.data[i] as u32 + frame.data[i + 1] as u32 + frame.data[i + 2] as u32) / 3;
+                    if brightness < 30 {
+                        dark_count += 1;
+                    }
+                    total += 1;
+                }
+            }
         }
     }
 
@@ -838,8 +870,7 @@ fn is_dark_frame(bgr_data: &[u8], threshold: f32) -> bool {
         return true;
     }
 
-    let dark_pct = (dark_count as f32 / total as f32) * 100.0;
-    dark_pct > threshold
+    (dark_count as f32 / total as f32) * 100.0 > threshold
 }
 
 /// Load an image file from disk and convert to BGR pixel data.

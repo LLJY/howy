@@ -32,6 +32,24 @@ pub fn send_message<W: Write, M: Message>(writer: &mut W, msg: &M) -> io::Result
     Ok(())
 }
 
+/// Send a protobuf message, reusing the provided buffer to avoid allocation.
+fn send_message_reuse<W: Write, M: Message>(
+    buf: &mut Vec<u8>,
+    writer: &mut W,
+    msg: &M,
+) -> io::Result<()> {
+    buf.clear();
+    let len = msg.encoded_len();
+    let len_bytes = (len as u32).to_be_bytes();
+    buf.reserve(4 + len);
+    buf.extend_from_slice(&len_bytes);
+    msg.encode(buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    writer.write_all(buf)?;
+    writer.flush()?;
+    Ok(())
+}
+
 /// Receive a protobuf message from a stream with length-prefix framing.
 pub fn recv_message<R: Read, M: Message + Default>(reader: &mut R) -> io::Result<M> {
     let mut len_buf = [0u8; 4];
@@ -52,9 +70,14 @@ pub fn recv_message<R: Read, M: Message + Default>(reader: &mut R) -> io::Result
 }
 
 /// A client that connects to the howy daemon over Unix socket.
+///
+/// Each request opens a fresh connection because the daemon handles one
+/// request per connection. The send buffer is reused across calls to
+/// avoid repeated heap allocation.
 pub struct DaemonClient {
     socket_path: String,
     timeout: Duration,
+    tx_buf: Vec<u8>,
 }
 
 impl DaemonClient {
@@ -62,6 +85,7 @@ impl DaemonClient {
         Self {
             socket_path: socket_path.to_string(),
             timeout: Duration::from_secs(10),
+            tx_buf: Vec::with_capacity(256),
         }
     }
 
@@ -78,17 +102,18 @@ impl DaemonClient {
     }
 
     /// Send a request and receive a response.
-    pub fn request(&self, req: &Request) -> io::Result<Response> {
+    /// Opens a fresh connection per request (daemon is one-shot per connection).
+    pub fn request(&mut self, req: &Request) -> io::Result<Response> {
         let mut stream = UnixStream::connect(&self.socket_path)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-        send_message(&mut stream, req)?;
+        send_message_reuse(&mut self.tx_buf, &mut stream, req)?;
         recv_message(&mut stream)
     }
 
     /// Quick health check.
-    pub fn ping(&self) -> bool {
+    pub fn ping(&mut self) -> bool {
         matches!(
             self.request(&Request::ping()),
             Ok(Response {
@@ -99,17 +124,17 @@ impl DaemonClient {
     }
 
     /// Authenticate a user.
-    pub fn authenticate(&self, username: &str, timeout: u32) -> io::Result<Response> {
+    pub fn authenticate(&mut self, username: &str, timeout: u32) -> io::Result<Response> {
         self.request(&Request::authenticate(username, timeout))
     }
 
     /// Check cached credential.
-    pub fn check_credential(&self, username: &str) -> io::Result<Response> {
+    pub fn check_credential(&mut self, username: &str) -> io::Result<Response> {
         self.request(&Request::check_credential(username))
     }
 
     /// Revoke a cached credential.
-    pub fn revoke_credential(&self, username: &str, session_id: &str) -> io::Result<Response> {
+    pub fn revoke_credential(&mut self, username: &str, session_id: &str) -> io::Result<Response> {
         self.request(&Request::revoke_credential(username, session_id))
     }
 }

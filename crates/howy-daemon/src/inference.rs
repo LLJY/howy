@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
-use ndarray::Array4;
+use ndarray::ArrayView4;
 use ort::execution_providers::{
     CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider, MIGraphXExecutionProvider,
     OpenVINOExecutionProvider, TensorRTExecutionProvider,
@@ -38,10 +38,26 @@ const ARCFACE_DST: [[f32; 2]; 5] = [
     [70.7299, 92.2041],
 ];
 
+/// Detector session with pre-allocated input buffer.
+struct DetectorState {
+    session: Session,
+    /// Pre-allocated NCHW buffer: 1 * 3 * det_h * det_w.
+    input_buf: Vec<f32>,
+    det_w: usize,
+    det_h: usize,
+}
+
+/// Recognizer session with pre-allocated input buffer.
+struct RecognizerState {
+    session: Session,
+    /// Pre-allocated NCHW buffer: 1 * 3 * 112 * 112 = 37632 floats.
+    input_buf: Vec<f32>,
+}
+
 /// The inference engine holding loaded ONNX sessions.
 pub struct InferenceEngine {
-    detector: Mutex<Session>,
-    recognizer: Mutex<Session>,
+    detector: Mutex<DetectorState>,
+    recognizer: Mutex<RecognizerState>,
     det_input_name: String,
     rec_input_name: String,
     det_size: (u32, u32),
@@ -99,7 +115,7 @@ impl InferenceEngine {
 
         let (mut det_builder, det_provider) =
             configure_execution_providers(det_builder, &det_plan, "detector")?;
-        let detector = map_ort!(det_builder.commit_from_file(&detector_path))
+        let det_session = map_ort!(det_builder.commit_from_file(&detector_path))
             .context("failed to load detector model")?;
 
         // Create recognizer session
@@ -113,12 +129,15 @@ impl InferenceEngine {
 
         let (mut rec_builder, rec_provider) =
             configure_execution_providers(rec_builder, &rec_plan, "recognizer")?;
-        let recognizer = map_ort!(rec_builder.commit_from_file(&recognizer_path))
+        let rec_session = map_ort!(rec_builder.commit_from_file(&recognizer_path))
             .context("failed to load recognizer model")?;
 
         // Get input names
-        let det_input_name = detector.inputs()[0].name().to_string();
-        let rec_input_name = recognizer.inputs()[0].name().to_string();
+        let det_input_name = det_session.inputs()[0].name().to_string();
+        let rec_input_name = rec_session.inputs()[0].name().to_string();
+
+        let det_w = config.ml.det_width as usize;
+        let det_h = config.ml.det_height as usize;
 
         let active_provider = if det_provider == rec_provider {
             det_provider
@@ -141,8 +160,16 @@ impl InferenceEngine {
         info!("Recognizer input: {rec_input_name}");
 
         Ok(Self {
-            detector: Mutex::new(detector),
-            recognizer: Mutex::new(recognizer),
+            detector: Mutex::new(DetectorState {
+                session: det_session,
+                input_buf: vec![0.0f32; 3 * det_w * det_h],
+                det_w,
+                det_h,
+            }),
+            recognizer: Mutex::new(RecognizerState {
+                session: rec_session,
+                input_buf: vec![0.0f32; 3 * 112 * 112],
+            }),
             det_input_name,
             rec_input_name,
             det_size: (config.ml.det_width, config.ml.det_height),
@@ -169,29 +196,48 @@ impl InferenceEngine {
     pub fn warmup(&self) -> Result<()> {
         info!("Running warmup inference...");
         let dummy = vec![0u8; 480 * 640 * 3];
-        let _ = self.detect(&dummy, 640, 480)?;
+        let _ = self.detect(&dummy, 640, 480, false)?;
         info!("Warmup complete");
         Ok(())
     }
 
-    /// Detect faces in a raw BGR image buffer.
+    /// Detect faces in a raw BGR or grayscale image buffer.
     ///
     /// Returns detected faces with bounding boxes, landmarks, and confidence scores.
     /// Embeddings are NOT computed here — call `encode` separately.
-    pub fn detect(&self, bgr_data: &[u8], width: u32, height: u32) -> Result<Vec<Face>> {
-        let (det_w, det_h) = self.det_size;
+    pub fn detect(&self, data: &[u8], width: u32, height: u32, is_gray: bool) -> Result<Vec<Face>> {
+        // Validate buffer before acquiring mutex to avoid poisoning on bad input.
+        validate_frame_buffer(data, width, height, is_gray)?;
 
-        // Preprocess: resize, pad, normalize, transpose to NCHW
-        let input = preprocess_detection(bgr_data, width, height, det_w, det_h);
-        let scale = f32::min(det_w as f32 / width as f32, det_h as f32 / height as f32);
-
-        // Run detector
-        let mut detector = self
+        let mut det = self
             .detector
             .lock()
             .map_err(|e| anyhow::anyhow!("inference lock poisoned: {e}"))?;
-        let input_tensor = map_ort!(TensorRef::from_array_view(&input))?;
-        let outputs = map_ort!(detector.run(ort::inputs![&self.det_input_name => input_tensor]))?;
+
+        let det_w = det.det_w;
+        let det_h = det.det_h;
+        let (cfg_det_w, cfg_det_h) = self.det_size;
+        debug_assert_eq!(cfg_det_w as usize, det_w);
+        debug_assert_eq!(cfg_det_h as usize, det_h);
+        let scale = f32::min(det_w as f32 / width as f32, det_h as f32 / height as f32);
+
+        preprocess_detection_into(
+            &mut det.input_buf,
+            data,
+            width as usize,
+            height as usize,
+            det_w,
+            det_h,
+            is_gray,
+        );
+
+        let DetectorState {
+            session, input_buf, ..
+        } = &mut *det;
+        let input_view = ArrayView4::from_shape((1, 3, det_h, det_w), input_buf.as_slice())
+            .map_err(|e| anyhow::anyhow!("tensor shape error: {e}"))?;
+        let input_tensor = map_ort!(TensorRef::from_array_view(input_view))?;
+        let outputs = map_ort!(session.run(ort::inputs![&self.det_input_name => input_tensor]))?;
 
         // Post-process SCRFD outputs
         let faces = postprocess_scrfd(
@@ -199,8 +245,8 @@ impl InferenceEngine {
             scale,
             width,
             height,
-            det_w,
-            det_h,
+            det_w as u32,
+            det_h as u32,
             self.det_threshold,
         )?;
 
@@ -210,24 +256,33 @@ impl InferenceEngine {
     /// Compute a 512-dimensional ArcFace embedding for a detected face.
     pub fn encode(
         &self,
-        bgr_data: &[u8],
+        data: &[u8],
         width: u32,
         height: u32,
         face: &Face,
+        is_gray: bool,
     ) -> Result<Vec<f32>> {
-        // Align face to standard 112x112 position using landmarks
-        let aligned = align_face(bgr_data, width, height, &face.landmark_points());
+        validate_frame_buffer(data, width, height, is_gray)?;
 
-        // Preprocess for recognizer: RGB, normalize, NCHW
-        let input = preprocess_recognition(&aligned);
-
-        // Run recognizer
-        let mut recognizer = self
+        let mut rec = self
             .recognizer
             .lock()
             .map_err(|e| anyhow::anyhow!("inference lock poisoned: {e}"))?;
-        let input_tensor = map_ort!(TensorRef::from_array_view(&input))?;
-        let outputs = map_ort!(recognizer.run(ort::inputs![&self.rec_input_name => input_tensor]))?;
+
+        align_and_preprocess_recognition(
+            &mut rec.input_buf,
+            data,
+            width as usize,
+            height as usize,
+            &face.landmark_points(),
+            is_gray,
+        );
+
+        let RecognizerState { session, input_buf } = &mut *rec;
+        let input_view = ArrayView4::from_shape((1, 3, 112, 112), input_buf.as_slice())
+            .map_err(|e| anyhow::anyhow!("tensor shape error: {e}"))?;
+        let input_tensor = map_ort!(TensorRef::from_array_view(input_view))?;
+        let outputs = map_ort!(session.run(ort::inputs![&self.rec_input_name => input_tensor]))?;
 
         // Extract and normalize embedding
         let embedding_view = map_ort!(outputs[0].try_extract_array::<f32>())?;
@@ -245,11 +300,17 @@ impl InferenceEngine {
     }
 
     /// Detect faces and compute embeddings in one call.
-    pub fn analyze(&self, bgr_data: &[u8], width: u32, height: u32) -> Result<Vec<Face>> {
-        let mut faces = self.detect(bgr_data, width, height)?;
+    pub fn analyze(
+        &self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        is_gray: bool,
+    ) -> Result<Vec<Face>> {
+        let mut faces = self.detect(data, width, height, is_gray)?;
 
         for face in &mut faces {
-            let embedding = self.encode(bgr_data, width, height, face)?;
+            let embedding = self.encode(data, width, height, face, is_gray)?;
             face.embedding = Some(embedding);
         }
 
@@ -258,75 +319,91 @@ impl InferenceEngine {
 }
 
 // ---------------------------------------------------------------------------
+// Input validation
+// ---------------------------------------------------------------------------
+
+/// Validate frame buffer length matches declared dimensions and format.
+/// Called before acquiring mutex to prevent panics from poisoning sessions.
+fn validate_frame_buffer(data: &[u8], width: u32, height: u32, is_gray: bool) -> Result<()> {
+    let channels: u32 = if is_gray { 1 } else { 3 };
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|v| v.checked_mul(channels as usize))
+        .ok_or_else(|| anyhow::anyhow!("frame dimensions overflow: {width}x{height}x{channels}"))?;
+
+    if data.len() < expected {
+        bail!(
+            "frame buffer too small: got {} bytes, expected {} ({width}x{height}x{channels})",
+            data.len(),
+            expected,
+        );
+    }
+    if width == 0 || height == 0 {
+        bail!("frame dimensions must be non-zero: {width}x{height}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Preprocessing
 // ---------------------------------------------------------------------------
 
-/// Preprocess a BGR image for SCRFD detection.
-/// Returns an Array4 in NCHW format, float32, normalized.
-fn preprocess_detection(
-    bgr_data: &[u8],
-    src_w: u32,
-    src_h: u32,
-    det_w: u32,
-    det_h: u32,
-) -> Array4<f32> {
+/// Preprocess a BGR or grayscale image for SCRFD detection.
+/// Writes directly into `dst` in NCHW layout (3 * det_h * det_w floats).
+fn preprocess_detection_into(
+    dst: &mut [f32],
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    det_w: usize,
+    det_h: usize,
+    is_gray: bool,
+) {
+    const NORM_SUB: f32 = 127.5;
+    const NORM_DIV: f32 = 1.0 / 128.0;
+    const PAD: f32 = (0.0 - NORM_SUB) * NORM_DIV;
+
+    let plane = det_w * det_h;
+    for v in dst.iter_mut() {
+        *v = PAD;
+    }
+
     let scale = f32::min(det_w as f32 / src_w as f32, det_h as f32 / src_h as f32);
-    let new_w = (src_w as f32 * scale) as u32;
-    let new_h = (src_h as f32 * scale) as u32;
+    let new_w = (src_w as f32 * scale) as usize;
+    let new_h = (src_h as f32 * scale) as usize;
 
-    // Create padded output
-    let pad_value: f32 = -127.5 / 128.0;
-    let mut padded = vec![pad_value; (det_h * det_w * 3) as usize];
+    let (r_plane, rest) = dst.split_at_mut(plane);
+    let (g_plane, b_plane) = rest.split_at_mut(plane);
 
-    // Simple bilinear resize + BGR->RGB + normalize
-    for y in 0..new_h {
-        for x in 0..new_w {
-            let src_x = (x as f32 / scale).min((src_w - 1) as f32);
-            let src_y = (y as f32 / scale).min((src_h - 1) as f32);
-
-            let sx = src_x as u32;
-            let sy = src_y as u32;
-            let src_idx = ((sy * src_w + sx) * 3) as usize;
-
-            if src_idx + 2 < bgr_data.len() {
-                let dst_idx = ((y * det_w + x) * 3) as usize;
-                // BGR -> RGB and normalize
-                padded[dst_idx] = (bgr_data[src_idx + 2] as f32 - 127.5) / 128.0; // R
-                padded[dst_idx + 1] = (bgr_data[src_idx + 1] as f32 - 127.5) / 128.0; // G
-                padded[dst_idx + 2] = (bgr_data[src_idx] as f32 - 127.5) / 128.0;
-                // B
+    if is_gray {
+        for y in 0..new_h {
+            let src_y = ((y as f32 / scale) as usize).min(src_h - 1);
+            let dst_row = y * det_w;
+            let src_row = src_y * src_w;
+            for x in 0..new_w {
+                let src_x = ((x as f32 / scale) as usize).min(src_w - 1);
+                let val = (src[src_row + src_x] as f32 - NORM_SUB) * NORM_DIV;
+                let di = dst_row + x;
+                r_plane[di] = val;
+                g_plane[di] = val;
+                b_plane[di] = val;
+            }
+        }
+    } else {
+        for y in 0..new_h {
+            let src_y = ((y as f32 / scale) as usize).min(src_h - 1);
+            let dst_row = y * det_w;
+            let src_row_start = src_y * src_w * 3;
+            for x in 0..new_w {
+                let src_x = ((x as f32 / scale) as usize).min(src_w - 1);
+                let si = src_row_start + src_x * 3;
+                let di = dst_row + x;
+                r_plane[di] = (src[si + 2] as f32 - NORM_SUB) * NORM_DIV;
+                g_plane[di] = (src[si + 1] as f32 - NORM_SUB) * NORM_DIV;
+                b_plane[di] = (src[si] as f32 - NORM_SUB) * NORM_DIV;
             }
         }
     }
-
-    // HWC -> NCHW
-    let mut nchw = Array4::<f32>::zeros((1, 3, det_h as usize, det_w as usize));
-    for y in 0..det_h as usize {
-        for x in 0..det_w as usize {
-            let hwc_idx = (y * det_w as usize + x) * 3;
-            nchw[[0, 0, y, x]] = padded[hwc_idx]; // R
-            nchw[[0, 1, y, x]] = padded[hwc_idx + 1]; // G
-            nchw[[0, 2, y, x]] = padded[hwc_idx + 2]; // B
-        }
-    }
-
-    nchw
-}
-
-/// Preprocess a 112x112 aligned face for ArcFace recognition.
-fn preprocess_recognition(aligned_rgb: &[u8]) -> Array4<f32> {
-    let mut nchw = Array4::<f32>::zeros((1, 3, 112, 112));
-
-    for y in 0..112usize {
-        for x in 0..112usize {
-            let idx = (y * 112 + x) * 3;
-            nchw[[0, 0, y, x]] = (aligned_rgb[idx] as f32 - 127.5) / 127.5; // R
-            nchw[[0, 1, y, x]] = (aligned_rgb[idx + 1] as f32 - 127.5) / 127.5; // G
-            nchw[[0, 2, y, x]] = (aligned_rgb[idx + 2] as f32 - 127.5) / 127.5; // B
-        }
-    }
-
-    nchw
 }
 
 // ---------------------------------------------------------------------------
@@ -512,57 +589,95 @@ fn iou(a: &Face, b: &Face) -> f32 {
 // Face alignment
 // ---------------------------------------------------------------------------
 
-/// Align a face to the standard 112x112 ArcFace position.
-/// Uses a simple similarity transform estimated from 5-point landmarks.
-/// Returns RGB pixel data (112*112*3 bytes).
-fn align_face(bgr_data: &[u8], width: u32, height: u32, landmarks: &[(f32, f32); 5]) -> Vec<u8> {
-    // Estimate similarity transform from src landmarks to ArcFace dst landmarks
+/// Align face and preprocess for recognition in one fused pass.
+/// Writes directly into `dst` in NCHW layout (3 * 112 * 112 floats).
+/// `estimate_similarity_transform` already returns the inverse warp used here.
+fn align_and_preprocess_recognition(
+    dst: &mut [f32],
+    src: &[u8],
+    width: usize,
+    height: usize,
+    landmarks: &[(f32, f32); 5],
+    is_gray: bool,
+) {
+    const NORM_SUB: f32 = 127.5;
+    const NORM_DIV: f32 = 1.0 / 127.5;
+    const DEFAULT_VAL: f32 = (0.0 - NORM_SUB) * NORM_DIV;
+
+    let plane = 112 * 112;
+    for v in dst.iter_mut() {
+        *v = DEFAULT_VAL;
+    }
+
+    let (r_plane, rest) = dst.split_at_mut(plane);
+    let (g_plane, b_plane) = rest.split_at_mut(plane);
+
     let (a, b, tx, ty) = estimate_similarity_transform(landmarks, &ARCFACE_DST);
 
-    let mut aligned = vec![0u8; 112 * 112 * 3];
+    for dy in 0..112usize {
+        let row_sx = -b * dy as f32 + tx;
+        let row_sy = a * dy as f32 + ty;
+        let row_offset = dy * 112;
 
-    for dy in 0..112u32 {
-        for dx in 0..112u32 {
-            // Inverse transform: find source pixel
-            let src_x = a * dx as f32 - b * dy as f32 + tx;
-            let src_y = b * dx as f32 + a * dy as f32 + ty;
+        for dx in 0..112usize {
+            let src_x = a * dx as f32 + row_sx;
+            let src_y = b * dx as f32 + row_sy;
 
             let x0 = src_x.floor() as i32;
             let y0 = src_y.floor() as i32;
             let x1 = x0 + 1;
             let y1 = y0 + 1;
+
+            if x0 < 0 || x1 >= width as i32 || y0 < 0 || y1 >= height as i32 {
+                continue;
+            }
+
             let fx = src_x - x0 as f32;
             let fy = src_y - y0 as f32;
-            let dst_idx = (dy * 112 + dx) as usize * 3;
+            let w00 = (1.0 - fx) * (1.0 - fy);
+            let w10 = fx * (1.0 - fy);
+            let w01 = (1.0 - fx) * fy;
+            let w11 = fx * fy;
+            let di = row_offset + dx;
 
-            if x0 >= 0 && x1 < width as i32 && y0 >= 0 && y1 < height as i32 {
-                for c in 0..3 {
-                    let src_c = if c == 0 {
-                        2
-                    } else if c == 2 {
-                        0
-                    } else {
-                        1
-                    };
-                    let src_idx = |x: i32, y: i32| -> usize {
-                        (y as u32 * width + x as u32) as usize * 3 + src_c
-                    };
+            if is_gray {
+                let idx = |x: i32, y: i32| -> usize { y as usize * width + x as usize };
+                let val = src[idx(x0, y0)] as f32 * w00
+                    + src[idx(x1, y0)] as f32 * w10
+                    + src[idx(x0, y1)] as f32 * w01
+                    + src[idx(x1, y1)] as f32 * w11;
+                let nval = (val - NORM_SUB) * NORM_DIV;
+                r_plane[di] = nval;
+                g_plane[di] = nval;
+                b_plane[di] = nval;
+            } else {
+                let idx = |x: i32, y: i32| -> usize { (y as usize * width + x as usize) * 3 };
+                let p00 = idx(x0, y0);
+                let p10 = idx(x1, y0);
+                let p01 = idx(x0, y1);
+                let p11 = idx(x1, y1);
 
-                    let v00 = bgr_data[src_idx(x0, y0)] as f32;
-                    let v10 = bgr_data[src_idx(x1, y0)] as f32;
-                    let v01 = bgr_data[src_idx(x0, y1)] as f32;
-                    let v11 = bgr_data[src_idx(x1, y1)] as f32;
-                    let val = v00 * (1.0 - fx) * (1.0 - fy)
-                        + v10 * fx * (1.0 - fy)
-                        + v01 * (1.0 - fx) * fy
-                        + v11 * fx * fy;
-                    aligned[dst_idx + c] = val.clamp(0.0, 255.0) as u8;
-                }
+                r_plane[di] = ((src[p00 + 2] as f32 * w00
+                    + src[p10 + 2] as f32 * w10
+                    + src[p01 + 2] as f32 * w01
+                    + src[p11 + 2] as f32 * w11)
+                    - NORM_SUB)
+                    * NORM_DIV;
+                g_plane[di] = ((src[p00 + 1] as f32 * w00
+                    + src[p10 + 1] as f32 * w10
+                    + src[p01 + 1] as f32 * w01
+                    + src[p11 + 1] as f32 * w11)
+                    - NORM_SUB)
+                    * NORM_DIV;
+                b_plane[di] = ((src[p00] as f32 * w00
+                    + src[p10] as f32 * w10
+                    + src[p01] as f32 * w01
+                    + src[p11] as f32 * w11)
+                    - NORM_SUB)
+                    * NORM_DIV;
             }
         }
     }
-
-    aligned
 }
 
 /// Estimate a similarity transform (rotation + uniform scale + translation)

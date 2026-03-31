@@ -62,12 +62,21 @@ device_path = ""
 max_height = 320
 # Dark frame threshold (0-100)
 dark_threshold = 60.0
+# Maximum consecutive dark frames before failing auth early (0 = no limit).
+# Detects a covered camera or broken IR emitter without burning the full timeout.
+max_dark_frames = 15
 # Requested capture dimensions (-1 = device default)
 frame_width = -1
 frame_height = -1
 # Frame rotation: 0 = landscape, 1 = both, 2 = portrait
 # Not yet implemented.
 rotate = 0
+# Requested capture FPS (-1 = device default)
+# Some IR emitters need a specific frame rate to function properly.
+device_fps = -1
+# Explicit exposure value (-1 = auto-exposure)
+# Disables auto-exposure when set. Use qv4l2 to find a good value.
+exposure = -1
 
 [snapshots]
 # Save snapshots of failed login attempts

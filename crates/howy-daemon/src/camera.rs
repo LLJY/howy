@@ -25,6 +25,46 @@ use opencv::{core, imgproc, prelude::*, videoio};
 use tracing::{debug, info, warn};
 use v4l::video::Capture as CaptureTraitImport;
 
+/// Pixel format of a captured frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FrameFormat {
+    /// 3 bytes per pixel: Blue, Green, Red.
+    Bgr,
+    /// 1 byte per pixel: grayscale intensity.
+    Gray,
+}
+
+/// A captured camera frame with format metadata.
+pub struct Frame {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub format: FrameFormat,
+}
+
+impl Frame {
+    /// Convert to BGR data. If already BGR, returns a borrowed view.
+    /// If Gray, expands to BGR.
+    pub fn to_bgr_data(&self) -> (std::borrow::Cow<'_, [u8]>, u32, u32) {
+        match self.format {
+            FrameFormat::Bgr => (
+                std::borrow::Cow::Borrowed(&self.data),
+                self.width,
+                self.height,
+            ),
+            FrameFormat::Gray => {
+                let mut bgr = Vec::with_capacity(self.data.len() * 3);
+                for &g in &self.data {
+                    bgr.push(g);
+                    bgr.push(g);
+                    bgr.push(g);
+                }
+                (std::borrow::Cow::Owned(bgr), self.width, self.height)
+            }
+        }
+    }
+}
+
 const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A camera capture device.
@@ -33,6 +73,8 @@ pub struct Camera {
     height: u32,
     format: CaptureFormat,
     device_path: String,
+    fps: i32,
+    exposure: i32,
     worker: Option<CaptureWorker>,
 }
 
@@ -43,7 +85,7 @@ struct CaptureWorker {
 }
 
 enum CaptureMessage {
-    Frame((Vec<u8>, u32, u32)),
+    Frame(Frame),
     Error(String),
 }
 
@@ -76,7 +118,13 @@ impl Camera {
     ///
     /// This does not open a persistent capture stream yet. `start()` does that,
     /// which keeps the camera cold until an auth request actually begins.
-    pub fn open(device_path: &str, req_width: i32, req_height: i32) -> Result<Self> {
+    pub fn open(
+        device_path: &str,
+        req_width: i32,
+        req_height: i32,
+        fps: i32,
+        exposure: i32,
+    ) -> Result<Self> {
         let path = if device_path.is_empty() {
             find_camera_device()?
         } else {
@@ -99,6 +147,8 @@ impl Camera {
             height,
             format,
             device_path: path,
+            fps,
+            exposure,
             worker: None,
         })
     }
@@ -117,6 +167,8 @@ impl Camera {
         let width = self.width;
         let height = self.height;
         let format = self.format;
+        let fps = self.fps;
+        let exposure = self.exposure;
 
         let latest_message = Arc::new(Mutex::new(None));
         let latest_message_worker = Arc::clone(&latest_message);
@@ -129,6 +181,8 @@ impl Camera {
                 width,
                 height,
                 format,
+                fps,
+                exposure,
                 latest_message_worker,
                 notify_tx,
                 stop_rx,
@@ -144,9 +198,8 @@ impl Camera {
         Ok(())
     }
 
-    /// Capture a single frame as BGR pixel data.
-    /// Returns (bgr_data, width, height).
-    pub fn capture_frame(&mut self) -> Result<(Vec<u8>, u32, u32)> {
+    /// Capture a single frame with pixel format metadata.
+    pub fn capture_frame(&mut self) -> Result<Frame> {
         let worker = self.worker.as_ref().context("camera not started")?;
 
         loop {
@@ -195,11 +248,13 @@ fn capture_worker_loop(
     width: u32,
     height: u32,
     format: CaptureFormat,
+    fps: i32,
+    exposure: i32,
     latest_message: Arc<Mutex<Option<CaptureMessage>>>,
     notify_tx: mpsc::SyncSender<()>,
     stop_rx: mpsc::Receiver<()>,
 ) {
-    let mut backend = match start_backend(&device_path, width, height, format) {
+    let mut backend = match start_backend(&device_path, width, height, format, fps, exposure) {
         Ok(backend) => backend,
         Err(e) => {
             warn!("Failed to start camera backend: {e:#}");
@@ -236,7 +291,7 @@ fn capture_worker_loop(
             }
             Err(e) if using_opencv => {
                 warn!("OpenCV capture failed: {e:#}; falling back to ffmpeg");
-                match FfmpegBackend::new(&device_path, width, height, format) {
+                match FfmpegBackend::new(&device_path, width, height, format, fps) {
                     Ok(ffmpeg_backend) => {
                         info!("Using ffmpeg camera backend");
                         backend = Backend::Ffmpeg(ffmpeg_backend);
@@ -274,15 +329,17 @@ fn start_backend(
     width: u32,
     height: u32,
     format: CaptureFormat,
+    fps: i32,
+    exposure: i32,
 ) -> Result<Backend> {
-    match OpenCvBackend::new(device_path, width, height) {
+    match OpenCvBackend::new(device_path, width, height, fps, exposure) {
         Ok(backend) => {
             info!("Using OpenCV CAP_V4L camera backend");
             Ok(Backend::OpenCv(backend))
         }
         Err(e) => {
             warn!("OpenCV backend unavailable: {e:#}; falling back to ffmpeg");
-            let backend = FfmpegBackend::new(device_path, width, height, format)?;
+            let backend = FfmpegBackend::new(device_path, width, height, format, fps)?;
             info!("Using ffmpeg camera backend");
             Ok(Backend::Ffmpeg(backend))
         }
@@ -317,7 +374,7 @@ fn take_latest_message(
     slot.take()
 }
 
-fn decode_capture_message(message: CaptureMessage) -> Result<(Vec<u8>, u32, u32)> {
+fn decode_capture_message(message: CaptureMessage) -> Result<Frame> {
     match message {
         CaptureMessage::Frame(frame) => Ok(frame),
         CaptureMessage::Error(message) => Err(anyhow!(message)),
@@ -325,7 +382,7 @@ fn decode_capture_message(message: CaptureMessage) -> Result<(Vec<u8>, u32, u32)
 }
 
 impl OpenCvBackend {
-    fn new(device: &str, width: u32, height: u32) -> Result<Self> {
+    fn new(device: &str, width: u32, height: u32, fps: i32, exposure: i32) -> Result<Self> {
         let mut cap = videoio::VideoCapture::from_file(device, videoio::CAP_V4L)
             .context("failed to open device with OpenCV CAP_V4L")?;
 
@@ -336,13 +393,27 @@ impl OpenCvBackend {
         // Best-effort low-latency knobs. Some drivers ignore these.
         let _ = cap.set(videoio::CAP_PROP_FRAME_WIDTH, width as f64);
         let _ = cap.set(videoio::CAP_PROP_FRAME_HEIGHT, height as f64);
-        let _ = cap.set(videoio::CAP_PROP_FPS, 30.0);
         let _ = cap.set(videoio::CAP_PROP_BUFFERSIZE, 1.0);
+
+        if fps > 0 {
+            let _ = cap.set(videoio::CAP_PROP_FPS, fps as f64);
+        }
+        // fps < 0: leave at device default (don't force 30fps — some IR
+        // emitters need specific frame rates).
+
+        if exposure >= 0 {
+            // Disable auto-exposure (V4L2_EXPOSURE_MANUAL = 1)
+            let _ = cap.set(videoio::CAP_PROP_AUTO_EXPOSURE, 1.0);
+            let _ = cap.set(videoio::CAP_PROP_EXPOSURE, exposure as f64);
+        } else {
+            // Explicitly request auto-exposure (V4L2_EXPOSURE_APERTURE_PRIORITY = 3)
+            let _ = cap.set(videoio::CAP_PROP_AUTO_EXPOSURE, 3.0);
+        }
 
         Ok(Self { cap })
     }
 
-    fn next_frame(&mut self) -> Result<(Vec<u8>, u32, u32)> {
+    fn next_frame(&mut self) -> Result<Frame> {
         let mut frame = core::Mat::default();
         self.cap.read(&mut frame).context("OpenCV read() failed")?;
         if frame.empty() {
@@ -353,31 +424,47 @@ impl OpenCvBackend {
         let cols = frame.cols();
         let channels = frame.channels();
 
-        let bgr = match channels {
+        match channels {
             1 => {
-                let mut converted = core::Mat::default();
-                imgproc::cvt_color_def(&frame, &mut converted, imgproc::COLOR_GRAY2BGR)
-                    .context("OpenCV GRAY2BGR conversion failed")?;
-                converted.data_bytes()?.to_vec()
+                // Return grayscale directly — no BGR expansion needed.
+                Ok(Frame {
+                    data: frame.data_bytes()?.to_vec(),
+                    width: cols as u32,
+                    height: rows as u32,
+                    format: FrameFormat::Gray,
+                })
             }
-            3 => frame.data_bytes()?.to_vec(),
+            3 => Ok(Frame {
+                data: frame.data_bytes()?.to_vec(),
+                width: cols as u32,
+                height: rows as u32,
+                format: FrameFormat::Bgr,
+            }),
             4 => {
                 let mut converted = core::Mat::default();
                 imgproc::cvt_color_def(&frame, &mut converted, imgproc::COLOR_BGRA2BGR)
                     .context("OpenCV BGRA2BGR conversion failed")?;
-                converted.data_bytes()?.to_vec()
+                Ok(Frame {
+                    data: converted.data_bytes()?.to_vec(),
+                    width: cols as u32,
+                    height: rows as u32,
+                    format: FrameFormat::Bgr,
+                })
             }
             other => bail!("unsupported OpenCV channel count: {other}"),
-        };
-
-        Ok((bgr, cols as u32, rows as u32))
+        }
     }
 }
 
 impl FfmpegBackend {
-    fn new(device: &str, width: u32, height: u32, format: CaptureFormat) -> Result<Self> {
+    fn new(device: &str, width: u32, height: u32, format: CaptureFormat, fps: i32) -> Result<Self> {
         let input_format = ffmpeg_input_format(format);
         let output_pix_fmt = ffmpeg_output_pix_fmt(format);
+        let fps_str = if fps > 0 {
+            fps.to_string()
+        } else {
+            "30".to_string()
+        };
 
         let mut child = Command::new("ffmpeg")
             .args([
@@ -400,7 +487,7 @@ impl FfmpegBackend {
                 "-video_size",
                 &format!("{}x{}", width, height),
                 "-framerate",
-                "30",
+                &fps_str,
                 "-i",
                 device,
                 "-pix_fmt",
@@ -424,7 +511,7 @@ impl FfmpegBackend {
         })
     }
 
-    fn next_frame(&mut self) -> Result<(Vec<u8>, u32, u32)> {
+    fn next_frame(&mut self) -> Result<Frame> {
         match self.format {
             CaptureFormat::Grey => {
                 let frame_size = (self.width * self.height) as usize;
@@ -432,14 +519,12 @@ impl FfmpegBackend {
                 self.stdout
                     .read_exact(&mut gray)
                     .context("failed to read gray frame from ffmpeg")?;
-
-                let mut bgr = Vec::with_capacity(frame_size * 3);
-                for g in gray {
-                    bgr.push(g);
-                    bgr.push(g);
-                    bgr.push(g);
-                }
-                Ok((bgr, self.width, self.height))
+                Ok(Frame {
+                    data: gray,
+                    width: self.width,
+                    height: self.height,
+                    format: FrameFormat::Gray,
+                })
             }
             CaptureFormat::Mjpeg | CaptureFormat::Yuyv => {
                 let frame_size = (self.width * self.height * 3) as usize;
@@ -447,7 +532,12 @@ impl FfmpegBackend {
                 self.stdout
                     .read_exact(&mut bgr)
                     .context("failed to read bgr frame from ffmpeg")?;
-                Ok((bgr, self.width, self.height))
+                Ok(Frame {
+                    data: bgr,
+                    width: self.width,
+                    height: self.height,
+                    format: FrameFormat::Bgr,
+                })
             }
         }
     }

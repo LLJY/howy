@@ -47,7 +47,7 @@ fn main() {
     println!("[3] Running face detection...");
     let t0 = Instant::now();
     let faces = engine
-        .detect(&bgr_data, WIDTH, HEIGHT)
+        .detect(&bgr_data, WIDTH, HEIGHT, false)
         .expect("Detection failed");
     let det_ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!("    Found {} face(s) in {:.1}ms", faces.len(), det_ms);
@@ -78,7 +78,7 @@ fn main() {
     println!("\n[4] Running full pipeline (detect + align + encode)...");
     let t0 = Instant::now();
     let analyzed = engine
-        .analyze(&bgr_data, WIDTH, HEIGHT)
+        .analyze(&bgr_data, WIDTH, HEIGHT, false)
         .expect("Analyze failed");
     let full_ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!(
@@ -118,8 +118,8 @@ fn main() {
 
     // Consistency: same frame twice should give same embedding
     println!("\n[5] Consistency check...");
-    let a1 = engine.analyze(&bgr_data, WIDTH, HEIGHT).unwrap();
-    let a2 = engine.analyze(&bgr_data, WIDTH, HEIGHT).unwrap();
+    let a1 = engine.analyze(&bgr_data, WIDTH, HEIGHT, false).unwrap();
+    let a2 = engine.analyze(&bgr_data, WIDTH, HEIGHT, false).unwrap();
     if let (Some(e1), Some(e2)) = (
         a1.first().and_then(|f| f.embedding.as_ref()),
         a2.first().and_then(|f| f.embedding.as_ref()),

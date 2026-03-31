@@ -202,7 +202,7 @@ fn bench_backend<B: CaptureBackend>(mut backend: B, engine: &InferenceEngine) ->
     let avg_brightness = means.iter().sum::<f64>() / means.len() as f64;
 
     let t0 = Instant::now();
-    let faces = engine.detect(&bgr, width, height)?;
+    let faces = engine.detect(&bgr, width, height, false)?;
     let detect_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let best_score = faces.iter().map(|f| f.score).fold(0.0_f32, f32::max);
 
@@ -210,7 +210,7 @@ fn bench_backend<B: CaptureBackend>(mut backend: B, engine: &InferenceEngine) ->
     let mut embedding_ok = false;
     if !faces.is_empty() {
         let t1 = Instant::now();
-        let analyzed = engine.analyze(&bgr, width, height)?;
+        let analyzed = engine.analyze(&bgr, width, height, false)?;
         analyze_ms = t1.elapsed().as_secs_f64() * 1000.0;
         embedding_ok = analyzed
             .first()
