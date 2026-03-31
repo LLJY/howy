@@ -159,10 +159,6 @@ unsafe fn authenticate_user(pamh: *mut PamHandle) -> libc::c_int {
             return PAM_AUTHINFO_UNAVAIL;
         }
 
-        if check_lid_closed() {
-            return PAM_AUTHINFO_UNAVAIL;
-        }
-
         // Check if user has face models (.bin or legacy .json)
         let model_path = match howy_common::paths::user_model_path(&username) {
             Some(p) => p,
