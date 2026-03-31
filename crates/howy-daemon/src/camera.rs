@@ -123,23 +123,35 @@ impl CameraProfile {
     }
 
     /// Take a warm device fd. Opens a fresh one if already taken.
-    /// Returns None only if opening fails.
+    /// Returns None only if opening fails. Always re-negotiates format
+    /// to ensure the device is in the expected state.
     pub fn take_device(&self) -> Option<v4l::Device> {
         // Try the cached device first
-        if let Ok(mut slot) = self.device.lock() {
-            if let Some(dev) = slot.take() {
-                return Some(dev);
+        let dev = if let Ok(mut slot) = self.device.lock() {
+            slot.take()
+        } else {
+            None
+        };
+
+        let dev = match dev {
+            Some(d) => d,
+            None => {
+                // Cached device was already taken — open a fresh one.
+                match v4l::Device::with_path(&self.device_path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        debug!("Failed to reopen camera device: {e}");
+                        return None;
+                    }
+                }
             }
-        }
-        // Cached device was already taken — open a fresh one.
-        // This is cheaper than the full probe (just fd open + format set).
-        match v4l::Device::with_path(&self.device_path) {
-            Ok(dev) => {
-                let _ = negotiate_format(&dev, self.width as i32, self.height as i32);
-                Some(dev)
-            }
+        };
+
+        // Always re-negotiate format to ensure device state matches profile.
+        match negotiate_format(&dev, self.width as i32, self.height as i32) {
+            Ok(_) => Some(dev),
             Err(e) => {
-                debug!("Failed to reopen camera device: {e}");
+                debug!("Format re-negotiation failed on warm device: {e}");
                 None
             }
         }
@@ -338,12 +350,24 @@ impl Camera {
 impl Drop for Camera {
     fn drop(&mut self) {
         if let Some(worker) = self.worker.take() {
-            // Signal the worker to stop and wait for it to fully release
-            // the camera device. Without join, the next auth request may
-            // race with the kernel releasing the V4L2 device.
+            // Signal the worker to stop and wait with a bounded timeout.
+            // If the worker is stuck on blocking I/O, we don't want to
+            // wedge the auth thread (and hold the camera lock) forever.
             let _ = worker.stop_tx.send(());
             if let Some(handle) = worker.thread_handle {
-                let _ = handle.join();
+                // Park for up to 500ms for a clean shutdown.
+                let deadline = std::time::Instant::now() + Duration::from_millis(500);
+                loop {
+                    if handle.is_finished() {
+                        let _ = handle.join();
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        warn!("Camera worker did not stop within 500ms; abandoning join");
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
         }
     }
