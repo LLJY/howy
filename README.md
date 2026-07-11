@@ -46,10 +46,13 @@ The `provider = "auto"` config tries GPU providers in order and caches the first
 ### Prerequisites
 
 - Rust toolchain
-- OpenCV 4.x (system package)
 - ONNX Runtime (system package, e.g. `onnxruntime-opt-rocm` on Arch)
 - SCRFD and ArcFace ONNX models in `/usr/share/howy/onnx-data/`
 - IR camera (or any V4L2 camera)
+- FFmpeg (optional fallback when native V4L2 mmap capture fails)
+
+`howyd`, the CLI, and the PAM module do not require system OpenCV. The optional
+Python enrollment frontend runs `opencv-python` in its isolated `uv` environment.
 
 ### Build & Install
 

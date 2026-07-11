@@ -1,0 +1,59 @@
+pkgbase = howy-git
+	pkgdesc = Linux face authentication daemon — a howdy replacement
+	pkgver = 0.1.0.r19.g4aceddb
+	pkgrel = 1
+	url = https://github.com/LLJY/howy
+	arch = x86_64
+	license = GPL-2.0-only
+	makedepends = cargo
+	makedepends = clang
+	makedepends = git
+	makedepends = onnxruntime-cpu
+	makedepends = protobuf
+	source = howy-git::git+https://github.com/LLJY/howy.git
+	sha256sums = SKIP
+
+pkgname = howy-cpu-git
+	pkgdesc = Linux face authentication daemon using ONNX Runtime CPU backend
+	depends = onnxruntime-cpu
+	depends = pam
+	optdepends = curl: download default ONNX models
+	optdepends = ffmpeg: optional camera fallback when native V4L2 mmap capture fails
+	optdepends = unzip: extract default ONNX models
+	optdepends = uv: run the bundled howy-enroll helper
+	optdepends = v4l-utils: inspect and tune camera controls
+	provides = howy=0.1.0.r19.g4aceddb
+	conflicts = howy
+	conflicts = howy-rocm-git
+	conflicts = howy-cuda-git
+	backup = etc/howy/config.toml
+
+pkgname = howy-rocm-git
+	pkgdesc = Linux face authentication daemon using ONNX Runtime ROCm backend
+	depends = onnxruntime-rocm
+	depends = pam
+	optdepends = curl: download default ONNX models
+	optdepends = ffmpeg: optional camera fallback when native V4L2 mmap capture fails
+	optdepends = unzip: extract default ONNX models
+	optdepends = uv: run the bundled howy-enroll helper
+	optdepends = v4l-utils: inspect and tune camera controls
+	provides = howy=0.1.0.r19.g4aceddb
+	conflicts = howy
+	conflicts = howy-cpu-git
+	conflicts = howy-cuda-git
+	backup = etc/howy/config.toml
+
+pkgname = howy-cuda-git
+	pkgdesc = Linux face authentication daemon using ONNX Runtime CUDA backend
+	depends = onnxruntime-cuda
+	depends = pam
+	optdepends = curl: download default ONNX models
+	optdepends = ffmpeg: optional camera fallback when native V4L2 mmap capture fails
+	optdepends = unzip: extract default ONNX models
+	optdepends = uv: run the bundled howy-enroll helper
+	optdepends = v4l-utils: inspect and tune camera controls
+	provides = howy=0.1.0.r19.g4aceddb
+	conflicts = howy
+	conflicts = howy-cpu-git
+	conflicts = howy-rocm-git
+	backup = etc/howy/config.toml

@@ -41,7 +41,6 @@ image = "0.25"
 
 # Camera
 v4l = "0.14"
-opencv = { version = "=0.99.0", default-features = false, features = ["videoio", "imgproc", "imgcodecs", "clang-runtime"] }
 
 # System
 nix = { version = "0.29", features = ["user", "signal", "fs", "ioctl"] }

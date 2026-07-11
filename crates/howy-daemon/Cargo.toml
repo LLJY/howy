@@ -49,7 +49,6 @@ image = { workspace = true }
 
 # Camera
 v4l = { workspace = true }
-opencv = { workspace = true }
 
 # System
 nix = { workspace = true }

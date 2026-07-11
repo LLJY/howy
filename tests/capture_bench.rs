@@ -1,11 +1,15 @@
+//! Production camera-path and optional FFmpeg capture benchmark.
+//!
+//! Run: `cargo run -p howy-daemon --bin capture_bench`.
+
 use std::io::{BufReader, Read};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use howy_common::config::HowyConfig;
+use howy_daemon::camera::Camera;
 use howy_daemon::inference::InferenceEngine;
-use opencv::{core, imgproc, prelude::*, videoio};
 
 const MODEL_DIR: &str = "dist/howdy_onnx/_internal/onnx-data";
 const DEVICE: &str = "/dev/video2";
@@ -19,59 +23,27 @@ trait CaptureBackend {
     fn next_frame(&mut self) -> Result<(Vec<u8>, u32, u32)>;
 }
 
-struct OpenCvBackend {
-    cap: videoio::VideoCapture,
+struct ProductionCameraBackend {
+    camera: Camera,
 }
 
-impl OpenCvBackend {
+impl ProductionCameraBackend {
     fn new(device: &str, width: u32, height: u32) -> Result<Self> {
-        let mut cap = videoio::VideoCapture::from_file(device, videoio::CAP_V4L)
-            .context("failed to open device with OpenCV CAP_V4L")?;
-        if !cap.is_opened()? {
-            bail!("OpenCV could not open device {device}");
-        }
-        let _ = cap.set(videoio::CAP_PROP_FRAME_WIDTH, width as f64);
-        let _ = cap.set(videoio::CAP_PROP_FRAME_HEIGHT, height as f64);
-        let _ = cap.set(videoio::CAP_PROP_FPS, 30.0);
-        let _ = cap.set(videoio::CAP_PROP_BUFFERSIZE, 1.0);
-        Ok(Self { cap })
+        let mut camera = Camera::open(device, width as i32, height as i32, 30, -1)?;
+        camera.start()?;
+        Ok(Self { camera })
     }
 }
 
-impl CaptureBackend for OpenCvBackend {
+impl CaptureBackend for ProductionCameraBackend {
     fn name(&self) -> &str {
-        "opencv-cap_v4l"
+        "production-v4l2-preferred"
     }
 
     fn next_frame(&mut self) -> Result<(Vec<u8>, u32, u32)> {
-        let mut frame = core::Mat::default();
-        self.cap.read(&mut frame).context("OpenCV read() failed")?;
-        if frame.empty() {
-            bail!("OpenCV returned empty frame");
-        }
-
-        let rows = frame.rows();
-        let cols = frame.cols();
-        let channels = frame.channels();
-
-        let bgr = match channels {
-            1 => {
-                let mut converted = core::Mat::default();
-                imgproc::cvt_color_def(&frame, &mut converted, imgproc::COLOR_GRAY2BGR)
-                    .context("OpenCV GRAY2BGR conversion failed")?;
-                converted.data_bytes()?.to_vec()
-            }
-            3 => frame.data_bytes()?.to_vec(),
-            4 => {
-                let mut converted = core::Mat::default();
-                imgproc::cvt_color_def(&frame, &mut converted, imgproc::COLOR_BGRA2BGR)
-                    .context("OpenCV BGRA2BGR conversion failed")?;
-                converted.data_bytes()?.to_vec()
-            }
-            other => bail!("unsupported OpenCV channel count: {other}"),
-        };
-
-        Ok((bgr, cols as u32, rows as u32))
+        let frame = self.camera.capture_frame()?;
+        let (bgr, width, height) = frame.to_bgr_data();
+        Ok((bgr.into_owned(), width, height))
     }
 }
 
@@ -239,13 +211,13 @@ fn main() -> Result<()> {
     let engine = build_engine()?;
     engine.warmup()?;
 
-    match OpenCvBackend::new(DEVICE, WIDTH, HEIGHT) {
+    match ProductionCameraBackend::new(DEVICE, WIDTH, HEIGHT) {
         Ok(backend) => {
             if let Err(e) = bench_backend(backend, &engine) {
-                println!("opencv-cap_v4l failed: {e:#}");
+                println!("production-v4l2-preferred failed: {e:#}");
             }
         }
-        Err(e) => println!("opencv-cap_v4l init failed: {e:#}"),
+        Err(e) => println!("production camera init failed: {e:#}"),
     }
 
     match FfmpegBackend::new(DEVICE, WIDTH, HEIGHT) {

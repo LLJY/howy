@@ -50,6 +50,8 @@ confirm_overwrite() {
 
 build_release_artifacts() {
     echo "Building release artifacts for this checkout..."
+    export ORT_LIB_PATH="${ORT_LIB_PATH:-/usr/lib}"
+    export ORT_PREFER_DYNAMIC_LINK="${ORT_PREFER_DYNAMIC_LINK:-1}"
     cargo build --release -p howy-daemon -p howy-cli -p howy-pam
 }
 

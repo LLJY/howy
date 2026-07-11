@@ -3,25 +3,21 @@
 //! Dissects where the ~200ms camera open time goes:
 //!   1. V4L2 device open (fd)
 //!   2. Format negotiation
-//!   3. OpenCV VideoCapture construction
-//!   4. First frame read (includes buffer allocation + stream start)
-//!   5. Subsequent frame reads (steady-state)
+//!   3. First mmap frame read (includes buffer allocation + stream start)
+//!   4. Subsequent frame reads (steady-state)
 //!
 //! Also tests alternative approaches:
 //!   - Raw V4L2 open/close cycle time
-//!   - Pre-opened fd passed to OpenCV
 //!   - ffmpeg startup time
-//!   - GREY vs BGR capture overhead
+//!   - V4L2 resolution impact
 //!
-//! Run: cargo test --test camera_startup_bench -- --nocapture --ignored
+//! Run: `cargo run -p howy-daemon --bin camera_startup_bench`.
 
 use std::io::Read;
-use std::os::unix::io::AsRawFd;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
-use opencv::{core, prelude::*, videoio};
+use anyhow::Result;
 
 const DEVICE: &str = "/dev/video2";
 const WIDTH: u32 = 640;
@@ -63,9 +59,9 @@ fn bench_v4l2_open_and_query() -> Result<()> {
         let dev = v4l::Device::with_path(DEVICE)?;
         let _caps = dev.query_caps()?;
 
+        use v4l::FourCC;
         use v4l::format::Format;
         use v4l::video::Capture;
-        use v4l::FourCC;
 
         let fmt = Format::new(WIDTH, HEIGHT, FourCC::new(b"GREY"));
         let _actual = Capture::set_format(&dev, &fmt)?;
@@ -73,109 +69,6 @@ fn bench_v4l2_open_and_query() -> Result<()> {
         Ok(())
     })?;
     print_result("v4l open + caps + set_format", min, avg, max);
-    Ok(())
-}
-
-fn bench_opencv_full_cycle() -> Result<()> {
-    println!("\n=== OpenCV full cycle: open → first frame → close ===");
-
-    // Break it down step by step
-    println!("  --- Step breakdown (single trial) ---");
-
-    let t0 = Instant::now();
-    let mut cap =
-        videoio::VideoCapture::from_file(DEVICE, videoio::CAP_V4L).context("from_file")?;
-    let t_open = t0.elapsed().as_secs_f64() * 1000.0;
-
-    let t1 = Instant::now();
-    let _ = cap.set(videoio::CAP_PROP_FRAME_WIDTH, WIDTH as f64);
-    let _ = cap.set(videoio::CAP_PROP_FRAME_HEIGHT, HEIGHT as f64);
-    let _ = cap.set(videoio::CAP_PROP_FPS, 30.0);
-    let _ = cap.set(videoio::CAP_PROP_BUFFERSIZE, 1.0);
-    let t_config = t1.elapsed().as_secs_f64() * 1000.0;
-
-    let t2 = Instant::now();
-    let mut frame = core::Mat::default();
-    cap.read(&mut frame).context("first read")?;
-    let t_first_read = t2.elapsed().as_secs_f64() * 1000.0;
-
-    let t3 = Instant::now();
-    cap.read(&mut frame).context("second read")?;
-    let t_second_read = t3.elapsed().as_secs_f64() * 1000.0;
-
-    let t4 = Instant::now();
-    cap.read(&mut frame).context("third read")?;
-    let t_third_read = t4.elapsed().as_secs_f64() * 1000.0;
-
-    let t5 = Instant::now();
-    drop(cap);
-    let t_close = t5.elapsed().as_secs_f64() * 1000.0;
-
-    println!("  VideoCapture::from_file          {t_open:7.2}ms");
-    println!("  set props (w/h/fps/buf)          {t_config:7.2}ms");
-    println!("  first cap.read()                 {t_first_read:7.2}ms");
-    println!("  second cap.read()                {t_second_read:7.2}ms");
-    println!("  third cap.read()                 {t_third_read:7.2}ms");
-    println!("  drop(cap)                        {t_close:7.2}ms");
-    println!(
-        "  TOTAL open→first_frame           {:.2}ms",
-        t_open + t_config + t_first_read
-    );
-    println!(
-        "  TOTAL open→close                 {:.2}ms",
-        t_open + t_config + t_first_read + t_second_read + t_third_read + t_close
-    );
-
-    // Now bench the full open→first_frame→close cycle
-    println!("\n  --- Full cycle repeated ---");
-    let (min, avg, max) = bench(TRIALS, || {
-        let mut cap =
-            videoio::VideoCapture::from_file(DEVICE, videoio::CAP_V4L).context("from_file")?;
-        let _ = cap.set(videoio::CAP_PROP_FRAME_WIDTH, WIDTH as f64);
-        let _ = cap.set(videoio::CAP_PROP_FRAME_HEIGHT, HEIGHT as f64);
-        let _ = cap.set(videoio::CAP_PROP_BUFFERSIZE, 1.0);
-        let mut frame = core::Mat::default();
-        cap.read(&mut frame).context("read")?;
-        if frame.empty() {
-            bail!("empty frame");
-        }
-        drop(cap);
-        Ok(())
-    })?;
-    print_result("open → read(1) → close", min, avg, max);
-
-    Ok(())
-}
-
-fn bench_opencv_buffersize_comparison() -> Result<()> {
-    println!("\n=== OpenCV buffer size: 1 vs default ===");
-
-    println!("  --- buffersize=1 ---");
-    let (min, avg, max) = bench(TRIALS, || {
-        let mut cap = videoio::VideoCapture::from_file(DEVICE, videoio::CAP_V4L)?;
-        let _ = cap.set(videoio::CAP_PROP_FRAME_WIDTH, WIDTH as f64);
-        let _ = cap.set(videoio::CAP_PROP_FRAME_HEIGHT, HEIGHT as f64);
-        let _ = cap.set(videoio::CAP_PROP_BUFFERSIZE, 1.0);
-        let mut frame = core::Mat::default();
-        cap.read(&mut frame)?;
-        drop(cap);
-        Ok(())
-    })?;
-    print_result("buffersize=1", min, avg, max);
-
-    println!("  --- buffersize=default ---");
-    let (min, avg, max) = bench(TRIALS, || {
-        let mut cap = videoio::VideoCapture::from_file(DEVICE, videoio::CAP_V4L)?;
-        let _ = cap.set(videoio::CAP_PROP_FRAME_WIDTH, WIDTH as f64);
-        let _ = cap.set(videoio::CAP_PROP_FRAME_HEIGHT, HEIGHT as f64);
-        // Don't set buffersize — let driver decide
-        let mut frame = core::Mat::default();
-        cap.read(&mut frame)?;
-        drop(cap);
-        Ok(())
-    })?;
-    print_result("buffersize=default", min, avg, max);
-
     Ok(())
 }
 
@@ -235,12 +128,12 @@ fn bench_v4l2_streamon_streamoff() -> Result<()> {
     println!("\n=== Raw V4L2 STREAMON/STREAMOFF cycle ===");
     println!("  (tests if we can keep the device open but toggle streaming)");
 
+    use v4l::FourCC;
     use v4l::buffer::Type;
     use v4l::format::Format;
     use v4l::io::traits::CaptureStream;
     use v4l::prelude::*;
     use v4l::video::Capture;
-    use v4l::FourCC;
 
     let dev = v4l::Device::with_path(DEVICE)?;
     let fmt = Format::new(WIDTH, HEIGHT, FourCC::new(b"GREY"));
@@ -285,7 +178,14 @@ fn bench_v4l2_streamon_streamoff() -> Result<()> {
 }
 
 fn bench_resolution_impact() -> Result<()> {
-    println!("\n=== Resolution impact on first frame latency ===");
+    println!("\n=== V4L2 resolution impact on first frame latency ===");
+
+    use v4l::FourCC;
+    use v4l::buffer::Type;
+    use v4l::format::Format;
+    use v4l::io::traits::CaptureStream;
+    use v4l::prelude::MmapStream;
+    use v4l::video::Capture;
 
     for (w, h, label) in [
         (320, 240, "320x240"),
@@ -293,13 +193,11 @@ fn bench_resolution_impact() -> Result<()> {
         (640, 480, "640x480"),
     ] {
         let (min, avg, max) = bench(3, || {
-            let mut cap = videoio::VideoCapture::from_file(DEVICE, videoio::CAP_V4L)?;
-            let _ = cap.set(videoio::CAP_PROP_FRAME_WIDTH, w as f64);
-            let _ = cap.set(videoio::CAP_PROP_FRAME_HEIGHT, h as f64);
-            let _ = cap.set(videoio::CAP_PROP_BUFFERSIZE, 1.0);
-            let mut frame = core::Mat::default();
-            cap.read(&mut frame)?;
-            drop(cap);
+            let dev = v4l::Device::with_path(DEVICE)?;
+            let fmt = Format::new(w, h, FourCC::new(b"GREY"));
+            let _actual = Capture::set_format(&dev, &fmt)?;
+            let mut stream = MmapStream::with_buffers(&dev, Type::VideoCapture, 1)?;
+            let (_frame, _metadata) = stream.next()?;
             Ok(())
         })?;
         print_result(label, min, avg, max);
@@ -314,8 +212,6 @@ fn main() -> Result<()> {
 
     bench_raw_v4l2_open_close()?;
     bench_v4l2_open_and_query()?;
-    bench_opencv_full_cycle()?;
-    bench_opencv_buffersize_comparison()?;
     bench_ffmpeg_startup()?;
     bench_v4l2_streamon_streamoff()?;
     bench_resolution_impact()?;
