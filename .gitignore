@@ -51,3 +51,14 @@ howdy-daemon.service
 Thumbs.db
 __pycache__/
 .BUILDINFO
+
+# Local-only FP16 experiment inputs and outputs (real fixtures stay external)
+/fp16-fixtures/
+/fp16-cache-fp32/
+/fp16-cache-fp16/
+/fp16-profiles-fp32/
+/fp16-profiles-fp16/
+/fp16-manifest*.json
+/fp16-result*.json
+/fp16-experiment-root/
+/fp16-diagnostics*.txt

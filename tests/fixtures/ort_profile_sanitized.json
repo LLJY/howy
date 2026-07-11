@@ -1,0 +1,37 @@
+[
+  {
+    "cat": "Node",
+    "ph": "X",
+    "dur": 12,
+    "name": "detector_kernel_time",
+    "args": { "provider": "MIGraphXExecutionProvider", "op_name": "Conv", "node_index": "0" }
+  },
+  {
+    "cat": "Node",
+    "ph": "X",
+    "dur": 8,
+    "name": "recognizer_kernel_time",
+    "args": { "provider": "MIGraphXExecutionProvider", "op_name": "Gemm", "node_index": "1" }
+  },
+  {
+    "cat": "Node",
+    "ph": "X",
+    "dur": 7,
+    "name": "recognizer_kernel_time",
+    "args": { "provider": "MIGraphXExecutionProvider", "op_name": "Gemm", "node_index": "1" }
+  },
+  {
+    "cat": "Node",
+    "ph": "X",
+    "dur": 2,
+    "name": "shape_kernel_time",
+    "args": { "provider": "CPUExecutionProvider", "op_name": "Shape", "node_index": "2" }
+  },
+  {
+    "cat": "Session",
+    "ph": "X",
+    "dur": 1,
+    "name": "model_run",
+    "args": {}
+  }
+]
