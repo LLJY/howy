@@ -1,18 +1,37 @@
-# howy
+# howy — Fast Linux Face Authentication in Rust
 
-> **Warning**: This is a vibe coded project. Precautions were taken and code was checked, however be warned.
+**howy** is a low-latency Linux face recognition daemon and PAM authentication
+system written in Rust. It is a GPU-accelerated alternative to
+[Howdy](https://github.com/boltgolt/howdy), with native AMD ROCm/MIGraphX
+support, automatic CPU fallback, and guided multi-angle face enrollment.
 
-I have always wanted to make an AMD compatible [howdy](https://github.com/boltgolt/howdy) that ran on the GPU, but upstream dlib refused to add support for ROCm.
+> **Warning:** This is an experimental, vibe-coded security project. Precautions
+> were taken and the code was reviewed, but you should keep an alternative
+> authentication method available.
 
-So I took matters into my own hands.
+## Why howy?
 
-## What is howy?
+- **Fast authentication** — approximately **230 ms end-to-end latency** on both
+  CPU and GPU inference paths in current testing.
+- **AMD GPU acceleration** — native MIGraphX support through ONNX Runtime for
+  AMD ROCm systems, with support for CUDA, TensorRT, and OpenVINO providers.
+- **Warm Rust daemon** — SCRFD and ArcFace models remain loaded between requests,
+  avoiding a cold CNN startup on every `sudo`, login, or PAM authentication.
+- **Face ID-inspired enrollment** — a smooth, pose-guided interface captures the
+  center plus eight head directions for broader recognition coverage.
+- **Linux-native integration** — V4L2 camera capture, Unix socket IPC, a PAM
+  module, and a CLI for enrollment and model management.
 
-howy is a Linux face authentication daemon -- a drop-in replacement for howdy, written in Rust. It aims to solve the biggest pain points:
+## Performance
 
-1. **AMD GPU support** -- Natively supports MIGraphX via ONNX Runtime. The ROCm stack is still finnicky, but it works. Falls back to CPU if GPU isn't available.
-2. **Daemon architecture** -- Models stay warm and loaded in memory. No more cold-starting a CNN on every `sudo` like howdy does. Auth typically completes in ~500ms.
-3. **\[WIP\] Proper enrollment flow** -- Apple FaceID-style pose-guided enrollment with MediaPipe face tracking. Captures multiple angles for better recognition.
+| Inference path | Observed end-to-end authentication latency |
+|----------------|--------------------------------------------|
+| CPU | ~230 ms |
+| GPU | ~230 ms |
+
+These are observed results from the current test setup, not a universal
+guarantee. Camera startup, hardware, drivers, ONNX Runtime provider selection,
+and system load can affect latency.
 
 ## Architecture
 
@@ -29,7 +48,7 @@ enroll.py    ──┘                      ├── SCRFD (face detection)
 - **howy**: CLI for managing face models (`add`, `enroll-batch`, `list`, `remove`, `clear`, `test`, `doctor`, `prewarm`).
 - **enroll.py**: Python frontend for pose-guided enrollment capture (runs via `uv`).
 
-## GPU Acceleration
+## Hardware Acceleration: AMD ROCm, CUDA, and CPU
 
 | Provider | Status |
 |----------|--------|
@@ -45,7 +64,7 @@ registration+self-test result is not graph-placement evidence, so persistent
 placement can justify provider pinning. MIGraphX may still reuse its separate
 persistent `.mxr` compiled-model cache on subsequent boots.
 
-## Quick Start
+## Install and Run howy on Linux
 
 ### Prerequisites
 
@@ -101,7 +120,7 @@ source flow for uncommitted performance-test code. Build the worktree directly
 and use `scripts/install-local.sh` (which prints and verifies installed SHA-256
 hashes), or run the exact local artifacts directly and record their hashes.
 
-### Enrollment
+### Face Enrollment
 
 ```bash
 # Capture frames with pose guidance
@@ -114,7 +133,7 @@ sudo howy enroll-batch --user $USER --session-dir /tmp/howy-enroll-XXXXX --label
 sudo howy test --user $USER
 ```
 
-### PAM Integration
+### Linux PAM Integration
 
 howy is designed as a drop-in replacement for howdy. The local installer places
 `pam_howy.so` but never edits PAM service configuration; PAM integration remains
