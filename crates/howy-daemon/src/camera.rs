@@ -16,10 +16,13 @@
 use std::collections::VecDeque;
 use std::io::{self, Cursor, Read};
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -70,6 +73,11 @@ impl Frame {
 }
 
 const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// V4L2 and FFmpeg I/O wake at least this often to observe cancellation.
+const CAPTURE_CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(75);
+/// Terminal V4L2 dequeue bound; comfortably exceeds the measured ~146ms cold first frame.
+const V4L2_DEQUEUE_TIMEOUT: Duration = Duration::from_millis(500);
+const SYNCHRONOUS_STOP_TIMEOUT: Duration = Duration::from_millis(100);
 
 // 128 MiB accommodates tightly packed 8K BGR output (~95 MiB) and 8K YUYV
 // capture (~63 MiB), while preventing a malformed format from requesting
@@ -87,9 +95,12 @@ const MAX_MJPEG_DIMENSION: u32 = 4096;
 const MAX_MJPEG_PIXELS: usize = 4096 * 2160;
 
 const FFMPEG_STDERR_TAIL_BYTES: usize = 16 * 1024;
+const FFMPEG_TERMINATION_ESCALATION: Duration = Duration::from_millis(300);
+static RETAINED_CAMERA_WORKERS: OnceLock<Mutex<Vec<std::thread::JoinHandle<()>>>> = OnceLock::new();
 
 /// Pre-resolved camera parameters.
 /// Computed once at daemon startup or lazily on first camera use.
+#[derive(Clone)]
 pub struct CameraProfile {
     device_path: String,
     width: u32,
@@ -142,6 +153,18 @@ impl CameraProfile {
             exposure,
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_profile(device_path: &str) -> Self {
+        Self {
+            device_path: device_path.to_string(),
+            width: 640,
+            height: 480,
+            format: CaptureFormat::Grey,
+            fps: 30,
+            exposure: -1,
+        }
+    }
 }
 
 /// A camera capture device.
@@ -153,13 +176,137 @@ pub struct Camera {
     fps: i32,
     exposure: i32,
     worker: Option<CaptureWorker>,
+    pending_cleanup: Option<PendingCameraCleanup>,
+    selected_backend: Arc<Mutex<Option<CaptureBackendKind>>>,
+}
+
+/// Capture backend actually selected by the production camera worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureBackendKind {
+    V4l2Mmap,
+    FfmpegFallback,
 }
 
 struct CaptureWorker {
     latest_message: Arc<Mutex<Option<CaptureMessage>>>,
     notify_rx: mpsc::Receiver<()>,
-    stop_tx: mpsc::Sender<()>,
+    cancellation: Arc<AtomicBool>,
     thread_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraStopState {
+    Released,
+    FailedPanicked,
+    Pending,
+}
+
+#[must_use = "pending camera cleanup must be joined or handed to the cleanup reaper"]
+pub enum CameraStopOutcome {
+    Released,
+    FailedPanicked,
+    Pending(PendingCameraCleanup),
+}
+
+impl CameraStopOutcome {
+    #[cfg(test)]
+    pub fn state(&self) -> CameraStopState {
+        match self {
+            Self::Released => CameraStopState::Released,
+            Self::FailedPanicked => CameraStopState::FailedPanicked,
+            Self::Pending(_) => CameraStopState::Pending,
+        }
+    }
+}
+
+/// Unique ownership of a stopped-but-not-yet-exited camera worker.
+pub struct PendingCameraCleanup {
+    thread_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerExit {
+    Released,
+    FailedPanicked,
+}
+
+impl PendingCameraCleanup {
+    pub fn is_finished(&self) -> bool {
+        self.thread_handle
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
+    pub fn try_complete(&mut self) -> Option<WorkerExit> {
+        if !self.is_finished() {
+            return None;
+        }
+        Some(match self.thread_handle.take() {
+            Some(handle) => {
+                if handle.join().is_err() {
+                    WorkerExit::FailedPanicked
+                } else {
+                    WorkerExit::Released
+                }
+            }
+            None => WorkerExit::Released,
+        })
+    }
+
+    pub(crate) fn from_thread_handle(handle: std::thread::JoinHandle<()>) -> Self {
+        Self {
+            thread_handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for PendingCameraCleanup {
+    fn drop(&mut self) {
+        if let Some(handle) = self.thread_handle.take() {
+            warn!("Retaining unresolved camera worker ownership for bounded daemon shutdown");
+            let retained = RETAINED_CAMERA_WORKERS.get_or_init(|| Mutex::new(Vec::new()));
+            let mut retained = match retained.lock() {
+                Ok(retained) => retained,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let mut index = 0;
+            while index < retained.len() {
+                if retained[index].is_finished() {
+                    let finished = retained.swap_remove(index);
+                    if finished.join().is_err() {
+                        warn!("Retained camera worker panicked before reap");
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            retained.push(handle);
+        }
+    }
+}
+
+pub(crate) fn take_retained_camera_workers() -> Vec<std::thread::JoinHandle<()>> {
+    let Some(retained) = RETAINED_CAMERA_WORKERS.get() else {
+        return Vec::new();
+    };
+    let mut retained = match retained.lock() {
+        Ok(retained) => retained,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut workers = std::mem::take(&mut *retained);
+    let mut index = 0;
+    while index < workers.len() {
+        if workers[index].is_finished() {
+            let finished = workers.swap_remove(index);
+            if finished.join().is_err() {
+                warn!("Retained camera worker panicked during final reap");
+            }
+        } else {
+            index += 1;
+        }
+    }
+    workers
 }
 
 enum CaptureMessage {
@@ -173,15 +320,20 @@ enum Backend {
 }
 
 trait BackendCapture {
-    fn next_frame(&mut self) -> Result<Frame>;
+    fn next_frame(&mut self, cancellation: &AtomicBool) -> Result<CaptureStep>;
     fn supports_fallback(&self) -> bool;
 }
 
+enum CaptureStep {
+    Frame(Frame),
+    Cancelled,
+}
+
 impl BackendCapture for Backend {
-    fn next_frame(&mut self) -> Result<Frame> {
+    fn next_frame(&mut self, cancellation: &AtomicBool) -> Result<CaptureStep> {
         match self {
-            Backend::V4l2Mmap(backend) => backend.next_frame(),
-            Backend::Ffmpeg(backend) => backend.next_frame(),
+            Backend::V4l2Mmap(backend) => backend.next_frame(cancellation),
+            Backend::Ffmpeg(backend) => backend.next_frame(cancellation),
         }
     }
 
@@ -192,6 +344,7 @@ impl BackendCapture for Backend {
 
 enum BackendEvent {
     Frame(Frame),
+    Cancelled,
     FellBack(anyhow::Error),
 }
 
@@ -221,6 +374,7 @@ struct FfmpegBackend {
 
 struct StderrDrainer {
     tail: Arc<Mutex<StderrTail>>,
+    cancellation: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -263,33 +417,49 @@ impl StderrTail {
 }
 
 impl StderrDrainer {
-    fn spawn<R>(mut stderr: R) -> Self
+    fn spawn<R>(mut stderr: R) -> Result<Self>
     where
-        R: Read + Send + 'static,
+        R: Read + AsRawFd + Send + 'static,
     {
         let tail = Arc::new(Mutex::new(StderrTail::new(FFMPEG_STDERR_TAIL_BYTES)));
         let tail_worker = Arc::clone(&tail);
-        let handle = thread::spawn(move || {
-            let mut chunk = [0_u8; 4096];
-            loop {
-                match stderr.read(&mut chunk) {
-                    Ok(0) => return,
-                    Ok(read) => {
-                        let mut tail = match tail_worker.lock() {
-                            Ok(tail) => tail,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        tail.push(&chunk[..read]);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation_worker = Arc::clone(&cancellation);
+        let fd = stderr.as_raw_fd();
+        let handle = thread::Builder::new()
+            .name("howy-ffmpeg-stderr".to_string())
+            .spawn(move || {
+                let mut chunk = [0_u8; 4096];
+                while !cancellation_worker.load(Ordering::Acquire) {
+                    match wait_for_fd_until(
+                        fd,
+                        Instant::now() + CAPTURE_CANCELLATION_CHECK_INTERVAL,
+                    ) {
+                        Ok(false) => continue,
+                        Err(_) => return,
+                        Ok(true) => {}
                     }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => return,
+                    match stderr.read(&mut chunk) {
+                        Ok(0) => return,
+                        Ok(read) => {
+                            let mut tail = match tail_worker.lock() {
+                                Ok(tail) => tail,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            tail.push(&chunk[..read]);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                        Err(_) => return,
+                    }
                 }
-            }
-        });
-        Self {
+            })
+            .context("failed to spawn FFmpeg stderr drainer")?;
+        Ok(Self {
             tail,
+            cancellation,
             handle: Some(handle),
-        }
+        })
     }
 
     fn snapshot(&self) -> String {
@@ -300,15 +470,40 @@ impl StderrDrainer {
         tail.snapshot()
     }
 
-    fn finish(&mut self) {
+    fn finish(&mut self) -> WorkerExit {
+        self.cancellation.store(true, Ordering::Release);
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            if handle.join().is_err() {
+                return WorkerExit::FailedPanicked;
+            }
+        }
+        WorkerExit::Released
+    }
+
+    /// Join after a known child exit so every diagnostic byte is consumed.
+    fn finish_after_eof(&mut self) -> WorkerExit {
+        if let Some(handle) = self.handle.take() {
+            if handle.join().is_err() {
+                return WorkerExit::FailedPanicked;
+            }
+        }
+        WorkerExit::Released
+    }
+}
+
+impl Drop for StderrDrainer {
+    fn drop(&mut self) {
+        if self.finish() == WorkerExit::FailedPanicked {
+            warn!("FFmpeg stderr drainer panicked during drop");
         }
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum TimedReadFailure {
+    Cancelled {
+        received: usize,
+    },
     Timeout {
         received: usize,
     },
@@ -340,6 +535,8 @@ impl Camera {
             fps: profile.fps,
             exposure: profile.exposure,
             worker: None,
+            pending_cleanup: None,
+            selected_backend: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -378,26 +575,32 @@ impl Camera {
         let latest_message = Arc::new(Mutex::new(None));
         let latest_message_worker = Arc::clone(&latest_message);
         let (notify_tx, notify_rx) = mpsc::sync_channel(1);
-        let (stop_tx, stop_rx) = mpsc::channel();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation_worker = Arc::clone(&cancellation);
+        let selected_backend = Arc::clone(&self.selected_backend);
 
-        let handle = thread::spawn(move || {
-            capture_worker_loop(
-                device_path,
-                width,
-                height,
-                format,
-                fps,
-                exposure,
-                latest_message_worker,
-                notify_tx,
-                stop_rx,
-            );
-        });
+        let handle = thread::Builder::new()
+            .name("howy-camera-capture".to_string())
+            .spawn(move || {
+                capture_worker_loop(
+                    device_path,
+                    width,
+                    height,
+                    format,
+                    fps,
+                    exposure,
+                    latest_message_worker,
+                    notify_tx,
+                    cancellation_worker,
+                    selected_backend,
+                );
+            })
+            .context("failed to spawn camera capture worker")?;
 
         self.worker = Some(CaptureWorker {
             latest_message,
             notify_rx,
-            stop_tx,
+            cancellation,
             thread_handle: Some(handle),
         });
 
@@ -405,28 +608,38 @@ impl Camera {
     }
 
     /// Stop the active capture worker, if any.
-    pub fn stop(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            // Signal the worker to stop and wait with a bounded timeout.
-            // If the worker is stuck on blocking I/O, we don't want to
-            // wedge the auth thread (and hold the camera lock) forever.
-            let _ = worker.stop_tx.send(());
-            if let Some(handle) = worker.thread_handle {
-                // Park for up to 500ms for a clean shutdown.
-                let deadline = std::time::Instant::now() + Duration::from_millis(500);
-                loop {
-                    if handle.is_finished() {
-                        let _ = handle.join();
-                        break;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        warn!("Camera worker did not stop within 500ms; abandoning join");
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
+    pub fn stop(&mut self) -> CameraStopOutcome {
+        if let Some(pending) = self.pending_cleanup.take() {
+            return CameraStopOutcome::Pending(pending);
         }
+        let Some(mut worker) = self.worker.take() else {
+            return CameraStopOutcome::Released;
+        };
+
+        worker.cancellation.store(true, Ordering::Release);
+        let Some(handle) = worker.thread_handle.take() else {
+            return CameraStopOutcome::Released;
+        };
+        let deadline = Instant::now() + SYNCHRONOUS_STOP_TIMEOUT;
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if handle.is_finished() {
+            if handle.join().is_err() {
+                CameraStopOutcome::FailedPanicked
+            } else {
+                CameraStopOutcome::Released
+            }
+        } else {
+            CameraStopOutcome::Pending(PendingCameraCleanup {
+                thread_handle: Some(handle),
+            })
+        }
+    }
+
+    pub(crate) fn retain_pending_cleanup(&mut self, pending: PendingCameraCleanup) {
+        debug_assert!(self.pending_cleanup.is_none());
+        self.pending_cleanup = Some(pending);
     }
 
     /// Capture a single frame with pixel format metadata.
@@ -464,11 +677,28 @@ impl Camera {
     pub fn height(&self) -> u32 {
         self.height
     }
+
+    /// Return the backend selected by the production worker after startup.
+    pub fn selected_backend(&self) -> Option<CaptureBackendKind> {
+        *self
+            .selected_backend
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 impl Drop for Camera {
     fn drop(&mut self) {
-        self.stop();
+        match self.stop() {
+            CameraStopOutcome::Pending(cleanup) => {
+                warn!("Camera dropped with pending worker; no admission reaper was attached");
+                drop(cleanup);
+            }
+            CameraStopOutcome::FailedPanicked => {
+                warn!("Camera worker panicked before camera drop cleanup");
+            }
+            CameraStopOutcome::Released => {}
+        }
     }
 }
 
@@ -481,10 +711,23 @@ fn capture_worker_loop(
     exposure: i32,
     latest_message: Arc<Mutex<Option<CaptureMessage>>>,
     notify_tx: mpsc::SyncSender<()>,
-    stop_rx: mpsc::Receiver<()>,
+    cancellation: Arc<AtomicBool>,
+    selected_backend: Arc<Mutex<Option<CaptureBackendKind>>>,
 ) {
-    let backend = match start_backend(&device_path, width, height, format, fps, exposure) {
-        Ok(backend) => backend,
+    // Cancellation brackets every controllable construction stage. Individual
+    // kernel open/ioctl calls cannot be interrupted safely from userspace; this
+    // isolated worker remains owned and can be handed to the tracked reaper.
+    let backend = match start_backend(
+        &device_path,
+        width,
+        height,
+        format,
+        fps,
+        exposure,
+        &cancellation,
+    ) {
+        Ok(BackendStart::Ready(backend)) => backend,
+        Ok(BackendStart::Cancelled) => return,
         Err(e) => {
             warn!("Failed to start camera backend: {e:#}");
             let _ = publish_message(
@@ -495,20 +738,28 @@ fn capture_worker_loop(
             return;
         }
     };
+    *selected_backend
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(backend_kind(&backend));
     let mut backend = Some(backend);
 
     loop {
-        match stop_rx.try_recv() {
-            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
-                debug!("Camera capture worker stopping");
-                return;
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
+        if cancellation.load(Ordering::Acquire) {
+            debug!("Camera capture worker stopping");
+            return;
         }
 
-        let event = capture_backend_once(&mut backend, || {
-            FfmpegBackend::new(&device_path, width, height, format, fps, exposure)
-                .map(Backend::Ffmpeg)
+        let event = capture_backend_once(&mut backend, &cancellation, || {
+            FfmpegBackend::new(
+                &device_path,
+                width,
+                height,
+                format,
+                fps,
+                exposure,
+                &cancellation,
+            )
+            .map(Backend::Ffmpeg)
         });
         match event {
             Ok(BackendEvent::Frame(frame)) => {
@@ -517,7 +768,15 @@ fn capture_worker_loop(
                     return;
                 }
             }
+            Ok(BackendEvent::Cancelled) => {
+                debug!("Camera capture worker cancelled");
+                return;
+            }
             Ok(BackendEvent::FellBack(error)) => {
+                *selected_backend
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(CaptureBackendKind::FfmpegFallback);
                 warn!("V4L2 capture failed ({error:#}); fell back to FFmpeg");
                 info!("Fell back to ffmpeg camera backend");
             }
@@ -534,6 +793,13 @@ fn capture_worker_loop(
     }
 }
 
+fn backend_kind(backend: &Backend) -> CaptureBackendKind {
+    match backend {
+        Backend::V4l2Mmap(_) => CaptureBackendKind::V4l2Mmap,
+        Backend::Ffmpeg(_) => CaptureBackendKind::FfmpegFallback,
+    }
+}
+
 fn start_backend(
     device_path: &str,
     width: u32,
@@ -541,29 +807,75 @@ fn start_backend(
     format: CaptureFormat,
     fps: i32,
     exposure: i32,
-) -> Result<Backend> {
+    cancellation: &AtomicBool,
+) -> Result<BackendStart<Backend>> {
     start_backend_with(
+        cancellation,
         || {
-            V4l2MmapBackend::new(device_path, width, height, format, fps, exposure)
-                .map(Backend::V4l2Mmap)
+            V4l2MmapBackend::new(
+                device_path,
+                width,
+                height,
+                format,
+                fps,
+                exposure,
+                cancellation,
+            )
+            .map(Backend::V4l2Mmap)
         },
         || {
-            FfmpegBackend::new(device_path, width, height, format, fps, exposure)
-                .map(Backend::Ffmpeg)
+            FfmpegBackend::new(
+                device_path,
+                width,
+                height,
+                format,
+                fps,
+                exposure,
+                cancellation,
+            )
+            .map(Backend::Ffmpeg)
         },
     )
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum BackendStart<T> {
+    Ready(T),
+    Cancelled,
+}
+
 fn start_backend_with<T>(
+    cancellation: &AtomicBool,
     try_v4l2: impl FnOnce() -> Result<T>,
     try_ffmpeg: impl FnOnce() -> Result<T>,
-) -> Result<T> {
+) -> Result<BackendStart<T>> {
+    if cancellation.load(Ordering::Acquire) {
+        return Ok(BackendStart::Cancelled);
+    }
     match try_v4l2() {
-        Ok(backend) => Ok(backend),
+        Ok(backend) => {
+            if cancellation.load(Ordering::Acquire) {
+                drop(backend);
+                Ok(BackendStart::Cancelled)
+            } else {
+                Ok(BackendStart::Ready(backend))
+            }
+        }
         Err(v4l2_error) => {
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(BackendStart::Cancelled);
+            }
             debug!("V4L2 mmap backend unavailable: {v4l2_error:#}; trying optional FFmpeg");
             match try_ffmpeg() {
-                Ok(backend) => Ok(backend),
+                Ok(backend) => {
+                    if cancellation.load(Ordering::Acquire) {
+                        drop(backend);
+                        Ok(BackendStart::Cancelled)
+                    } else {
+                        Ok(BackendStart::Ready(backend))
+                    }
+                }
+                Err(_) if cancellation.load(Ordering::Acquire) => Ok(BackendStart::Cancelled),
                 Err(ffmpeg_error) => Err(anyhow!(
                     "V4L2 mmap backend failed: {v4l2_error:#}; optional FFmpeg fallback failed: {ffmpeg_error:#}"
                 )),
@@ -572,6 +884,7 @@ fn start_backend_with<T>(
     }
 }
 
+#[cfg(test)]
 fn construct_fallback_after_release<T, U>(
     failed_backend: &mut Option<T>,
     construct: impl FnOnce() -> Result<U>,
@@ -582,6 +895,7 @@ fn construct_fallback_after_release<T, U>(
 
 fn capture_backend_once<B>(
     backend: &mut Option<B>,
+    cancellation: &AtomicBool,
     construct_fallback: impl FnOnce() -> Result<B>,
 ) -> Result<BackendEvent>
 where
@@ -594,18 +908,31 @@ where
     let frame_result = backend
         .as_mut()
         .context("capture backend missing")?
-        .next_frame();
+        .next_frame(cancellation);
 
     match frame_result {
-        Ok(frame) => Ok(BackendEvent::Frame(frame)),
+        Ok(CaptureStep::Frame(frame)) => Ok(BackendEvent::Frame(frame)),
+        Ok(CaptureStep::Cancelled) => Ok(BackendEvent::Cancelled),
         Err(capture_error) if supports_fallback => {
-            let fallback = construct_fallback_after_release(backend, construct_fallback).map_err(
-                |fallback_error| {
-                    anyhow!(
+            drop(backend.take());
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(BackendEvent::Cancelled);
+            }
+            let fallback = match construct_fallback() {
+                Ok(fallback) => fallback,
+                Err(_) if cancellation.load(Ordering::Acquire) => {
+                    return Ok(BackendEvent::Cancelled);
+                }
+                Err(fallback_error) => {
+                    return Err(anyhow!(
                         "V4L2 capture failed: {capture_error:#}; optional FFmpeg fallback failed: {fallback_error:#}"
-                    )
-                },
-            )?;
+                    ));
+                }
+            };
+            if cancellation.load(Ordering::Acquire) {
+                drop(fallback);
+                return Ok(BackendEvent::Cancelled);
+            }
             *backend = Some(fallback);
             Ok(BackendEvent::FellBack(capture_error))
         }
@@ -736,10 +1063,20 @@ fn apply_v4l2_settings(device: &v4l::Device, fps: i32, exposure: i32) {
     }
 }
 
-fn apply_v4l2_settings_before_ffmpeg(device_path: &str, fps: i32, exposure: i32) {
+fn apply_v4l2_settings_before_ffmpeg(
+    device_path: &str,
+    fps: i32,
+    exposure: i32,
+    cancellation: &AtomicBool,
+) {
+    if cancellation.load(Ordering::Acquire) {
+        return;
+    }
     match v4l::Device::with_path(device_path) {
         Ok(device) => {
-            apply_v4l2_settings(&device, fps, exposure);
+            if !cancellation.load(Ordering::Acquire) {
+                apply_v4l2_settings(&device, fps, exposure);
+            }
             drop(device);
         }
         Err(error) => debug!(
@@ -759,7 +1096,11 @@ impl V4l2MmapBackend {
         _format: CaptureFormat,
         fps: i32,
         exposure: i32,
+        cancellation: &AtomicBool,
     ) -> Result<Self> {
+        if cancellation.load(Ordering::Acquire) {
+            bail!("camera startup cancelled before V4L2 open");
+        }
         let dev =
             v4l::Device::with_path(device_path).context("failed to open V4L2 device for mmap")?;
 
@@ -781,12 +1122,15 @@ impl V4l2MmapBackend {
         // because the stream is stored in the same struct as the device and
         // fields drop in declaration order (stream before _device). The stream
         // only holds an Arc<Handle> cloned from the device, not a direct reference.
-        let stream = unsafe {
+        let mut stream = unsafe {
             let dev_ref: &v4l::Device = &*device;
             let dev_ref_static: &'static v4l::Device = std::mem::transmute(dev_ref);
             v4l::io::mmap::Stream::with_buffers(dev_ref_static, BufType::VideoCapture, 2)
                 .context("V4L2 mmap: failed to create stream")?
         };
+        // A dequeue timeout is terminal because v4l 0.14 `next()` has already
+        // queued a buffer and cannot safely be resumed without double-queueing.
+        stream.set_timeout(V4L2_DEQUEUE_TIMEOUT);
 
         debug!(
             width = negotiated.width,
@@ -812,16 +1156,45 @@ impl V4l2MmapBackend {
         })
     }
 
-    fn next_frame(&mut self) -> Result<Frame> {
-        let (buf, meta) = self
-            .stream
-            .next()
-            .context("V4L2 mmap: failed to read frame")?;
+    fn next_frame(&mut self, cancellation: &AtomicBool) -> Result<CaptureStep> {
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(CaptureStep::Cancelled);
+        }
+        let (buf, meta) = match classify_v4l_dequeue(self.stream.next(), cancellation)? {
+            Some(frame) => frame,
+            None => return Ok(CaptureStep::Cancelled),
+        };
+
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(CaptureStep::Cancelled);
+        }
 
         match normalize_mmap_payload(buf, meta.bytesused, &self.negotiated)? {
-            NormalizedMmapPayload::Frame(frame) => Ok(frame),
-            NormalizedMmapPayload::Mjpeg(payload) => decode_mjpeg(payload, &self.negotiated),
+            NormalizedMmapPayload::Frame(frame) => Ok(CaptureStep::Frame(frame)),
+            NormalizedMmapPayload::Mjpeg(payload) => {
+                decode_mjpeg(payload, &self.negotiated).map(CaptureStep::Frame)
+            }
         }
+    }
+}
+
+fn classify_v4l_dequeue<T>(result: io::Result<T>, cancellation: &AtomicBool) -> Result<Option<T>> {
+    match result {
+        Ok(frame) => Ok(Some(frame)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+            ) =>
+        {
+            if cancellation.load(Ordering::Acquire) {
+                Ok(None)
+            } else {
+                Err(error)
+                    .context("V4L2 mmap dequeue ended in a non-resumable timeout/interruption")
+            }
+        }
+        Err(error) => Err(error).context("V4L2 mmap: failed to read frame"),
     }
 }
 
@@ -1298,7 +1671,11 @@ impl FfmpegBackend {
         format: CaptureFormat,
         fps: i32,
         exposure: i32,
+        cancellation: &AtomicBool,
     ) -> Result<Self> {
+        if cancellation.load(Ordering::Acquire) {
+            bail!("camera startup cancelled before FFmpeg preparation");
+        }
         let output_bytes_per_pixel = if matches!(format, CaptureFormat::Grey) {
             1
         } else {
@@ -1309,12 +1686,21 @@ impl FfmpegBackend {
         if matches!(format, CaptureFormat::Grey) {
             checked_frame_len(width, height, 3, "FFmpeg GREY BGR expansion")?;
         }
-        apply_v4l2_settings_before_ffmpeg(device, fps, exposure);
+        apply_v4l2_settings_before_ffmpeg(device, fps, exposure, cancellation);
+        if cancellation.load(Ordering::Acquire) {
+            bail!("camera startup cancelled before FFmpeg spawn");
+        }
         let args = ffmpeg_args(device, width, height, format, fps);
-        let mut child = Command::new("ffmpeg")
+        if cancellation.load(Ordering::Acquire) {
+            bail!("camera startup cancelled before FFmpeg spawn");
+        }
+        let mut command = Command::new("ffmpeg");
+        command
             .args(&args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_parent_death_signal(&mut command);
+        let mut child = command
             .spawn()
             .with_context(|| {
                 format!(
@@ -1322,12 +1708,34 @@ impl FfmpegBackend {
                 )
             })?;
 
-        let stdout = child.stdout.take().context("ffmpeg stdout missing")?;
-        let stderr = child.stderr.take().context("ffmpeg stderr missing")?;
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                terminate_ffmpeg_child(&mut child);
+                bail!("ffmpeg stdout missing");
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                terminate_ffmpeg_child(&mut child);
+                bail!("ffmpeg stderr missing");
+            }
+        };
+        let stderr = match StderrDrainer::spawn(stderr) {
+            Ok(stderr) => stderr,
+            Err(error) => {
+                if let Err(kill_error) = child.kill() {
+                    warn!(%kill_error, "Failed to kill FFmpeg after stderr drainer spawn failure");
+                }
+                terminate_ffmpeg_child(&mut child);
+                return Err(error);
+            }
+        };
         Ok(Self {
             child,
             stdout,
-            stderr: StderrDrainer::spawn(stderr),
+            stderr,
             width,
             height,
             format,
@@ -1335,33 +1743,42 @@ impl FfmpegBackend {
         })
     }
 
-    fn next_frame(&mut self) -> Result<Frame> {
+    fn next_frame(&mut self, cancellation: &AtomicBool) -> Result<CaptureStep> {
         match self.format {
             CaptureFormat::Grey => {
                 let mut gray = vec![0u8; self.frame_size];
-                self.read_frame(&mut gray, "grayscale")?;
-                Ok(Frame {
+                if !self.read_frame(&mut gray, "grayscale", cancellation)? {
+                    return Ok(CaptureStep::Cancelled);
+                }
+                Ok(CaptureStep::Frame(Frame {
                     data: gray,
                     width: self.width,
                     height: self.height,
                     format: FrameFormat::Gray,
-                })
+                }))
             }
             CaptureFormat::Mjpeg | CaptureFormat::Yuyv => {
                 let mut bgr = vec![0u8; self.frame_size];
-                self.read_frame(&mut bgr, "BGR")?;
-                Ok(Frame {
+                if !self.read_frame(&mut bgr, "BGR", cancellation)? {
+                    return Ok(CaptureStep::Cancelled);
+                }
+                Ok(CaptureStep::Frame(Frame {
                     data: bgr,
                     width: self.width,
                     height: self.height,
                     format: FrameFormat::Bgr,
-                })
+                }))
             }
         }
     }
 
-    fn read_frame(&mut self, frame: &mut [u8], description: &str) -> Result<()> {
-        self.read_frame_with_timeout(frame, description, FRAME_READ_TIMEOUT)
+    fn read_frame(
+        &mut self,
+        frame: &mut [u8],
+        description: &str,
+        cancellation: &AtomicBool,
+    ) -> Result<bool> {
+        self.read_frame_with_timeout(frame, description, FRAME_READ_TIMEOUT, cancellation)
     }
 
     fn read_frame_with_timeout(
@@ -1369,13 +1786,19 @@ impl FfmpegBackend {
         frame: &mut [u8],
         description: &str,
         timeout: Duration,
-    ) -> Result<()> {
+        cancellation: &AtomicBool,
+    ) -> Result<bool> {
         let deadline = Instant::now() + timeout;
         let stdout_fd = self.stdout.as_raw_fd();
-        match read_exact_until(&mut self.stdout, frame, deadline, |deadline| {
-            wait_for_fd_until(stdout_fd, deadline)
-        }) {
-            Ok(()) => Ok(()),
+        match read_exact_until(
+            &mut self.stdout,
+            frame,
+            deadline,
+            || cancellation.load(Ordering::Acquire),
+            |deadline| wait_for_fd_until(stdout_fd, deadline),
+        ) {
+            Ok(()) => Ok(true),
+            Err(TimedReadFailure::Cancelled { .. }) => Ok(false),
             Err(TimedReadFailure::Timeout { received }) => Err(self.with_stderr_tail(format!(
                 "timed out after {}ms waiting for {description} frame from FFmpeg ({received}/{} bytes)",
                 timeout.as_millis(),
@@ -1403,7 +1826,9 @@ impl FfmpegBackend {
     ) -> anyhow::Error {
         match self.child.try_wait() {
             Ok(Some(status)) => {
-                self.stderr.finish();
+                if self.stderr.finish_after_eof() == WorkerExit::FailedPanicked {
+                    warn!("FFmpeg stderr drainer panicked");
+                }
                 self.with_stderr_tail(format!(
                     "FFmpeg exited {status} before a complete {description} frame was read ({received}/{expected} bytes)"
                 ))
@@ -1427,10 +1852,34 @@ impl FfmpegBackend {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn configure_parent_death_signal(command: &mut Command) {
+    let expected_parent = unsafe { libc::getpid() };
+    // SAFETY: the closure invokes only async-signal-safe libc syscalls before
+    // exec. It installs SIGKILL and closes the parent-death race by comparing
+    // the post-prctl parent with the parent that configured this command.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() != expected_parent {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+                return Err(io::Error::from_raw_os_error(libc::ECHILD));
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_parent_death_signal(_command: &mut Command) {}
+
 fn read_exact_until<R>(
     reader: &mut R,
     frame: &mut [u8],
     deadline: Instant,
+    mut cancelled: impl FnMut() -> bool,
     mut wait: impl FnMut(Instant) -> io::Result<bool>,
 ) -> std::result::Result<(), TimedReadFailure>
 where
@@ -1438,12 +1887,16 @@ where
 {
     let mut offset = 0;
     while offset < frame.len() {
+        if cancelled() {
+            return Err(TimedReadFailure::Cancelled { received: offset });
+        }
         if Instant::now() >= deadline {
             return Err(TimedReadFailure::Timeout { received: offset });
         }
-        match wait(deadline) {
+        let checkpoint = deadline.min(Instant::now() + CAPTURE_CANCELLATION_CHECK_INTERVAL);
+        match wait(checkpoint) {
             Ok(true) => {}
-            Ok(false) => return Err(TimedReadFailure::Timeout { received: offset }),
+            Ok(false) => continue,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
                 return Err(TimedReadFailure::Io {
@@ -1500,17 +1953,42 @@ fn wait_for_fd_until(fd: i32, deadline: Instant) -> io::Result<bool> {
     }
 }
 
-fn cleanup_ffmpeg_process(child: &mut Child, stderr: &mut StderrDrainer) {
-    if matches!(child.try_wait(), Ok(None)) {
-        let _ = child.kill();
+fn cleanup_ffmpeg_process(child: &mut Child, stderr: &mut StderrDrainer) -> WorkerExit {
+    let stderr_exit = stderr.finish();
+    if stderr_exit == WorkerExit::FailedPanicked {
+        warn!("FFmpeg stderr drainer panicked during cleanup");
     }
-    let _ = child.wait();
-    stderr.finish();
+    terminate_ffmpeg_child(child);
+    stderr_exit
+}
+
+/// Repeatedly escalates with `kill` while preserving `Child` ownership until
+/// `try_wait` confirms reaping. This may keep the isolated capture worker alive,
+/// but request and reaper-owner paths only retain/poll that worker with bounds.
+fn terminate_ffmpeg_child(child: &mut Child) {
+    let mut escalation_deadline = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(error) => {
+                warn!(%error, "Failed to inspect FFmpeg camera process; retaining ownership");
+            }
+        }
+
+        if Instant::now() >= escalation_deadline {
+            if let Err(error) = child.kill() {
+                warn!(%error, "Failed to kill FFmpeg camera process; will retry while owned");
+            }
+            escalation_deadline = Instant::now() + FFMPEG_TERMINATION_ESCALATION;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 impl Drop for FfmpegBackend {
     fn drop(&mut self) {
-        cleanup_ffmpeg_process(&mut self.child, &mut self.stderr);
+        let _ = cleanup_ffmpeg_process(&mut self.child, &mut self.stderr);
     }
 }
 
@@ -1768,7 +2246,7 @@ mod tests {
         FfmpegBackend {
             child,
             stdout,
-            stderr: StderrDrainer::spawn(stderr),
+            stderr: StderrDrainer::spawn(stderr).unwrap(),
             width: u32::try_from(frame_size).unwrap(),
             height: 1,
             format: CaptureFormat::Grey,
@@ -2097,7 +2575,9 @@ mod tests {
     #[test]
     fn startup_backend_order_is_v4l2_then_ffmpeg() {
         let order = RefCell::new(Vec::new());
+        let cancellation = AtomicBool::new(false);
         let selected = start_backend_with(
+            &cancellation,
             || {
                 order.borrow_mut().push("v4l2");
                 Err(anyhow!("unavailable"))
@@ -2109,14 +2589,16 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(selected, "ffmpeg");
+        assert_eq!(selected, BackendStart::Ready("ffmpeg"));
         assert_eq!(*order.borrow(), ["v4l2", "ffmpeg"]);
     }
 
     #[test]
     fn successful_v4l2_start_does_not_try_ffmpeg() {
         let ffmpeg_called = Cell::new(false);
+        let cancellation = AtomicBool::new(false);
         let selected = start_backend_with(
+            &cancellation,
             || Ok("v4l2"),
             || {
                 ffmpeg_called.set(true);
@@ -2125,8 +2607,74 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(selected, "v4l2");
+        assert_eq!(selected, BackendStart::Ready("v4l2"));
         assert!(!ffmpeg_called.get());
+    }
+
+    #[test]
+    fn cancellation_prevents_startup_and_fallback_construction() {
+        let cancellation = AtomicBool::new(true);
+        let v4l_called = Cell::new(false);
+        let ffmpeg_called = Cell::new(false);
+        let result = start_backend_with(
+            &cancellation,
+            || {
+                v4l_called.set(true);
+                Ok("v4l")
+            },
+            || {
+                ffmpeg_called.set(true);
+                Ok("ffmpeg")
+            },
+        )
+        .unwrap();
+        assert_eq!(result, BackendStart::Cancelled);
+        assert!(!v4l_called.get());
+        assert!(!ffmpeg_called.get());
+
+        cancellation.store(false, Ordering::Release);
+        let result: BackendStart<&str> = start_backend_with(
+            &cancellation,
+            || {
+                cancellation.store(true, Ordering::Release);
+                Err(anyhow!("terminal V4L failure"))
+            },
+            || {
+                ffmpeg_called.set(true);
+                Ok("ffmpeg")
+            },
+        )
+        .unwrap();
+        assert_eq!(result, BackendStart::Cancelled);
+        assert!(!ffmpeg_called.get());
+    }
+
+    #[test]
+    fn cancellation_after_failed_backend_release_skips_ffmpeg_fallback() {
+        struct CancellingBackend<'a>(&'a AtomicBool);
+        impl BackendCapture for CancellingBackend<'_> {
+            fn next_frame(&mut self, _cancellation: &AtomicBool) -> Result<CaptureStep> {
+                Err(anyhow!("terminal dequeue failure"))
+            }
+
+            fn supports_fallback(&self) -> bool {
+                true
+            }
+        }
+        impl Drop for CancellingBackend<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let cancellation = AtomicBool::new(false);
+        let mut backend = Some(CancellingBackend(&cancellation));
+        let event = capture_backend_once(&mut backend, &cancellation, || {
+            panic!("cancellation must prevent FFmpeg construction")
+        })
+        .unwrap();
+        assert!(matches!(event, BackendEvent::Cancelled));
+        assert!(backend.is_none());
     }
 
     #[test]
@@ -2137,16 +2685,16 @@ mod tests {
             dropped: Rc<Cell<bool>>,
         }
         impl BackendCapture for FakeBackend {
-            fn next_frame(&mut self) -> Result<Frame> {
+            fn next_frame(&mut self, _cancellation: &AtomicBool) -> Result<CaptureStep> {
                 if self.fail {
                     Err(anyhow!("capture failed"))
                 } else {
-                    Ok(Frame {
+                    Ok(CaptureStep::Frame(Frame {
                         data: vec![1],
                         width: 1,
                         height: 1,
                         format: FrameFormat::Gray,
-                    })
+                    }))
                 }
             }
 
@@ -2167,7 +2715,8 @@ mod tests {
             can_fallback: true,
             dropped: Rc::clone(&dropped),
         });
-        let event = capture_backend_once(&mut backend, || {
+        let cancellation = AtomicBool::new(false);
+        let event = capture_backend_once(&mut backend, &cancellation, || {
             assert!(dropped.get(), "failed owner must be dropped first");
             Ok(FakeBackend {
                 fail: false,
@@ -2179,6 +2728,211 @@ mod tests {
 
         assert!(matches!(event, BackendEvent::FellBack(_)));
         assert!(backend.is_some());
+    }
+
+    #[test]
+    fn v4l_terminal_timeout_never_retries_same_stream_and_cancellation_skips_fallback() {
+        struct TerminalBackend {
+            calls: usize,
+            successful_first_frame: bool,
+        }
+        impl BackendCapture for TerminalBackend {
+            fn next_frame(&mut self, cancellation: &AtomicBool) -> Result<CaptureStep> {
+                self.calls += 1;
+                if self.successful_first_frame && self.calls == 1 {
+                    Ok(CaptureStep::Frame(Frame {
+                        data: vec![1],
+                        width: 1,
+                        height: 1,
+                        format: FrameFormat::Gray,
+                    }))
+                } else {
+                    match classify_v4l_dequeue::<()>(
+                        Err(io::Error::from(io::ErrorKind::TimedOut)),
+                        cancellation,
+                    )? {
+                        Some(()) => unreachable!(),
+                        None => Ok(CaptureStep::Cancelled),
+                    }
+                }
+            }
+
+            fn supports_fallback(&self) -> bool {
+                true
+            }
+        }
+
+        let cancellation = AtomicBool::new(true);
+        let mut backend = Some(TerminalBackend {
+            calls: 0,
+            successful_first_frame: false,
+        });
+        let fallback_called = Cell::new(false);
+        let event = capture_backend_once(&mut backend, &cancellation, || {
+            fallback_called.set(true);
+            Ok(TerminalBackend {
+                calls: 0,
+                successful_first_frame: false,
+            })
+        })
+        .unwrap();
+        assert!(matches!(event, BackendEvent::Cancelled));
+        assert_eq!(backend.as_ref().unwrap().calls, 1);
+        assert!(!fallback_called.get());
+
+        cancellation.store(false, Ordering::Release);
+        let mut backend = Some(TerminalBackend {
+            calls: 0,
+            successful_first_frame: true,
+        });
+        assert!(matches!(
+            capture_backend_once(&mut backend, &cancellation, || unreachable!()).unwrap(),
+            BackendEvent::Frame(_)
+        ));
+        cancellation.store(true, Ordering::Release);
+        let event = capture_backend_once(&mut backend, &cancellation, || {
+            panic!("cancelled terminal timeout must not construct fallback")
+        })
+        .unwrap();
+        assert!(matches!(event, BackendEvent::Cancelled));
+        assert_eq!(backend.as_ref().unwrap().calls, 2);
+
+        cancellation.store(false, Ordering::Release);
+        let mut backend = Some(TerminalBackend {
+            calls: 0,
+            successful_first_frame: false,
+        });
+        let event = capture_backend_once(&mut backend, &cancellation, || {
+            Ok(TerminalBackend {
+                calls: 0,
+                successful_first_frame: false,
+            })
+        })
+        .unwrap();
+        assert!(matches!(event, BackendEvent::FellBack(_)));
+        assert_eq!(backend.as_ref().unwrap().calls, 0);
+
+        assert!(
+            classify_v4l_dequeue::<()>(
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                &AtomicBool::new(false),
+            )
+            .is_err()
+        );
+        assert!(
+            classify_v4l_dequeue::<()>(
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                &AtomicBool::new(true),
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    fn camera_with_test_worker(run: impl FnOnce(Arc<AtomicBool>) + Send + 'static) -> Camera {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let handle = thread::spawn(move || run(worker_cancellation));
+        let (notify_tx, notify_rx) = mpsc::sync_channel(1);
+        drop(notify_tx);
+        Camera {
+            width: 1,
+            height: 1,
+            format: CaptureFormat::Grey,
+            device_path: String::new(),
+            fps: -1,
+            exposure: -1,
+            worker: Some(CaptureWorker {
+                latest_message: Arc::new(Mutex::new(None)),
+                notify_rx,
+                cancellation,
+                thread_handle: Some(handle),
+            }),
+            pending_cleanup: None,
+            selected_backend: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn stop_is_idempotent_and_reports_released_worker() {
+        let exited = Arc::new(AtomicBool::new(false));
+        let worker_exited = Arc::clone(&exited);
+        let mut camera = camera_with_test_worker(move |cancellation| {
+            while !cancellation.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            worker_exited.store(true, Ordering::Release);
+        });
+
+        assert_eq!(camera.stop().state(), CameraStopState::Released);
+        assert!(exited.load(Ordering::Acquire));
+        assert_eq!(camera.stop().state(), CameraStopState::Released);
+    }
+
+    #[test]
+    fn stop_reports_panicked_worker_without_propagating_panic() {
+        let mut camera = camera_with_test_worker(|_| panic!("mock worker panic"));
+        while !camera
+            .worker
+            .as_ref()
+            .unwrap()
+            .thread_handle
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(camera.stop().state(), CameraStopState::FailedPanicked);
+        assert_eq!(camera.stop().state(), CameraStopState::Released);
+    }
+
+    #[test]
+    fn timed_out_stop_returns_owned_pending_cleanup() {
+        let (release_tx, release_rx) = mpsc::channel();
+        let exited = Arc::new(AtomicBool::new(false));
+        let worker_exited = Arc::clone(&exited);
+        let mut camera = camera_with_test_worker(move |cancellation| {
+            while !cancellation.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let _ = release_rx.recv();
+            worker_exited.store(true, Ordering::Release);
+        });
+
+        let outcome = camera.stop();
+        assert_eq!(outcome.state(), CameraStopState::Pending);
+        assert!(!exited.load(Ordering::Acquire));
+        release_tx.send(()).unwrap();
+        match outcome {
+            CameraStopOutcome::Pending(mut cleanup) => {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !cleanup.is_finished() {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(cleanup.try_complete(), Some(WorkerExit::Released));
+            }
+            CameraStopOutcome::Released => panic!("worker should still be pending"),
+            CameraStopOutcome::FailedPanicked => panic!("worker should not panic"),
+        }
+        assert!(exited.load(Ordering::Acquire));
+        assert_eq!(camera.stop().state(), CameraStopState::Released);
+    }
+
+    #[test]
+    fn dropping_pending_cleanup_retains_handle_for_final_owner() {
+        let (release_tx, release_rx) = mpsc::channel();
+        let pending = PendingCameraCleanup::from_thread_handle(thread::spawn(move || {
+            let _ = release_rx.recv();
+        }));
+        drop(pending);
+        let retained = take_retained_camera_workers();
+        assert_eq!(retained.len(), 1);
+        release_tx.send(()).unwrap();
+        for handle in retained {
+            handle.join().unwrap();
+        }
     }
 
     #[test]
@@ -2216,6 +2970,14 @@ mod tests {
             positive_args.get(fps_index + 1).map(String::as_str),
             Some("25")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parent_death_signal_pre_exec_contract_allows_child_exec() {
+        let mut command = Command::new("/bin/true");
+        configure_parent_death_signal(&mut command);
+        assert!(command.status().unwrap().success());
     }
 
     #[test]
@@ -2261,6 +3023,7 @@ mod tests {
             &mut partial,
             &mut frame,
             Instant::now() + Duration::from_secs(1),
+            || false,
             |_| Ok(true),
         )
         .unwrap_err();
@@ -2270,33 +3033,76 @@ mod tests {
         let error = read_exact_until(
             &mut unread,
             &mut frame,
-            Instant::now() + Duration::from_secs(1),
+            Instant::now(),
+            || false,
             |_| Ok(false),
         )
         .unwrap_err();
         assert_eq!(error, TimedReadFailure::Timeout { received: 0 });
 
         let calls = Cell::new(0);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let error = read_exact_until(&mut unread, &mut frame, deadline, |seen_deadline| {
-            assert_eq!(seen_deadline, deadline);
-            calls.set(calls.get() + 1);
-            if calls.get() == 1 {
-                Err(io::Error::from(io::ErrorKind::Interrupted))
-            } else {
-                Ok(false)
-            }
-        })
+        let deadline = Instant::now() + Duration::from_millis(1);
+        let error = read_exact_until(
+            &mut unread,
+            &mut frame,
+            deadline,
+            || false,
+            |_| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    Err(io::Error::from(io::ErrorKind::Interrupted))
+                } else {
+                    thread::sleep(Duration::from_millis(2));
+                    Ok(false)
+                }
+            },
+        )
         .unwrap_err();
         assert_eq!(calls.get(), 2);
         assert_eq!(error, TimedReadFailure::Timeout { received: 0 });
     }
 
     #[test]
+    fn ffmpeg_mock_read_observes_cancellation_without_losing_partial_count() {
+        let mut reader = Cursor::new(vec![7_u8]);
+        let mut frame = [0_u8; 2];
+        let checks = Cell::new(0);
+        let error = read_exact_until(
+            &mut reader,
+            &mut frame,
+            Instant::now() + Duration::from_secs(1),
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 1
+            },
+            |_| Ok(true),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TimedReadFailure::Cancelled { received: 1 });
+        assert_eq!(frame[0], 7);
+    }
+
+    #[test]
     fn stderr_drainer_caps_tail_under_flood() {
+        use std::io::Write;
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+
         let flood = vec![b'x'; FFMPEG_STDERR_TAIL_BYTES * 4];
-        let mut drainer = StderrDrainer::spawn(Cursor::new(flood));
-        drainer.finish();
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let flood_writer = thread::spawn(move || {
+            writer.write_all(&flood).unwrap();
+            writer.shutdown(Shutdown::Write).unwrap();
+        });
+        let mut drainer = StderrDrainer::spawn(reader).unwrap();
+        flood_writer.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !drainer.handle.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(drainer.finish(), WorkerExit::Released);
         assert_eq!(drainer.snapshot().len(), FFMPEG_STDERR_TAIL_BYTES);
 
         let mut tail = StderrTail::new(8);
@@ -2306,35 +3112,54 @@ mod tests {
     }
 
     #[test]
-    fn ffmpeg_errors_include_stderr_for_partial_exit_and_timeout() {
-        let mut early = fake_ffmpeg_backend("printf early-device-busy >&2; exit 7", 1);
-        let _ = early.child.wait();
-        early.stderr.finish();
-        let error = early
-            .next_frame()
-            .err()
-            .expect("early FFmpeg exit should fail");
-        let message = error.to_string();
-        assert!(message.contains("0/1 bytes"));
-        assert!(message.contains("early-device-busy"));
+    fn stderr_drainer_cancellation_is_bounded_with_inherited_writer_open() {
+        use std::os::unix::net::UnixStream;
 
-        let mut partial =
-            fake_ffmpeg_backend("printf x; printf partial-device-busy >&2; exit 3", 2);
-        let _ = partial.child.wait();
-        partial.stderr.finish();
-        let error = partial
-            .next_frame()
-            .err()
-            .expect("partial FFmpeg frame should fail");
-        let message = error.to_string();
-        assert!(message.contains("1/2 bytes"));
-        assert!(message.contains("partial-device-busy"));
+        let (writer, reader) = UnixStream::pair().unwrap();
+        let inherited_writer = writer.try_clone().unwrap();
+        let mut drainer = StderrDrainer::spawn(reader).unwrap();
+        let started = Instant::now();
+        assert_eq!(drainer.finish(), WorkerExit::Released);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        drop(inherited_writer);
+        drop(writer);
+    }
+
+    #[test]
+    fn ffmpeg_errors_include_stderr_for_partial_exit_and_timeout() {
+        for _ in 0..20 {
+            let mut early = fake_ffmpeg_backend("printf early-device-busy >&2; exit 7", 1);
+            let _ = early.child.wait();
+            let error = early
+                .next_frame(&AtomicBool::new(false))
+                .err()
+                .expect("early FFmpeg exit should fail");
+            let message = error.to_string();
+            assert!(message.contains("0/1 bytes"));
+            assert!(message.contains("early-device-busy"));
+
+            let mut partial =
+                fake_ffmpeg_backend("printf x; printf partial-device-busy >&2; exit 3", 2);
+            let _ = partial.child.wait();
+            let error = partial
+                .next_frame(&AtomicBool::new(false))
+                .err()
+                .expect("partial FFmpeg frame should fail");
+            let message = error.to_string();
+            assert!(message.contains("1/2 bytes"));
+            assert!(message.contains("partial-device-busy"));
+        }
 
         let mut timeout = fake_ffmpeg_backend("printf timeout-device-busy >&2; exec sleep 5", 1);
         thread::sleep(Duration::from_millis(10));
         let mut frame = [0_u8; 1];
         let error = timeout
-            .read_frame_with_timeout(&mut frame, "test", Duration::from_millis(20))
+            .read_frame_with_timeout(
+                &mut frame,
+                "test",
+                Duration::from_millis(20),
+                &AtomicBool::new(false),
+            )
             .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("timed out"));
@@ -2349,7 +3174,7 @@ mod tests {
             .spawn()
             .unwrap();
         let stderr = child.stderr.take().unwrap();
-        let mut drainer = StderrDrainer::spawn(stderr);
+        let mut drainer = StderrDrainer::spawn(stderr).unwrap();
 
         cleanup_ffmpeg_process(&mut child, &mut drainer);
 

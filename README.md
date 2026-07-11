@@ -39,7 +39,11 @@ enroll.py    ──┘                      ├── SCRFD (face detection)
 | TensorRT | Supported via ONNX Runtime, untested |
 | CPU | Always works (final fallback) |
 
-The `provider = "auto"` config tries GPU providers in order and caches the first one that works. Persistent `.mxr` cache eliminates MIGraphX compilation on subsequent boots.
+The `provider = "auto"` config discovers providers on every daemon start. A
+registration+self-test result is not graph-placement evidence, so persistent
+`provider-selection.txt` files are intentionally ignored until profiled
+placement can justify provider pinning. MIGraphX may still reuse its separate
+persistent `.mxr` compiled-model cache on subsequent boots.
 
 ## Quick Start
 
@@ -70,6 +74,33 @@ sudo howy prewarm
 howy doctor
 ```
 
+### Daemon activation and first-auth latency
+
+Socket-only activation is the lower-resource, on-demand option. The first PAM
+request starts the service, so that request includes daemon model/provider
+initialization and warmup time:
+
+```bash
+sudo systemctl enable --now howy.socket
+```
+
+For the lowest first-auth latency, explicitly enable and start both units. This
+starts `howyd` before PAM needs it, allowing provider/session initialization plus
+the detector and recognizer warmups to finish ahead of authentication:
+
+```bash
+sudo systemctl enable --now howy.socket howy.service
+```
+
+Packaging and local install scripts install/reload these units but intentionally
+do not enable either activation policy automatically.
+
+`PKGBUILD` retains remote Git source semantics for committed package builds and
+installs the canonical checked-in units from `systemd/`. Do not use that remote
+source flow for uncommitted performance-test code. Build the worktree directly
+and use `scripts/install-local.sh` (which prints and verifies installed SHA-256
+hashes), or run the exact local artifacts directly and record their hashes.
+
 ### Enrollment
 
 ```bash
@@ -85,7 +116,9 @@ sudo howy test --user $USER
 
 ### PAM Integration
 
-howy is designed as a drop-in replacement for howdy. The install script backs up `pam_howdy.so` and symlinks it to `pam_howy.so`, so existing PAM configurations work without modification.
+howy is designed as a drop-in replacement for howdy. The local installer places
+`pam_howy.so` but never edits PAM service configuration; PAM integration remains
+an explicit administrator step.
 
 ## Project Structure
 
@@ -107,6 +140,7 @@ systemd/
   howy.socket     # Systemd socket unit
 docs/
   ENROLLMENT_DESIGN.md
+  FP16_EXPERIMENT.md
   MIGRAPHX_DEPLOYMENT_NOTES.md
 ```
 

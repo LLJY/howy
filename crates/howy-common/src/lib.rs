@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod credential;
+pub mod env;
 pub mod face;
 pub mod ipc;
 pub mod paths;

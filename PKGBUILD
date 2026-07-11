@@ -39,43 +39,6 @@ build() {
   cargo build --frozen --release -p howy-daemon -p howy-cli -p howy-pam
 }
 
-_install_units() {
-  install -Dm644 /dev/stdin "${pkgdir}/usr/lib/systemd/system/howy.service" <<'EOF'
-[Unit]
-Description=howy Face Authentication Daemon
-Documentation=https://github.com/LLJY/howy
-After=network.target
-Requires=howy.socket
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/howyd
-Restart=on-failure
-RestartSec=5
-Environment="RUST_LOG=info"
-SupplementaryGroups=video render
-KeyringMode=shared
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  install -Dm644 /dev/stdin "${pkgdir}/usr/lib/systemd/system/howy.socket" <<'EOF'
-[Unit]
-Description=howy Face Authentication Socket
-Documentation=https://github.com/LLJY/howy
-
-[Socket]
-ListenStream=/run/howy/howy.sock
-SocketMode=0666
-DirectoryMode=0755
-RuntimeDirectory=howy
-
-[Install]
-WantedBy=sockets.target
-EOF
-}
-
 _package_common() {
   local _pkgname="$1"
 
@@ -88,15 +51,16 @@ _package_common() {
   install -Dm644 config.toml "${pkgdir}/etc/howy/config.toml"
   install -Dm755 scripts/download-models.sh "${pkgdir}/usr/bin/howy-download-models"
   install -Dm755 scripts/enroll.py "${pkgdir}/usr/bin/howy-enroll"
+  install -Dm644 systemd/howy.service "${pkgdir}/usr/lib/systemd/system/howy.service"
+  install -Dm644 systemd/howy.socket "${pkgdir}/usr/lib/systemd/system/howy.socket"
   install -Dm644 README.md "${pkgdir}/usr/share/doc/${_pkgname}/README.md"
   install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${_pkgname}/LICENSE"
 
   install -d "${pkgdir}/etc/howy/models"
   install -d "${pkgdir}/usr/share/howy/onnx-data"
-  install -d "${pkgdir}/var/cache/howy"
+  install -dm700 "${pkgdir}/var/cache/howy"
   install -d "${pkgdir}/var/log/howy"
 
-  _install_units
 }
 
 package_howy-cpu-git() {

@@ -6,15 +6,15 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ndarray::ArrayView4;
 use ort::execution_providers::{
     CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider, MIGraphXExecutionProvider,
     OpenVINOExecutionProvider, TensorRTExecutionProvider,
 };
+use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::builder::SessionBuilder;
-use ort::session::Session;
 use ort::value::TensorRef;
 use tracing::{info, warn};
 
@@ -27,7 +27,7 @@ macro_rules! map_ort {
 }
 
 use howy_common::config::HowyConfig;
-use howy_common::face::Face;
+use howy_common::face::{self, Face};
 
 /// Standard ArcFace alignment destination landmarks for 112x112 crop.
 const ARCFACE_DST: [[f32; 2]; 5] = [
@@ -37,6 +37,13 @@ const ARCFACE_DST: [[f32; 2]; 5] = [
     [41.5493, 92.3655],
     [70.7299, 92.2041],
 ];
+
+const SCRFD_STRIDES: [usize; 3] = [8, 16, 32];
+const SCRFD_ANCHORS_PER_CELL: usize = 2;
+const SCRFD_GROUP_WIDTHS: [usize; 3] = [1, 4, 10];
+const SCRFD_OUTPUT_COUNT: usize = SCRFD_STRIDES.len() * SCRFD_GROUP_WIDTHS.len();
+/// Reject degenerate ArcFace outputs while remaining far below any useful embedding norm.
+const MIN_RECOGNIZER_L2_NORM: f64 = 1.0e-12;
 
 /// Detector session with pre-allocated input buffer.
 struct DetectorState {
@@ -62,9 +69,17 @@ pub struct InferenceEngine {
     rec_input_name: String,
     det_size: (u32, u32),
     det_threshold: f32,
-    active_provider: String,
+    registered_preferred_provider: String,
     detector_path: PathBuf,
     recognizer_path: PathBuf,
+}
+
+/// Opt-in ONNX Runtime profiling destinations used only by experiment harnesses.
+pub struct InferenceProfiling {
+    pub detector_path: PathBuf,
+    pub recognizer_path: PathBuf,
+    /// Harness-only precision pin applied through the MIGraphX provider API.
+    pub migraphx_fp16: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,18 +106,60 @@ impl ProviderKind {
 impl InferenceEngine {
     /// Create a new inference engine, loading and preparing ONNX models.
     pub fn new(config: &HowyConfig) -> Result<Self> {
-        // Resolve model paths
-        let detector_path = resolve_model_path(&config.ml.detector_model, "det_10g.onnx")?;
-        let recognizer_path = resolve_model_path(&config.ml.recognizer_model, "w600k_r50.onnx")?;
+        Self::new_inner(config, true, None, None)
+    }
 
-        info!("Loading detector: {}", detector_path.display());
-        info!("Loading recognizer: {}", recognizer_path.display());
+    /// Create an engine with independent detector and recognizer ORT profiles.
+    pub fn new_profiled(config: &HowyConfig, profiling: InferenceProfiling) -> Result<Self> {
+        Self::new_inner(config, true, Some(profiling), None)
+    }
+
+    /// Create profiled sessions from parent-pinned ONNX bytes.
+    pub fn new_profiled_from_memory(
+        config: &HowyConfig,
+        profiling: InferenceProfiling,
+        detector_model: &[u8],
+        recognizer_model: &[u8],
+    ) -> Result<Self> {
+        Self::new_inner(
+            config,
+            true,
+            Some(profiling),
+            Some((detector_model, recognizer_model)),
+        )
+    }
+
+    fn new_inner(
+        config: &HowyConfig,
+        register_cpu_fallback: bool,
+        profiling: Option<InferenceProfiling>,
+        model_bytes: Option<(&[u8], &[u8])>,
+    ) -> Result<Self> {
+        // Harness sessions consume parent-pinned bytes and never reopen model paths.
+        let (detector_path, recognizer_path) = if model_bytes.is_some() {
+            (
+                PathBuf::from("<pinned-detector-memory>"),
+                PathBuf::from("<pinned-recognizer-memory>"),
+            )
+        } else {
+            (
+                resolve_model_path(&config.ml.detector_model, "det_10g.onnx")?,
+                resolve_model_path(&config.ml.recognizer_model, "w600k_r50.onnx")?,
+            )
+        };
+
+        if model_bytes.is_some() {
+            info!("Loading detector and recognizer from pinned memory");
+        } else {
+            info!("Loading detector: {}", detector_path.display());
+            info!("Loading recognizer: {}", recognizer_path.display());
+        }
 
         // Build execution providers based on config. The working MIGraphX
         // deployment on this host relies on ORT_MIGRAPHX_* environment-based
         // cache configuration; do not reintroduce explicit save/load model paths.
-        let det_plan = build_execution_providers(&config.ml.provider, "detector")?;
-        let rec_plan = build_execution_providers(&config.ml.provider, "recognizer")?;
+        let det_plan = build_execution_providers(&config.ml.provider, register_cpu_fallback)?;
+        let rec_plan = build_execution_providers(&config.ml.provider, register_cpu_fallback)?;
 
         // Create detector session
         let mut det_builder = map_ort!(Session::builder())?;
@@ -112,11 +169,20 @@ impl InferenceEngine {
         if config.ml.threads > 0 {
             det_builder = map_ort!(det_builder.with_intra_threads(config.ml.threads))?;
         }
+        if let Some(profiling) = profiling.as_ref() {
+            det_builder = map_ort!(det_builder.with_profiling(&profiling.detector_path))?;
+        }
 
+        let fp16 = profiling
+            .as_ref()
+            .and_then(|profiling| profiling.migraphx_fp16);
         let (mut det_builder, det_provider) =
-            configure_execution_providers(det_builder, &det_plan, "detector")?;
-        let det_session = map_ort!(det_builder.commit_from_file(&detector_path))
-            .context("failed to load detector model")?;
+            configure_execution_providers(det_builder, &det_plan, "detector", fp16)?;
+        let det_session = match model_bytes {
+            Some((detector, _)) => map_ort!(det_builder.commit_from_memory(detector)),
+            None => map_ort!(det_builder.commit_from_file(&detector_path)),
+        }
+        .context("failed to load detector model")?;
 
         // Create recognizer session
         let mut rec_builder = map_ort!(Session::builder())?;
@@ -126,11 +192,17 @@ impl InferenceEngine {
         if config.ml.threads > 0 {
             rec_builder = map_ort!(rec_builder.with_intra_threads(config.ml.threads))?;
         }
+        if let Some(profiling) = profiling.as_ref() {
+            rec_builder = map_ort!(rec_builder.with_profiling(&profiling.recognizer_path))?;
+        }
 
         let (mut rec_builder, rec_provider) =
-            configure_execution_providers(rec_builder, &rec_plan, "recognizer")?;
-        let rec_session = map_ort!(rec_builder.commit_from_file(&recognizer_path))
-            .context("failed to load recognizer model")?;
+            configure_execution_providers(rec_builder, &rec_plan, "recognizer", fp16)?;
+        let rec_session = match model_bytes {
+            Some((_, recognizer)) => map_ort!(rec_builder.commit_from_memory(recognizer)),
+            None => map_ort!(rec_builder.commit_from_file(&recognizer_path)),
+        }
+        .context("failed to load recognizer model")?;
 
         // Get input names
         let det_input_name = det_session.inputs()[0].name().to_string();
@@ -139,21 +211,15 @@ impl InferenceEngine {
         let det_w = config.ml.det_width as usize;
         let det_h = config.ml.det_height as usize;
 
-        let active_provider = if det_provider == rec_provider {
+        let registered_preferred_provider = if det_provider == rec_provider {
             det_provider
         } else {
-            let fallback = if det_provider == "cpu" || rec_provider == "cpu" {
-                "cpu".to_string()
-            } else {
-                det_provider.clone()
-            };
             warn!(
-                detector_provider = %det_provider,
-                recognizer_provider = %rec_provider,
-                effective_provider = %fallback,
+                detector_registered_preference = %det_provider,
+                recognizer_registered_preference = %rec_provider,
                 "Detector and recognizer registered different execution providers"
             );
-            fallback
+            "mixed".to_string()
         };
 
         info!("Detector input: {det_input_name}");
@@ -174,14 +240,21 @@ impl InferenceEngine {
             rec_input_name,
             det_size: (config.ml.det_width, config.ml.det_height),
             det_threshold: config.ml.det_threshold,
-            active_provider,
+            registered_preferred_provider,
             detector_path,
             recognizer_path,
         })
     }
 
+    /// Provider registered first for both sessions; this is not graph-placement evidence.
+    pub fn registered_preferred_provider(&self) -> &str {
+        &self.registered_preferred_provider
+    }
+
+    /// Compatibility accessor for existing status and smoke-test callers.
+    #[allow(dead_code)]
     pub fn active_provider(&self) -> &str {
-        &self.active_provider
+        self.registered_preferred_provider()
     }
 
     pub fn detector_model_path(&self) -> String {
@@ -199,6 +272,47 @@ impl InferenceEngine {
         let _ = self.detect(&dummy, 640, 480, false)?;
         info!("Warmup complete");
         Ok(())
+    }
+
+    /// Run the recognizer directly with a deterministic synthetic NCHW tensor.
+    pub fn warmup_recognizer(&self) -> Result<()> {
+        let synthetic_input: Vec<f32> = (0..3 * 112 * 112)
+            .map(|index| ((index % 256) as f32 - 127.5) / 128.0)
+            .collect();
+        let input_view = ArrayView4::from_shape((1, 3, 112, 112), synthetic_input.as_slice())
+            .map_err(|e| anyhow::anyhow!("recognizer warmup tensor shape error: {e}"))?;
+        let input_tensor = map_ort!(TensorRef::from_array_view(input_view))?;
+
+        let mut recognizer = self
+            .recognizer
+            .lock()
+            .map_err(|e| anyhow::anyhow!("inference lock poisoned: {e}"))?;
+        let outputs = map_ort!(
+            recognizer
+                .session
+                .run(ort::inputs![&self.rec_input_name => input_tensor])
+        )?;
+        let _ = extract_valid_recognizer_output(&outputs)?;
+        Ok(())
+    }
+
+    /// Explicitly finish both opt-in profiles and return ORT's actual paths.
+    pub fn end_profiling(&self) -> Result<(String, String)> {
+        let detector_path = {
+            let mut detector = self
+                .detector
+                .lock()
+                .map_err(|e| anyhow::anyhow!("inference lock poisoned: {e}"))?;
+            map_ort!(detector.session.end_profiling())?
+        };
+        let recognizer_path = {
+            let mut recognizer = self
+                .recognizer
+                .lock()
+                .map_err(|e| anyhow::anyhow!("inference lock poisoned: {e}"))?;
+            map_ort!(recognizer.session.end_profiling())?
+        };
+        Ok((detector_path, recognizer_path))
     }
 
     /// Detect faces in a raw BGR or grayscale image buffer.
@@ -238,6 +352,7 @@ impl InferenceEngine {
             .map_err(|e| anyhow::anyhow!("tensor shape error: {e}"))?;
         let input_tensor = map_ort!(TensorRef::from_array_view(input_view))?;
         let outputs = map_ort!(session.run(ort::inputs![&self.det_input_name => input_tensor]))?;
+        validate_scrfd_outputs(&outputs, det_w, det_h)?;
 
         // Post-process SCRFD outputs
         let faces = postprocess_scrfd(
@@ -284,19 +399,9 @@ impl InferenceEngine {
         let input_tensor = map_ort!(TensorRef::from_array_view(input_view))?;
         let outputs = map_ort!(session.run(ort::inputs![&self.rec_input_name => input_tensor]))?;
 
-        // Extract and normalize embedding
-        let embedding_view = map_ort!(outputs[0].try_extract_array::<f32>())?;
-        let mut embedding: Vec<f32> = embedding_view.iter().copied().collect();
-
-        // L2 normalize
-        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for v in &mut embedding {
-                *v /= norm;
-            }
-        }
-
-        Ok(embedding)
+        // Extract, validate, and normalize embedding.
+        let embedding = extract_valid_recognizer_output(&outputs)?;
+        Ok(normalize_arcface_embedding(embedding))
     }
 
     /// Detect faces and compute embeddings in one call.
@@ -315,6 +420,291 @@ impl InferenceEngine {
         }
 
         Ok(faces)
+    }
+}
+
+fn validate_output_count(model: &str, actual: usize, expected: usize) -> Result<()> {
+    if actual != expected {
+        bail!("{model} returned {actual} outputs; expected exactly {expected}");
+    }
+    Ok(())
+}
+
+fn validate_scrfd_output_facts(
+    output_index: usize,
+    det_w: usize,
+    det_h: usize,
+    shape: &[usize],
+    contiguous_data: Option<&[f32]>,
+) -> Result<()> {
+    let stride_index = output_index % SCRFD_STRIDES.len();
+    let group_index = output_index / SCRFD_STRIDES.len();
+    let stride = *SCRFD_STRIDES
+        .get(stride_index)
+        .context("SCRFD output index exceeds stride groups")?;
+    let group_width = *SCRFD_GROUP_WIDTHS
+        .get(group_index)
+        .context("SCRFD output index exceeds score/box/landmark groups")?;
+
+    if det_w == 0 || det_h == 0 || det_w % stride != 0 || det_h % stride != 0 {
+        bail!("SCRFD input dimensions must be non-zero multiples of stride {stride}");
+    }
+    let anchors = (det_w / stride)
+        .checked_mul(det_h / stride)
+        .and_then(|cells| cells.checked_mul(SCRFD_ANCHORS_PER_CELL))
+        .context("SCRFD expected anchor count overflowed")?;
+    let rank_shape_valid = shape == [anchors, group_width] || shape == [1, anchors, group_width];
+    if !rank_shape_valid {
+        bail!(
+            "SCRFD output {output_index} has shape {shape:?}; expected [{anchors}, {group_width}] or [1, {anchors}, {group_width}]"
+        );
+    }
+
+    let data = contiguous_data
+        .ok_or_else(|| anyhow::anyhow!("SCRFD output {output_index} is not contiguous"))?;
+    let expected_len = anchors
+        .checked_mul(group_width)
+        .context("SCRFD expected output length overflowed")?;
+    if data.len() != expected_len {
+        bail!(
+            "SCRFD output {output_index} has {} values; expected {expected_len}",
+            data.len()
+        );
+    }
+    if data.iter().any(|value| !value.is_finite()) {
+        bail!("SCRFD output {output_index} contains non-finite values");
+    }
+    Ok(())
+}
+
+fn validate_scrfd_outputs(
+    outputs: &ort::session::SessionOutputs<'_>,
+    det_w: usize,
+    det_h: usize,
+) -> Result<()> {
+    validate_output_count("SCRFD", outputs.len(), SCRFD_OUTPUT_COUNT)?;
+    for output_index in 0..SCRFD_OUTPUT_COUNT {
+        let output = map_ort!(outputs[output_index].try_extract_array::<f32>())?;
+        validate_scrfd_output_facts(
+            output_index,
+            det_w,
+            det_h,
+            output.shape(),
+            output.as_slice(),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_recognizer_output_facts(
+    shape: &[usize],
+    contiguous_data: Option<&[f32]>,
+) -> Result<()> {
+    if shape != [1, face::FACE_EMBEDDING_DIM] {
+        bail!(
+            "recognizer output has shape {shape:?}; expected [1, {}]",
+            face::FACE_EMBEDDING_DIM
+        );
+    }
+    let data =
+        contiguous_data.ok_or_else(|| anyhow::anyhow!("recognizer output is not contiguous"))?;
+    if data.len() != face::FACE_EMBEDDING_DIM {
+        bail!(
+            "recognizer output has {} values; expected {}",
+            data.len(),
+            face::FACE_EMBEDDING_DIM
+        );
+    }
+    if data.iter().any(|value| !value.is_finite()) {
+        bail!("recognizer output contains non-finite values");
+    }
+
+    let norm = data
+        .iter()
+        .map(|value| f64::from(*value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    if norm <= MIN_RECOGNIZER_L2_NORM {
+        bail!("recognizer output L2 norm is too small");
+    }
+    Ok(())
+}
+
+fn extract_valid_recognizer_output(outputs: &ort::session::SessionOutputs<'_>) -> Result<Vec<f32>> {
+    validate_output_count("recognizer", outputs.len(), 1)?;
+    let output = map_ort!(outputs[0].try_extract_array::<f32>())?;
+    let data = output
+        .as_slice()
+        .ok_or_else(|| anyhow::anyhow!("recognizer output is not contiguous"))?;
+    validate_recognizer_output_facts(output.shape(), Some(data))?;
+    Ok(data.to_vec())
+}
+
+/// Preserve the accepted Route 1 ArcFace normalization order exactly.
+fn normalize_arcface_embedding(mut embedding: Vec<f32>) -> Vec<f32> {
+    let norm: f32 = embedding
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if norm > 0.0 {
+        for value in &mut embedding {
+            *value /= norm;
+        }
+    }
+    embedding
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        InferenceEngine, ProviderKind, SCRFD_OUTPUT_COUNT, build_execution_providers,
+        normalize_arcface_embedding, validate_output_count, validate_recognizer_output_facts,
+        validate_scrfd_output_facts,
+    };
+    use howy_common::config::HowyConfig;
+    use howy_common::face::FACE_EMBEDDING_DIM;
+
+    #[test]
+    fn output_counts_are_exact() {
+        assert!(validate_output_count("SCRFD", SCRFD_OUTPUT_COUNT, SCRFD_OUTPUT_COUNT).is_ok());
+        assert!(
+            validate_output_count("SCRFD", SCRFD_OUTPUT_COUNT - 1, SCRFD_OUTPUT_COUNT).is_err()
+        );
+        assert!(
+            validate_output_count("SCRFD", SCRFD_OUTPUT_COUNT + 1, SCRFD_OUTPUT_COUNT).is_err()
+        );
+        assert!(validate_output_count("recognizer", 0, 1).is_err());
+        assert!(validate_output_count("recognizer", 2, 1).is_err());
+    }
+
+    #[test]
+    fn scrfd_accepts_actual_and_explicit_batch_shapes() {
+        let scores = vec![0.0; 12_800];
+        assert!(validate_scrfd_output_facts(0, 640, 640, &[12_800, 1], Some(&scores)).is_ok());
+        assert!(validate_scrfd_output_facts(0, 640, 640, &[1, 12_800, 1], Some(&scores)).is_ok());
+
+        let boxes = vec![0.0; 3_200 * 4];
+        assert!(validate_scrfd_output_facts(4, 640, 640, &[3_200, 4], Some(&boxes)).is_ok());
+        let landmarks = vec![0.0; 800 * 10];
+        assert!(validate_scrfd_output_facts(8, 640, 640, &[800, 10], Some(&landmarks)).is_ok());
+    }
+
+    #[test]
+    fn scrfd_rejects_bad_shape_length_layout_and_values() {
+        let valid = vec![0.0; 12_800];
+        assert!(validate_scrfd_output_facts(0, 640, 640, &[1, 1, 12_800], Some(&valid)).is_err());
+        assert!(validate_scrfd_output_facts(0, 640, 640, &[12_800, 4], Some(&valid)).is_err());
+        assert!(
+            validate_scrfd_output_facts(0, 640, 640, &[12_800, 1], Some(&valid[..10])).is_err()
+        );
+        assert!(validate_scrfd_output_facts(0, 640, 640, &[12_800, 1], None).is_err());
+
+        let mut non_finite = valid;
+        non_finite[0] = f32::NAN;
+        assert!(validate_scrfd_output_facts(0, 640, 640, &[12_800, 1], Some(&non_finite)).is_err());
+        non_finite[0] = f32::INFINITY;
+        assert!(validate_scrfd_output_facts(0, 640, 640, &[12_800, 1], Some(&non_finite)).is_err());
+    }
+
+    #[test]
+    fn recognizer_requires_exact_shape_contiguous_finite_nonzero_data() {
+        let valid = vec![1.0; FACE_EMBEDDING_DIM];
+        assert!(validate_recognizer_output_facts(&[1, FACE_EMBEDDING_DIM], Some(&valid)).is_ok());
+        assert!(validate_recognizer_output_facts(&[FACE_EMBEDDING_DIM], Some(&valid)).is_err());
+        assert!(
+            validate_recognizer_output_facts(&[1, FACE_EMBEDDING_DIM, 1], Some(&valid)).is_err()
+        );
+        assert!(validate_recognizer_output_facts(&[2, FACE_EMBEDDING_DIM], Some(&valid)).is_err());
+        assert!(
+            validate_recognizer_output_facts(
+                &[1, FACE_EMBEDDING_DIM],
+                Some(&valid[..FACE_EMBEDDING_DIM - 1]),
+            )
+            .is_err()
+        );
+        assert!(validate_recognizer_output_facts(&[1, FACE_EMBEDDING_DIM], None).is_err());
+        assert!(
+            validate_recognizer_output_facts(
+                &[1, FACE_EMBEDDING_DIM],
+                Some(&vec![0.0; FACE_EMBEDDING_DIM])
+            )
+            .is_err()
+        );
+
+        let mut non_finite = valid;
+        non_finite[0] = f32::NAN;
+        assert!(
+            validate_recognizer_output_facts(&[1, FACE_EMBEDDING_DIM], Some(&non_finite)).is_err()
+        );
+        non_finite[0] = f32::NEG_INFINITY;
+        assert!(
+            validate_recognizer_output_facts(&[1, FACE_EMBEDDING_DIM], Some(&non_finite)).is_err()
+        );
+    }
+
+    #[test]
+    fn arcface_normalization_is_bit_exact_with_accepted_route1() {
+        let input: Vec<f32> = (0..FACE_EMBEDDING_DIM)
+            .map(|index| ((index as i32 % 37) - 18) as f32 * 0.03125 + index as f32 * 0.000_001)
+            .collect();
+
+        // Accepted Route 1 implementation, kept independently here as the regression oracle.
+        let mut expected = input.clone();
+        let norm: f32 = expected
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        if norm > 0.0 {
+            for value in &mut expected {
+                *value /= norm;
+            }
+        }
+
+        let actual = normalize_arcface_embedding(input);
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "normalization changed at embedding index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_accelerated_registration_plan_omits_cpu() {
+        assert_eq!(
+            build_execution_providers("migraphx", false).unwrap(),
+            vec![ProviderKind::Migraphx]
+        );
+        assert_eq!(
+            build_execution_providers("migraphx", true).unwrap(),
+            vec![ProviderKind::Migraphx, ProviderKind::Cpu]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires HOWY_TEST_MODEL_DIR with real SCRFD and ArcFace ONNX models"]
+    fn real_cpu_models_pass_shared_output_validation() {
+        let model_dir = std::env::var("HOWY_TEST_MODEL_DIR").expect("HOWY_TEST_MODEL_DIR is set");
+        let mut config = HowyConfig::default();
+        config.ml.provider = "cpu".to_string();
+        config.ml.detector_model = format!("{model_dir}/det_10g.onnx");
+        config.ml.recognizer_model = format!("{model_dir}/w600k_r50.onnx");
+        config.ml.det_width = 640;
+        config.ml.det_height = 640;
+
+        let engine = InferenceEngine::new(&config).expect("real CPU models load");
+        assert_eq!(engine.registered_preferred_provider(), "cpu");
+        engine.warmup().expect("detector warmup validates outputs");
+        engine
+            .warmup_recognizer()
+            .expect("recognizer warmup validates output");
+        engine
+            .detect(&vec![0_u8; 640 * 480 * 3], 640, 480, false)
+            .expect("production detector validates real outputs");
     }
 }
 
@@ -487,46 +877,35 @@ fn postprocess_scrfd(
     threshold: f32,
 ) -> Result<Vec<Face>> {
     let mut faces = Vec::new();
-    let strides: [u32; 3] = [8, 16, 32];
-    let num_outputs = outputs.len();
 
     // SCRFD outputs: for each stride: scores, bboxes, landmarks
-    // Standard det_10g has 9 outputs (3 strides x 3)
-    for (stride_idx, &stride) in strides.iter().enumerate() {
+    // Standard det_10g has 9 outputs (3 strides x 3), validated before this call.
+    for (stride_idx, &stride) in SCRFD_STRIDES.iter().enumerate() {
         let scores_idx = stride_idx;
         let bbox_idx = stride_idx + 3;
         let lm_idx = stride_idx + 6;
 
-        if scores_idx >= num_outputs || bbox_idx >= num_outputs {
-            break;
-        }
-
         let scores = map_ort!(outputs[scores_idx].try_extract_array::<f32>())?;
         let bboxes = map_ort!(outputs[bbox_idx].try_extract_array::<f32>())?;
-        let landmarks = if lm_idx < num_outputs {
-            Some(map_ort!(outputs[lm_idx].try_extract_array::<f32>())?)
-        } else {
-            None
-        };
+        let landmarks = map_ort!(outputs[lm_idx].try_extract_array::<f32>())?;
 
-        let fmap_h = det_h / stride;
-        let fmap_w = det_w / stride;
+        let fmap_h = det_h as usize / stride;
+        let fmap_w = det_w as usize / stride;
 
-        let scores_flat = scores.as_slice().unwrap_or(&[]);
-        let bboxes_flat = bboxes.as_slice().unwrap_or(&[]);
-        let lm_flat = landmarks.as_ref().and_then(|l| l.as_slice());
-        let num_cells = (fmap_h * fmap_w) as usize;
-        if num_cells == 0 {
-            continue;
-        }
+        let scores_flat = scores
+            .as_slice()
+            .context("validated SCRFD scores became non-contiguous")?;
+        let bboxes_flat = bboxes
+            .as_slice()
+            .context("validated SCRFD boxes became non-contiguous")?;
+        let lm_flat = landmarks
+            .as_slice()
+            .context("validated SCRFD landmarks became non-contiguous")?;
+        let num_cells = fmap_h * fmap_w;
+        let num_anchors = SCRFD_ANCHORS_PER_CELL;
 
-        let num_anchors = scores_flat.len() / num_cells;
-        if num_anchors == 0 {
-            continue;
-        }
-
-        for i in 0..scores_flat.len() {
-            if scores_flat[i] <= threshold {
+        for (i, score) in scores_flat.iter().copied().enumerate() {
+            if score <= threshold {
                 continue;
             }
 
@@ -535,15 +914,11 @@ fn postprocess_scrfd(
                 continue;
             }
 
-            let anchor_x = (cell_idx % fmap_w as usize) as f32 * stride as f32;
-            let anchor_y = (cell_idx / fmap_w as usize) as f32 * stride as f32;
+            let anchor_x = (cell_idx % fmap_w) as f32 * stride as f32;
+            let anchor_y = (cell_idx / fmap_w) as f32 * stride as f32;
 
             // Decode bbox (distance from anchor)
             let bi = i * 4;
-            if bi + 3 >= bboxes_flat.len() {
-                continue;
-            }
-
             let x1 = ((anchor_x - bboxes_flat[bi] * stride as f32) / scale)
                 .max(0.0)
                 .min(img_w as f32);
@@ -559,37 +934,16 @@ fn postprocess_scrfd(
 
             // Decode landmarks
             let mut lm = [0.0f32; 10];
-            if let Some(lm_data) = lm_flat {
-                let li = i * 10;
-                if li + 9 < lm_data.len() {
-                    for k in 0..5 {
-                        lm[k * 2] = (lm_data[li + k * 2] * stride as f32 + anchor_x) / scale;
-                        lm[k * 2 + 1] =
-                            (lm_data[li + k * 2 + 1] * stride as f32 + anchor_y) / scale;
-                    }
-                }
-            } else {
-                // Estimate landmarks from bbox
-                let w = x2 - x1;
-                let h = y2 - y1;
-                lm = [
-                    x1 + w * 0.3,
-                    y1 + h * 0.3, // left eye
-                    x1 + w * 0.7,
-                    y1 + h * 0.3, // right eye
-                    x1 + w * 0.5,
-                    y1 + h * 0.55, // nose
-                    x1 + w * 0.35,
-                    y1 + h * 0.75, // left mouth
-                    x1 + w * 0.65,
-                    y1 + h * 0.75, // right mouth
-                ];
+            let li = i * 10;
+            for k in 0..5 {
+                lm[k * 2] = (lm_flat[li + k * 2] * stride as f32 + anchor_x) / scale;
+                lm[k * 2 + 1] = (lm_flat[li + k * 2 + 1] * stride as f32 + anchor_y) / scale;
             }
 
             faces.push(Face {
                 bbox: [x1 as i32, y1 as i32, x2 as i32, y2 as i32],
                 landmarks: lm,
-                score: scores_flat[i],
+                score,
                 embedding: None,
             });
         }
@@ -644,11 +998,7 @@ fn iou(a: &Face, b: &Face) -> f32 {
     let area_b = b.width() as f32 * b.height() as f32;
     let union = area_a + area_b - inter;
 
-    if union <= 0.0 {
-        0.0
-    } else {
-        inter / union
-    }
+    if union <= 0.0 { 0.0 } else { inter / union }
 }
 
 // ---------------------------------------------------------------------------
@@ -840,9 +1190,12 @@ fn estimate_similarity_transform(
 // Execution Provider setup
 // ---------------------------------------------------------------------------
 
-/// Build the ordered execution-provider plan based on config string.
-fn build_execution_providers(provider: &str, _model_tag: &str) -> Result<Vec<ProviderKind>> {
-    let plan = match provider.trim().to_ascii_lowercase().as_str() {
+/// Build the ordered execution-provider registration plan based on config.
+fn build_execution_providers(
+    provider: &str,
+    register_cpu_fallback: bool,
+) -> Result<Vec<ProviderKind>> {
+    let mut plan = match provider.trim().to_ascii_lowercase().as_str() {
         "auto" => vec![
             ProviderKind::TensorRt,
             ProviderKind::Cuda,
@@ -850,16 +1203,24 @@ fn build_execution_providers(provider: &str, _model_tag: &str) -> Result<Vec<Pro
             ProviderKind::OpenVino,
             ProviderKind::Cpu,
         ],
-        "tensorrt" => vec![ProviderKind::TensorRt, ProviderKind::Cpu],
-        "cuda" => vec![ProviderKind::Cuda, ProviderKind::Cpu],
-        "migraphx" => vec![ProviderKind::Migraphx, ProviderKind::Cpu],
-        "openvino" => vec![ProviderKind::OpenVino, ProviderKind::Cpu],
+        "tensorrt" => vec![ProviderKind::TensorRt],
+        "cuda" => vec![ProviderKind::Cuda],
+        "migraphx" => vec![ProviderKind::Migraphx],
+        "openvino" => vec![ProviderKind::OpenVino],
         "" | "cpu" => vec![ProviderKind::Cpu],
         other => {
             warn!("Provider '{other}' is not enabled in this build, falling back to CPU");
             vec![ProviderKind::Cpu]
         }
     };
+
+    if !provider.trim().eq_ignore_ascii_case("cpu") {
+        if register_cpu_fallback && !plan.contains(&ProviderKind::Cpu) {
+            plan.push(ProviderKind::Cpu);
+        } else if !register_cpu_fallback {
+            plan.retain(|provider| *provider != ProviderKind::Cpu);
+        }
+    }
 
     Ok(plan)
 }
@@ -868,8 +1229,9 @@ fn configure_execution_providers(
     mut session_builder: SessionBuilder,
     providers: &[ProviderKind],
     model_tag: &str,
+    migraphx_fp16: Option<bool>,
 ) -> Result<(SessionBuilder, String)> {
-    let mut active_provider: Option<&'static str> = None;
+    let mut registered_preference: Option<&'static str> = None;
 
     for provider in providers {
         let registered = match provider {
@@ -889,7 +1251,11 @@ fn configure_execution_providers(
             )?,
             ProviderKind::Migraphx => register_provider(
                 &mut session_builder,
-                MIGraphXExecutionProvider::default(),
+                MIGraphXExecutionProvider::default()
+                    .with_fp16(migraphx_fp16.unwrap_or(false))
+                    .with_fp8(false)
+                    .with_int8(false)
+                    .with_exhaustive_tune(false),
                 provider.name(),
                 model_tag,
                 false,
@@ -910,17 +1276,14 @@ fn configure_execution_providers(
             )?,
         };
 
-        if registered && active_provider.is_none() {
-            active_provider = Some(provider.name());
+        if registered && registered_preference.is_none() {
+            registered_preference = Some(provider.name());
         }
     }
 
-    Ok((
-        session_builder,
-        active_provider
-            .unwrap_or(ProviderKind::Cpu.name())
-            .to_string(),
-    ))
+    let registered_preference = registered_preference
+        .ok_or_else(|| anyhow::anyhow!("no execution provider registered for {model_tag}"))?;
+    Ok((session_builder, registered_preference.to_string()))
 }
 
 fn register_provider<E>(
@@ -935,7 +1298,11 @@ where
 {
     match provider.register(session_builder) {
         Ok(()) => {
-            info!(provider = provider_name, model = model_tag, "Registered execution provider");
+            info!(
+                provider = provider_name,
+                model = model_tag,
+                "Registered execution provider"
+            );
             Ok(true)
         }
         Err(err) if required => Err(anyhow::anyhow!(

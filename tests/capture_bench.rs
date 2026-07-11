@@ -1,233 +1,198 @@
-//! Production camera-path and optional FFmpeg capture benchmark.
+//! Non-installed production capture benchmark. Requires explicit local inputs.
 //!
-//! Run: `cargo run -p howy-daemon --bin capture_bench`.
+//! This target is intentionally not suitable for automated tests and must never
+//! be run without deliberate hardware/model parameters.
 
-use std::io::{BufReader, Read};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::collections::BTreeMap;
+use std::env;
+use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use howy_common::config::HowyConfig;
-use howy_daemon::camera::Camera;
+use howy_daemon::camera::{Camera, CaptureBackendKind, Frame, FrameFormat};
 use howy_daemon::inference::InferenceEngine;
 
-const MODEL_DIR: &str = "dist/howdy_onnx/_internal/onnx-data";
-const DEVICE: &str = "/dev/video2";
-const WIDTH: u32 = 640;
-const HEIGHT: u32 = 360;
-const WARMUP_FRAMES: usize = 30;
-const SAMPLE_FRAMES: usize = 30;
-
-trait CaptureBackend {
-    fn name(&self) -> &str;
-    fn next_frame(&mut self) -> Result<(Vec<u8>, u32, u32)>;
+struct Arguments {
+    config: PathBuf,
+    device: String,
+    detector_model: String,
+    recognizer_model: String,
+    warmup_frames: usize,
+    sample_frames: usize,
 }
 
-struct ProductionCameraBackend {
-    camera: Camera,
-}
-
-impl ProductionCameraBackend {
-    fn new(device: &str, width: u32, height: u32) -> Result<Self> {
-        let mut camera = Camera::open(device, width as i32, height as i32, 30, -1)?;
-        camera.start()?;
-        Ok(Self { camera })
-    }
-}
-
-impl CaptureBackend for ProductionCameraBackend {
-    fn name(&self) -> &str {
-        "production-v4l2-preferred"
-    }
-
-    fn next_frame(&mut self) -> Result<(Vec<u8>, u32, u32)> {
-        let frame = self.camera.capture_frame()?;
-        let (bgr, width, height) = frame.to_bgr_data();
-        Ok((bgr.into_owned(), width, height))
-    }
-}
-
-struct FfmpegBackend {
-    child: Child,
-    stdout: BufReader<ChildStdout>,
-    width: u32,
-    height: u32,
-}
-
-impl FfmpegBackend {
-    fn new(device: &str, width: u32, height: u32) -> Result<Self> {
-        let mut child = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-fflags",
-                "nobuffer",
-                "-flags",
-                "low_delay",
-                "-probesize",
-                "32",
-                "-analyzeduration",
-                "0",
-                "-f",
-                "v4l2",
-                "-input_format",
-                "gray",
-                "-video_size",
-                &format!("{}x{}", width, height),
-                "-framerate",
-                "30",
-                "-i",
-                device,
-                "-pix_fmt",
-                "gray",
-                "-f",
-                "rawvideo",
-                "-",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to spawn ffmpeg sidecar")?;
-
-        let stdout = child.stdout.take().context("ffmpeg stdout missing")?;
-        Ok(Self {
-            child,
-            stdout: BufReader::new(stdout),
-            width,
-            height,
-        })
-    }
-}
-
-impl Drop for FfmpegBackend {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl CaptureBackend for FfmpegBackend {
-    fn name(&self) -> &str {
-        "ffmpeg-sidecar"
-    }
-
-    fn next_frame(&mut self) -> Result<(Vec<u8>, u32, u32)> {
-        let frame_size = (self.width * self.height) as usize;
-        let mut gray = vec![0u8; frame_size];
-        self.stdout
-            .read_exact(&mut gray)
-            .context("failed to read gray frame from ffmpeg")?;
-
-        let mut bgr = Vec::with_capacity(frame_size * 3);
-        for g in gray {
-            bgr.push(g);
-            bgr.push(g);
-            bgr.push(g);
+fn parse_arguments() -> Result<Arguments> {
+    let mut values = BTreeMap::new();
+    let mut args = env::args_os().skip(1);
+    while let Some(key) = args.next() {
+        let key = key
+            .to_str()
+            .and_then(|key| key.strip_prefix("--"))
+            .context("arguments must use UTF-8 --name value syntax")?;
+        if !matches!(
+            key,
+            "config"
+                | "device"
+                | "detector-model"
+                | "recognizer-model"
+                | "warmup-frames"
+                | "samples"
+        ) {
+            bail!("unknown argument --{key}");
         }
-        Ok((bgr, self.width, self.height))
+        let value = args.next().context("missing argument value")?;
+        if values.insert(key.to_string(), value).is_some() {
+            bail!("duplicate argument --{key}");
+        }
     }
+    let required = |name: &str| {
+        values
+            .get(name)
+            .and_then(|value| value.to_str())
+            .map(str::to_owned)
+            .with_context(|| format!("missing --{name}"))
+    };
+    let parse_count = |name: &str| -> Result<usize> {
+        required(name)?
+            .parse()
+            .with_context(|| format!("invalid --{name}"))
+    };
+    let arguments = Arguments {
+        config: PathBuf::from(required("config")?),
+        device: required("device")?,
+        detector_model: required("detector-model")?,
+        recognizer_model: required("recognizer-model")?,
+        warmup_frames: parse_count("warmup-frames")?,
+        sample_frames: parse_count("samples")?,
+    };
+    if arguments.sample_frames == 0 {
+        bail!("--samples must be greater than zero");
+    }
+    Ok(arguments)
 }
 
 fn brightness(bgr: &[u8]) -> f64 {
     if bgr.is_empty() {
         return 0.0;
     }
-    bgr.iter().map(|&v| v as f64).sum::<f64>() / bgr.len() as f64
+    bgr.iter().map(|&value| f64::from(value)).sum::<f64>() / bgr.len() as f64
 }
 
-fn build_engine() -> Result<InferenceEngine> {
-    let mut config = HowyConfig::default();
-    config.ml.provider = "cpu".to_string();
-    config.ml.det_threshold = 0.3;
-    config.ml.detector_model = format!("{MODEL_DIR}/det_10g.onnx");
-    config.ml.recognizer_model = format!("{MODEL_DIR}/w600k_r50.onnx");
-    InferenceEngine::new(&config)
+fn backend_name(backend: CaptureBackendKind) -> &'static str {
+    match backend {
+        CaptureBackendKind::V4l2Mmap => "v4l2-mmap",
+        CaptureBackendKind::FfmpegFallback => "ffmpeg-fallback",
+    }
 }
 
-fn bench_backend<B: CaptureBackend>(mut backend: B, engine: &InferenceEngine) -> Result<()> {
-    println!("== backend: {} ==", backend.name());
-
-    let startup = Instant::now();
-    let mut first_frame_ms = 0.0;
-    let mut capture_ms = Vec::new();
-    let mut means = Vec::new();
-    let mut last_frame = None;
-
-    for i in 0..(WARMUP_FRAMES + SAMPLE_FRAMES) {
-        let t0 = Instant::now();
-        let frame = backend.next_frame()?;
-        let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
-        if i == 0 {
-            first_frame_ms = startup.elapsed().as_secs_f64() * 1000.0;
-        }
-        if i >= WARMUP_FRAMES {
-            capture_ms.push(elapsed);
-            means.push(brightness(&frame.0));
-        }
-        last_frame = Some(frame);
-    }
-
-    let (bgr, width, height) = last_frame.context("no captured frame")?;
-    let avg_capture_ms = capture_ms.iter().sum::<f64>() / capture_ms.len() as f64;
-    let avg_brightness = means.iter().sum::<f64>() / means.len() as f64;
-
-    let t0 = Instant::now();
-    let faces = engine.detect(&bgr, width, height, false)?;
-    let detect_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let best_score = faces.iter().map(|f| f.score).fold(0.0_f32, f32::max);
-
-    let mut analyze_ms = 0.0;
-    let mut embedding_ok = false;
-    if !faces.is_empty() {
-        let t1 = Instant::now();
-        let analyzed = engine.analyze(&bgr, width, height, false)?;
-        analyze_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        embedding_ok = analyzed
-            .first()
-            .and_then(|f| f.embedding.as_ref())
-            .map(|e| e.len() == 512 && e.iter().all(|v| v.is_finite()))
-            .unwrap_or(false);
-    }
-
-    println!("first_frame_ms={first_frame_ms:.1}");
-    println!("avg_capture_ms={avg_capture_ms:.2}");
-    println!("avg_brightness={avg_brightness:.1}");
-    println!("faces={} best_score={best_score:.4}", faces.len());
-    println!("detect_ms={detect_ms:.1}");
-    if !faces.is_empty() {
-        println!("analyze_ms={analyze_ms:.1} embedding_ok={embedding_ok}");
-    }
-    println!();
-
-    Ok(())
+fn inference_input(frame: &Frame) -> (&[u8], u32, u32, bool) {
+    (
+        &frame.data,
+        frame.width,
+        frame.height,
+        frame.format == FrameFormat::Gray,
+    )
 }
 
 fn main() -> Result<()> {
-    println!("howy capture benchmark");
-    println!("device={DEVICE} {}x{}\n", WIDTH, HEIGHT);
+    let arguments = parse_arguments()?;
+    let mut config = HowyConfig::load(&arguments.config)?;
+    config.video.device_path = arguments.device.clone();
+    config.ml.detector_model = arguments.detector_model;
+    config.ml.recognizer_model = arguments.recognizer_model;
 
-    let engine = build_engine()?;
+    let engine = InferenceEngine::new(&config)?;
     engine.warmup()?;
+    engine.warmup_recognizer()?;
 
-    match ProductionCameraBackend::new(DEVICE, WIDTH, HEIGHT) {
-        Ok(backend) => {
-            if let Err(e) = bench_backend(backend, &engine) {
-                println!("production-v4l2-preferred failed: {e:#}");
-            }
+    let construction_started = Instant::now();
+    let mut camera = Camera::open(
+        &config.video.device_path,
+        config.video.frame_width,
+        config.video.frame_height,
+        config.video.device_fps,
+        config.video.exposure,
+    )?;
+    camera.start()?;
+    let first_frame = camera.capture_frame()?;
+    let construction_through_first_frame_ms = construction_started.elapsed().as_secs_f64() * 1000.0;
+    let backend = camera
+        .selected_backend()
+        .context("capture worker did not report its selected backend")?;
+
+    let total_frames = arguments
+        .warmup_frames
+        .checked_add(arguments.sample_frames)
+        .context("requested frame count overflow")?;
+    let mut capture_ms = Vec::with_capacity(arguments.sample_frames);
+    let mut brightness_samples = Vec::with_capacity(arguments.sample_frames);
+    let mut last_frame = first_frame;
+    for index in 0..total_frames {
+        let started = Instant::now();
+        let frame = camera
+            .capture_frame()
+            .with_context(|| format!("required capture {index}/{total_frames} did not complete"))?;
+        if index >= arguments.warmup_frames {
+            capture_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            let (bgr, _, _) = frame.to_bgr_data();
+            brightness_samples.push(brightness(&bgr));
         }
-        Err(e) => println!("production camera init failed: {e:#}"),
+        last_frame = frame;
+    }
+    if capture_ms.len() != arguments.sample_frames {
+        bail!("required capture sample count did not complete");
     }
 
-    match FfmpegBackend::new(DEVICE, WIDTH, HEIGHT) {
-        Ok(backend) => {
-            if let Err(e) = bench_backend(backend, &engine) {
-                println!("ffmpeg-sidecar failed: {e:#}");
-            }
-        }
-        Err(e) => println!("ffmpeg-sidecar init failed: {e:#}"),
-    }
+    let (data, width, height, is_gray) = inference_input(&last_frame);
+    let detect_started = Instant::now();
+    let faces = engine.detect(data, width, height, is_gray)?;
+    let detect_ms = detect_started.elapsed().as_secs_f64() * 1000.0;
 
+    println!("howy production capture benchmark");
+    println!("selected_backend={}", backend_name(backend));
+    println!(
+        "fallback_selected={}",
+        backend == CaptureBackendKind::FfmpegFallback
+    );
+    println!("construction_through_first_frame_ms={construction_through_first_frame_ms:.2}");
+    println!("required_samples_completed={}", capture_ms.len());
+    println!(
+        "mean_capture_ms={:.2}",
+        capture_ms.iter().sum::<f64>() / capture_ms.len() as f64
+    );
+    println!(
+        "mean_brightness={:.2}",
+        brightness_samples.iter().sum::<f64>() / brightness_samples.len() as f64
+    );
+    println!("faces={} detect_ms={detect_ms:.2}", faces.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inference_input_preserves_raw_gray_and_bgr_layouts() {
+        let gray = Frame {
+            data: vec![10, 20],
+            width: 2,
+            height: 1,
+            format: FrameFormat::Gray,
+        };
+        let (data, width, height, is_gray) = inference_input(&gray);
+        assert_eq!(data, [10, 20]);
+        assert_eq!((width, height, is_gray), (2, 1, true));
+
+        let bgr = Frame {
+            data: vec![1, 2, 3, 4, 5, 6],
+            width: 2,
+            height: 1,
+            format: FrameFormat::Bgr,
+        };
+        let (data, width, height, is_gray) = inference_input(&bgr);
+        assert_eq!(data, [1, 2, 3, 4, 5, 6]);
+        assert_eq!((width, height, is_gray), (2, 1, false));
+    }
 }

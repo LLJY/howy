@@ -44,6 +44,8 @@ RestrictAddressFamilies=AF_UNIX
 MemoryDenyWriteExecute=no
 LockPersonality=yes
 UMask=0077
+CacheDirectory=howy
+CacheDirectoryMode=0700
 
 # Camera access: local-test install assumes /etc/howy/config.toml uses /dev/video2.
 # If you change the configured camera node, update DeviceAllow to match exactly.

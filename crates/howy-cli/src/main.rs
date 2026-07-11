@@ -1,14 +1,16 @@
 //! howy — CLI tool for managing face models and testing authentication.
 
 use std::io::{self, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use howy_common::config::HowyConfig;
+use howy_common::env::parse_strict_bool;
 use howy_common::face::{FaceModel, UserModels};
 use howy_common::ipc::DaemonClient;
 use howy_common::paths;
@@ -94,6 +96,11 @@ enum Commands {
 
 fn main() -> Result<()> {
     let Cli { user, yes, command } = Cli::parse();
+    let perf_trace = parse_strict_bool(
+        "HOWY_PERF_TRACE",
+        std::env::var_os("HOWY_PERF_TRACE").as_deref(),
+        false,
+    )?;
 
     match command {
         Commands::Add { label } => {
@@ -122,7 +129,7 @@ fn main() -> Result<()> {
         }
         Commands::Test => {
             let user = resolve_target_user(user.as_deref())?;
-            cmd_test(&user)
+            cmd_test(&user, perf_trace)
         }
         Commands::Status => cmd_status(),
         Commands::Doctor => cmd_doctor(),
@@ -410,12 +417,20 @@ fn cmd_clear(user: &str, skip_confirm: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_test(user: &str) -> Result<()> {
+fn cmd_test(user: &str, perf_trace: bool) -> Result<()> {
     println!("Testing face recognition for '{user}'...");
 
     let mut client = DaemonClient::default_path().with_timeout(std::time::Duration::from_secs(10));
 
-    let response = client.authenticate(user, 0)?;
+    let request_started = perf_trace.then(Instant::now);
+    let response = client.authenticate(user, 0);
+    if let Some(started) = request_started {
+        println!(
+            "Client request wall: {:.1}ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    let response = response?;
 
     match response.result {
         Some(RespResult::Success(s)) => {
@@ -458,7 +473,7 @@ fn cmd_status() -> Result<()> {
     match response.result {
         Some(RespResult::Info(info)) => {
             println!("Daemon: RUNNING");
-            println!("  Provider: {}", info.provider);
+            println!("  Registered provider preference: {}", info.provider);
             println!("  Detector: {}", info.detector_model);
             println!("  Recognizer: {}", info.recognizer_model);
             println!("  Embedding dim: {}", info.embedding_dim);
@@ -523,7 +538,7 @@ fn cmd_doctor() -> Result<()> {
         Ok(response) => match response.result {
             Some(RespResult::Info(info)) => {
                 println!("  Reachable: yes");
-                println!("  Effective provider: {}", info.provider);
+                println!("  Registered provider preference: {}", info.provider);
                 println!("  Uptime: {}s", info.uptime_secs);
             }
             other => {
@@ -557,12 +572,7 @@ fn cmd_doctor() -> Result<()> {
             }
         }
 
-        let provider_cache = cache_dir.join("provider-selection.txt");
-        if let Ok(contents) = std::fs::read_to_string(&provider_cache) {
-            println!("  Cached provider: {}", contents.trim());
-        } else {
-            println!("  Cached provider: <none>");
-        }
+        println!("  Auto provider cache: disabled (stale selection files are ignored)");
 
         let prewarm_marker = cache_dir.join("prewarm-status.txt");
         println!(
@@ -609,6 +619,7 @@ fn cmd_prewarm() -> Result<()> {
         command.env("ORT_MIGRAPHX_MODEL_CACHE_PATH", "/var/cache/howy");
         command.env("ORT_MIGRAPHX_CACHE_PATH", "/var/cache/howy");
     }
+    configure_private_umask(&mut command);
 
     let status = command
         .stdin(Stdio::null())
@@ -623,6 +634,49 @@ fn cmd_prewarm() -> Result<()> {
 
     println!("Prewarm completed.");
     Ok(())
+}
+
+fn configure_private_umask(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o077);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configure_private_umask;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    #[test]
+    fn prewarm_child_mxr_creation_inherits_private_umask() {
+        let directory = std::env::temp_dir().join(format!(
+            "howy-cli-umask-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let cache_file = directory.join("mock.mxr");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("touch \"$1\"")
+            .arg("sh")
+            .arg(&cache_file);
+        configure_private_umask(&mut command);
+        assert!(command.status().unwrap().success());
+        assert_eq!(
+            std::fs::metadata(&cache_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 fn cmd_config(to_stdout: bool) -> Result<()> {
