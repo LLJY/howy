@@ -23,6 +23,12 @@ pub const CONFIG_FILE: &str = "/etc/howy/config.toml";
 /// System-wide face model storage.
 pub const MODELS_DIR: &str = "/etc/howy/models";
 
+/// Mode-1 cached-AEAD face model storage.
+pub const MODE1_MODELS_DIR: &str = "/etc/howy/models/mode1";
+
+/// Mode-2 ephemeral-AEAD face model storage.
+pub const MODE2_MODELS_DIR: &str = "/etc/howy/models/mode2";
+
 /// ONNX model data directory.
 pub const ONNX_DATA_DIR: &str = "/usr/share/howy/onnx-data";
 
@@ -34,12 +40,16 @@ pub const SNAPSHOT_DIR: &str = "/var/log/howy/snapshots";
 
 /// Validate a username for safe filesystem usage.
 pub fn validate_username(username: &str) -> bool {
-    !username.is_empty()
-        && username.len() <= 64
-        && !username.contains("..")
-        && username.bytes().all(
-            |byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'),
-        )
+    is_canonical_username(username)
+}
+
+/// Shared exact grammar for canonical NSS usernames used by storage paths.
+pub(crate) fn is_canonical_username(username: &str) -> bool {
+    let bytes = username.as_bytes();
+    (1..=64).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// User face model file for a given username.
@@ -66,4 +76,26 @@ pub fn find_model(filename: &str) -> Option<PathBuf> {
     ];
 
     search_paths.into_iter().find(|p| p.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_username;
+
+    #[test]
+    fn username_validation_uses_the_canonical_storage_grammar() {
+        for valid in ["a", "first..last", "Alice-01_test.name", &"x".repeat(64)] {
+            assert!(validate_username(valid), "{valid:?}");
+        }
+        for invalid in [
+            "",
+            &"x".repeat(65),
+            "root/child",
+            "root\\child",
+            "has space",
+            "josé",
+        ] {
+            assert!(!validate_username(invalid), "{invalid:?}");
+        }
+    }
 }

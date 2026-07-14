@@ -8,3 +8,5 @@ pub mod face;
 pub mod ipc;
 pub mod paths;
 pub mod protocol;
+pub mod provisioning;
+pub mod storage;

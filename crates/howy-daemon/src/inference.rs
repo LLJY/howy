@@ -3,7 +3,12 @@
 //! Uses the `ort` crate for ONNX Runtime, supporting CUDA, TensorRT,
 //! MIGraphX, OpenVINO, and CPU execution providers.
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
@@ -16,7 +21,9 @@ use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::builder::SessionBuilder;
 use ort::value::TensorRef;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 /// Helper macro to convert ort errors into anyhow errors.
 /// The ort::Error type is generic over a context type, so we use a closure.
@@ -28,6 +35,20 @@ macro_rules! map_ort {
 
 use howy_common::config::HowyConfig;
 use howy_common::face::{self, Face};
+use howy_common::storage::ModelDigest;
+
+use crate::mode1_key::CredentialSourceIdentity;
+
+#[derive(Debug)]
+struct ModelCredentialAlias;
+
+impl std::fmt::Display for ModelCredentialAlias {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("model selection aliases the Mode 1 storage credential")
+    }
+}
+
+impl std::error::Error for ModelCredentialAlias {}
 
 /// Standard ArcFace alignment destination landmarks for 112x112 crop.
 const ARCFACE_DST: [[f32; 2]; 5] = [
@@ -44,12 +65,13 @@ const SCRFD_GROUP_WIDTHS: [usize; 3] = [1, 4, 10];
 const SCRFD_OUTPUT_COUNT: usize = SCRFD_STRIDES.len() * SCRFD_GROUP_WIDTHS.len();
 /// Reject degenerate ArcFace outputs while remaining far below any useful embedding norm.
 const MIN_RECOGNIZER_L2_NORM: f64 = 1.0e-12;
+pub const MAX_RECOGNIZER_MODEL_BYTES: u64 = 192 * 1024 * 1024;
 
 /// Detector session with pre-allocated input buffer.
 struct DetectorState {
     session: Session,
     /// Pre-allocated NCHW buffer: 1 * 3 * det_h * det_w.
-    input_buf: Vec<f32>,
+    input_buf: Zeroizing<Vec<f32>>,
     det_w: usize,
     det_h: usize,
 }
@@ -58,7 +80,7 @@ struct DetectorState {
 struct RecognizerState {
     session: Session,
     /// Pre-allocated NCHW buffer: 1 * 3 * 112 * 112 = 37632 floats.
-    input_buf: Vec<f32>,
+    input_buf: Zeroizing<Vec<f32>>,
 }
 
 /// The inference engine holding loaded ONNX sessions.
@@ -80,6 +102,144 @@ pub struct InferenceProfiling {
     pub recognizer_path: PathBuf,
     /// Harness-only precision pin applied through the MIGraphX provider API.
     pub migraphx_fp16: Option<bool>,
+}
+
+/// Descriptor-bound model selected by explicit or automatic resolution.
+///
+/// The display path is retained for diagnostics, while all subsequent reads
+/// and ONNX parsing use the already-validated descriptor through procfs.
+#[derive(Debug)]
+pub struct ResolvedModel {
+    display_path: PathBuf,
+    file: File,
+}
+
+/// One startup snapshot of both production model descriptors.
+pub struct ResolvedModels {
+    detector: ResolvedModel,
+    recognizer: ResolvedModel,
+}
+
+impl ResolvedModels {
+    pub fn detector(&self) -> &ResolvedModel {
+        &self.detector
+    }
+
+    pub fn recognizer(&self) -> &ResolvedModel {
+        &self.recognizer
+    }
+}
+
+impl ResolvedModel {
+    pub fn display_path(&self) -> &Path {
+        &self.display_path
+    }
+
+    fn descriptor_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+
+    pub fn read_all(&self) -> Result<Vec<u8>> {
+        let descriptor_path = self.descriptor_path();
+        let mut file = File::open(&descriptor_path).with_context(|| {
+            format!(
+                "failed to reopen pinned model descriptor for {}",
+                self.display_path.display()
+            )
+        })?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).with_context(|| {
+            format!(
+                "failed to read exact model bytes from {}",
+                self.display_path.display()
+            )
+        })?;
+        Ok(bytes)
+    }
+
+    /// Stream a digest from the pinned descriptor under a checked byte cap.
+    /// No model-sized allocation is created for storage readiness.
+    pub fn sha256_digest_bounded(&self, maximum_bytes: u64) -> Result<ModelDigest> {
+        self.sha256_digest_bounded_cancellable(maximum_bytes, || false)
+    }
+
+    /// Stream a digest from the pinned recognizer descriptor while polling a
+    /// caller-owned deadline. Descriptor metadata is exact before and after the
+    /// stream, so a provisioning result cannot bind a drifted model.
+    pub fn sha256_digest_bounded_cancellable(
+        &self,
+        maximum_bytes: u64,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<ModelDigest> {
+        let expected_length = self.file.metadata()?.len();
+        if expected_length == 0 || expected_length > maximum_bytes {
+            bail!("pinned recognizer model size is outside the storage readiness limit");
+        }
+        let before = self.file.metadata()?;
+        let identity = (
+            before.dev(),
+            before.ino(),
+            before.uid(),
+            before.gid(),
+            before.mode(),
+            before.nlink(),
+            before.len(),
+            before.mtime(),
+            before.mtime_nsec(),
+            before.ctime(),
+            before.ctime_nsec(),
+        );
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        let mut total = 0u64;
+        while total < expected_length {
+            if cancelled() {
+                bail!("recognizer digest cancelled by readiness deadline");
+            }
+            let amount = usize::try_from((expected_length - total).min(buffer.len() as u64))?;
+            let read = self
+                .file
+                .read_at(&mut buffer[..amount], total)
+                .with_context(|| {
+                    format!(
+                        "failed to stream pinned recognizer model {}",
+                        self.display_path.display()
+                    )
+                })?;
+            if read == 0 {
+                bail!("pinned recognizer model became shorter while it was hashed");
+            }
+            total = total
+                .checked_add(read as u64)
+                .context("pinned recognizer model length overflow")?;
+            if total > maximum_bytes {
+                bail!("pinned recognizer model exceeds the storage readiness limit");
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let mut extra = [0u8; 1];
+        if self.file.read_at(&mut extra, expected_length)? != 0 {
+            bail!("pinned recognizer model became longer while it was hashed");
+        }
+        let after = self.file.metadata()?;
+        let after_identity = (
+            after.dev(),
+            after.ino(),
+            after.uid(),
+            after.gid(),
+            after.mode(),
+            after.nlink(),
+            after.len(),
+            after.mtime(),
+            after.mtime_nsec(),
+            after.ctime(),
+            after.ctime_nsec(),
+        );
+        if total != expected_length || after_identity != identity {
+            bail!("pinned recognizer model changed while storage binding was computed");
+        }
+        Ok(ModelDigest::new(hasher.finalize().into()))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,12 +266,19 @@ impl ProviderKind {
 impl InferenceEngine {
     /// Create a new inference engine, loading and preparing ONNX models.
     pub fn new(config: &HowyConfig) -> Result<Self> {
-        Self::new_inner(config, true, None, None)
+        let models = resolve_models(config, None)?;
+        Self::new_inner(config, true, None, None, Some(&models))
+    }
+
+    /// Create a production engine from the startup-pinned model snapshot.
+    pub fn new_with_resolved_models(config: &HowyConfig, models: &ResolvedModels) -> Result<Self> {
+        Self::new_inner(config, true, None, None, Some(models))
     }
 
     /// Create an engine with independent detector and recognizer ORT profiles.
     pub fn new_profiled(config: &HowyConfig, profiling: InferenceProfiling) -> Result<Self> {
-        Self::new_inner(config, true, Some(profiling), None)
+        let models = resolve_models(config, None)?;
+        Self::new_inner(config, true, Some(profiling), None, Some(&models))
     }
 
     /// Create profiled sessions from parent-pinned ONNX bytes.
@@ -126,6 +293,7 @@ impl InferenceEngine {
             true,
             Some(profiling),
             Some((detector_model, recognizer_model)),
+            None,
         )
     }
 
@@ -134,18 +302,19 @@ impl InferenceEngine {
         register_cpu_fallback: bool,
         profiling: Option<InferenceProfiling>,
         model_bytes: Option<(&[u8], &[u8])>,
+        resolved_models: Option<&ResolvedModels>,
     ) -> Result<Self> {
         // Harness sessions consume parent-pinned bytes and never reopen model paths.
-        let (detector_path, recognizer_path) = if model_bytes.is_some() {
-            (
+        let (detector_path, recognizer_path) = match resolved_models {
+            Some(models) => (
+                models.detector.display_path.clone(),
+                models.recognizer.display_path.clone(),
+            ),
+            None if model_bytes.is_some() => (
                 PathBuf::from("<pinned-detector-memory>"),
                 PathBuf::from("<pinned-recognizer-memory>"),
-            )
-        } else {
-            (
-                resolve_model_path(&config.ml.detector_model, "det_10g.onnx")?,
-                resolve_model_path(&config.ml.recognizer_model, "w600k_r50.onnx")?,
-            )
+            ),
+            None => bail!("resolved model descriptors are required"),
         };
 
         if model_bytes.is_some() {
@@ -180,7 +349,10 @@ impl InferenceEngine {
             configure_execution_providers(det_builder, &det_plan, "detector", fp16)?;
         let det_session = match model_bytes {
             Some((detector, _)) => map_ort!(det_builder.commit_from_memory(detector)),
-            None => map_ort!(det_builder.commit_from_file(&detector_path)),
+            None => {
+                let models = resolved_models.expect("resolved model descriptors");
+                map_ort!(det_builder.commit_from_file(models.detector.descriptor_path()))
+            }
         }
         .context("failed to load detector model")?;
 
@@ -200,7 +372,10 @@ impl InferenceEngine {
             configure_execution_providers(rec_builder, &rec_plan, "recognizer", fp16)?;
         let rec_session = match model_bytes {
             Some((_, recognizer)) => map_ort!(rec_builder.commit_from_memory(recognizer)),
-            None => map_ort!(rec_builder.commit_from_file(&recognizer_path)),
+            None => {
+                let models = resolved_models.expect("resolved model descriptors");
+                map_ort!(rec_builder.commit_from_file(models.recognizer.descriptor_path()))
+            }
         }
         .context("failed to load recognizer model")?;
 
@@ -228,13 +403,13 @@ impl InferenceEngine {
         Ok(Self {
             detector: Mutex::new(DetectorState {
                 session: det_session,
-                input_buf: vec![0.0f32; 3 * det_w * det_h],
+                input_buf: Zeroizing::new(vec![0.0f32; 3 * det_w * det_h]),
                 det_w,
                 det_h,
             }),
             recognizer: Mutex::new(RecognizerState {
                 session: rec_session,
-                input_buf: vec![0.0f32; 3 * 112 * 112],
+                input_buf: Zeroizing::new(vec![0.0f32; 3 * 112 * 112]),
             }),
             det_input_name,
             rec_input_name,
@@ -263,6 +438,10 @@ impl InferenceEngine {
 
     pub fn recognizer_model_path(&self) -> String {
         self.recognizer_path.display().to_string()
+    }
+
+    pub(crate) fn plaintext_scratch_bytes(&self) -> Result<usize> {
+        inference_plaintext_scratch_bytes(self.det_size.0, self.det_size.1)
     }
 
     /// Run a warmup inference to prime the execution provider.
@@ -423,6 +602,92 @@ impl InferenceEngine {
     }
 }
 
+pub(crate) fn inference_plaintext_scratch_bytes(
+    detector_width: u32,
+    detector_height: u32,
+) -> Result<usize> {
+    let detector_width = usize::try_from(detector_width).context("detector width overflow")?;
+    let detector_height = usize::try_from(detector_height).context("detector height overflow")?;
+    let detector_input = detector_width
+        .checked_mul(detector_height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+        .context("detector input accounting overflow")?;
+    let recognizer_input = 3usize
+        .checked_mul(112)
+        .and_then(|values| values.checked_mul(112))
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+        .context("recognizer input accounting overflow")?;
+    let persistent_inputs = detector_input
+        .checked_add(recognizer_input)
+        .context("inference input accounting overflow")?;
+
+    let mut anchors = 0usize;
+    let mut detector_output_values = 0usize;
+    for stride in SCRFD_STRIDES {
+        if detector_width == 0
+            || detector_height == 0
+            || detector_width % stride != 0
+            || detector_height % stride != 0
+        {
+            bail!("SCRFD dimensions must be nonzero multiples of stride {stride}");
+        }
+        let level_anchors = detector_width
+            .checked_div(stride)
+            .and_then(|width| {
+                detector_height
+                    .checked_div(stride)
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|cells| cells.checked_mul(SCRFD_ANCHORS_PER_CELL))
+            .context("SCRFD anchor accounting overflow")?;
+        anchors = anchors
+            .checked_add(level_anchors)
+            .context("SCRFD anchor accounting overflow")?;
+        let level_outputs = SCRFD_GROUP_WIDTHS.iter().try_fold(0usize, |total, width| {
+            level_anchors
+                .checked_mul(*width)
+                .and_then(|values| total.checked_add(values))
+        });
+        detector_output_values = detector_output_values
+            .checked_add(level_outputs.context("SCRFD output accounting overflow")?)
+            .context("SCRFD output accounting overflow")?;
+    }
+    let detector_outputs = detector_output_values
+        .checked_mul(std::mem::size_of::<f32>())
+        .context("SCRFD output-byte accounting overflow")?;
+    // NMS simultaneously owns the full candidate vector, a full result vector,
+    // and one suppression byte per candidate. Provider-private execution
+    // workspace is deliberately outside the daemon-owned biometric plaintext
+    // budget; every bounded CPU-visible input, output, candidate, and copy is in it.
+    let candidate_nms = anchors
+        .checked_mul(
+            std::mem::size_of::<Face>()
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<bool>()))
+                .context("SCRFD candidate-size accounting overflow")?,
+        )
+        .context("SCRFD candidate accounting overflow")?;
+    let detector_phase = detector_outputs
+        .checked_add(candidate_nms)
+        .context("detector phase accounting overflow")?;
+
+    // ORT's ArcFace output and the daemon-owned extraction copy coexist before
+    // normalization returns the copy to the caller.
+    let recognizer_outputs = face::FACE_EMBEDDING_DIM
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|bytes| bytes.checked_mul(2))
+        .context("recognizer output accounting overflow")?;
+    let recognizer_phase = anchors
+        .checked_mul(std::mem::size_of::<Face>())
+        .and_then(|faces| faces.checked_add(recognizer_outputs))
+        .context("recognizer phase accounting overflow")?;
+
+    persistent_inputs
+        .checked_add(detector_phase.max(recognizer_phase))
+        .context("inference phase accounting overflow")
+}
+
 fn validate_output_count(model: &str, actual: usize, expected: usize) -> Result<()> {
     if actual != expected {
         bail!("{model} returned {actual} outputs; expected exactly {expected}");
@@ -558,12 +823,276 @@ fn normalize_arcface_embedding(mut embedding: Vec<f32>) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InferenceEngine, ProviderKind, SCRFD_OUTPUT_COUNT, build_execution_providers,
-        normalize_arcface_embedding, validate_output_count, validate_recognizer_output_facts,
-        validate_scrfd_output_facts,
+        InferenceEngine, ModelCredentialAlias, ProviderKind, SCRFD_OUTPUT_COUNT,
+        build_execution_providers, normalize_arcface_embedding, resolve_model_path,
+        resolve_model_path_with_credential_directory, validate_output_count,
+        validate_recognizer_output_facts, validate_scrfd_output_facts,
     };
+    use crate::mode1_key::{CredentialSourceIdentity, MODE1_CREDENTIAL_NAME};
     use howy_common::config::HowyConfig;
     use howy_common::face::FACE_EMBEDDING_DIM;
+    use howy_common::storage::recognizer_model_digest;
+    use std::cell::Cell;
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    fn temporary_directory(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "howy-model-alias-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn mode0_guard_rejects_direct_symlink_hardlink_and_proc_fd_aliases_before_model_read() {
+        let root = temporary_directory("all");
+        let credential_directory = root.join("credentials");
+        let models = root.join("models");
+        std::fs::create_dir(&credential_directory).unwrap();
+        std::fs::create_dir(&models).unwrap();
+        let credential_path = credential_directory.join(MODE1_CREDENTIAL_NAME);
+        std::fs::write(&credential_path, [0x5a; 32]).unwrap();
+        let credential = File::open(&credential_path).unwrap();
+        let guard = CredentialSourceIdentity::from_descriptor_metadata(
+            &File::open(&credential_directory)
+                .unwrap()
+                .metadata()
+                .unwrap(),
+            &credential.metadata().unwrap(),
+            None,
+        );
+        let symlink = models.join("symlink.onnx");
+        let hardlink = models.join("hardlink.onnx");
+        std::os::unix::fs::symlink(&credential_path, &symlink).unwrap();
+        std::fs::hard_link(&credential_path, &hardlink).unwrap();
+        let proc_fd = format!("/proc/self/fd/{}", credential.as_raw_fd());
+
+        for alias in [
+            credential_path.to_string_lossy().into_owned(),
+            symlink.to_string_lossy().into_owned(),
+            hardlink.to_string_lossy().into_owned(),
+            proc_fd,
+        ] {
+            let model_reads = Cell::new(0_u32);
+            let result =
+                resolve_model_path(&alias, "w600k_r50.onnx", Some(guard)).and_then(|model| {
+                    model_reads.set(model_reads.get() + 1);
+                    model.read_all()
+                });
+            let error = result.unwrap_err();
+            assert!(error.downcast_ref::<ModelCredentialAlias>().is_some());
+            assert_eq!(model_reads.get(), 0, "model bytes read for alias {alias}");
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn storage_key_name_is_never_a_generic_model_credential_name() {
+        let root = temporary_directory("name");
+        let credential_path = root.join(MODE1_CREDENTIAL_NAME);
+        std::fs::write(&credential_path, [0x33; 32]).unwrap();
+        let directory = File::open(&root).unwrap();
+        let credential = File::open(&credential_path).unwrap();
+        let guard = CredentialSourceIdentity::from_descriptor_metadata(
+            &directory.metadata().unwrap(),
+            &credential.metadata().unwrap(),
+            None,
+        );
+        let error = resolve_model_path("", MODE1_CREDENTIAL_NAME, Some(guard)).unwrap_err();
+        assert!(error.downcast_ref::<ModelCredentialAlias>().is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn automatic_model_credentials_accept_only_the_legitimate_fixed_names() {
+        let root = temporary_directory("fixed-credentials");
+        let storage_key = root.join(MODE1_CREDENTIAL_NAME);
+        std::fs::write(&storage_key, [0x22; 32]).unwrap();
+        let directory = File::open(&root).unwrap();
+        let credential = File::open(&storage_key).unwrap();
+        let guard = CredentialSourceIdentity::from_descriptor_metadata(
+            &directory.metadata().unwrap(),
+            &credential.metadata().unwrap(),
+            None,
+        );
+        for name in ["det_10g.onnx", "w600k_r50.onnx"] {
+            std::fs::write(root.join(name), name.as_bytes()).unwrap();
+            let model = resolve_model_path_with_credential_directory(
+                "",
+                name,
+                Some(guard),
+                Some(root.as_os_str()),
+            )
+            .unwrap();
+            assert_eq!(model.read_all().unwrap(), name.as_bytes());
+        }
+        let generic_name = "not-a-howdy-model-credential.onnx";
+        std::fs::write(root.join(generic_name), b"generic").unwrap();
+        assert!(
+            resolve_model_path_with_credential_directory(
+                "",
+                generic_name,
+                Some(guard),
+                Some(root.as_os_str()),
+            )
+            .is_err()
+        );
+        let error = resolve_model_path_with_credential_directory(
+            "",
+            MODE1_CREDENTIAL_NAME,
+            Some(guard),
+            Some(root.as_os_str()),
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<ModelCredentialAlias>().is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ordinary_and_symlinked_noncredential_models_remain_supported() {
+        let root = temporary_directory("ordinary");
+        let credential_directory = root.join("credentials");
+        std::fs::create_dir(&credential_directory).unwrap();
+        let credential_path = credential_directory.join(MODE1_CREDENTIAL_NAME);
+        std::fs::write(&credential_path, [0x11; 32]).unwrap();
+        let credential = File::open(&credential_path).unwrap();
+        let guard = CredentialSourceIdentity::from_descriptor_metadata(
+            &File::open(&credential_directory)
+                .unwrap()
+                .metadata()
+                .unwrap(),
+            &credential.metadata().unwrap(),
+            None,
+        );
+        let model_path = root.join("w600k_r50.onnx");
+        let model_link = root.join("recognizer-current.onnx");
+        std::fs::write(&model_path, b"ordinary-model").unwrap();
+        std::os::unix::fs::symlink(&model_path, &model_link).unwrap();
+
+        for path in [&model_path, &model_link] {
+            let model =
+                resolve_model_path(path.to_str().unwrap(), "w600k_r50.onnx", Some(guard)).unwrap();
+            assert_eq!(model.read_all().unwrap(), b"ordinary-model");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn storage_and_primary_and_cpu_attempts_share_original_pinned_model_inodes() {
+        let root = temporary_directory("provider-retry-pinning");
+        let detector_path = root.join("detector.onnx");
+        let recognizer_path = root.join("recognizer.onnx");
+        let detector_b = root.join("detector-b.onnx");
+        let recognizer_b = root.join("recognizer-b.onnx");
+        let detector_a_bytes = b"detector inode A";
+        let recognizer_a_bytes = b"recognizer inode A";
+        std::fs::write(&detector_path, detector_a_bytes).unwrap();
+        std::fs::write(&recognizer_path, recognizer_a_bytes).unwrap();
+        std::fs::write(&detector_b, b"detector replacement B").unwrap();
+        std::fs::write(&recognizer_b, b"recognizer replacement B").unwrap();
+        let mut config = HowyConfig::default();
+        config.ml.detector_model = detector_path.to_string_lossy().into_owned();
+        config.ml.recognizer_model = recognizer_path.to_string_lossy().into_owned();
+        let models = super::resolve_models(&config, None).unwrap();
+        let detector_identity = models.detector.file.metadata().unwrap();
+        let recognizer_identity = models.recognizer.file.metadata().unwrap();
+
+        let storage_bytes = models.recognizer().read_all().unwrap();
+        assert_eq!(storage_bytes, recognizer_a_bytes);
+        let storage_digest = recognizer_model_digest(&storage_bytes);
+
+        std::fs::rename(&detector_path, root.join("detector-a-held")).unwrap();
+        std::fs::rename(&recognizer_path, root.join("recognizer-a-held")).unwrap();
+        std::os::unix::fs::symlink(&detector_b, &detector_path).unwrap();
+        std::os::unix::fs::symlink(&recognizer_b, &recognizer_path).unwrap();
+
+        for attempt in ["primary", "cpu-fallback"] {
+            let mut detector_attempt = File::open(models.detector().descriptor_path()).unwrap();
+            let mut recognizer_attempt = File::open(models.recognizer().descriptor_path()).unwrap();
+            let mut detector_bytes = Vec::new();
+            let mut recognizer_bytes = Vec::new();
+            detector_attempt.read_to_end(&mut detector_bytes).unwrap();
+            recognizer_attempt
+                .read_to_end(&mut recognizer_bytes)
+                .unwrap();
+            assert_eq!(detector_bytes, detector_a_bytes, "{attempt}");
+            assert_eq!(recognizer_bytes, recognizer_a_bytes, "{attempt}");
+            assert_eq!(
+                detector_attempt.metadata().unwrap().ino(),
+                detector_identity.ino()
+            );
+            assert_eq!(
+                recognizer_attempt.metadata().unwrap().ino(),
+                recognizer_identity.ino()
+            );
+            assert_eq!(recognizer_model_digest(&recognizer_bytes), storage_digest);
+        }
+        assert_eq!(
+            std::fs::read(&detector_path).unwrap(),
+            b"detector replacement B"
+        );
+        assert_eq!(
+            std::fs::read(&recognizer_path).unwrap(),
+            b"recognizer replacement B"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn readiness_digest_streams_the_pinned_recognizer_under_an_exact_bound() {
+        let root = temporary_directory("bounded-readiness-digest");
+        let recognizer_path = root.join("recognizer.onnx");
+        let bytes = vec![0x5a; 128 * 1024 + 17];
+        std::fs::write(&recognizer_path, &bytes).unwrap();
+        let recognizer =
+            resolve_model_path(recognizer_path.to_str().unwrap(), "w600k_r50.onnx", None).unwrap();
+
+        assert_eq!(
+            recognizer
+                .sha256_digest_bounded(bytes.len() as u64)
+                .unwrap(),
+            recognizer_model_digest(&bytes)
+        );
+        assert!(
+            recognizer
+                .sha256_digest_bounded(bytes.len() as u64 - 1)
+                .is_err()
+        );
+
+        let empty_path = root.join("empty.onnx");
+        std::fs::write(&empty_path, []).unwrap();
+        let empty =
+            resolve_model_path(empty_path.to_str().unwrap(), "w600k_r50.onnx", None).unwrap();
+        assert!(empty.sha256_digest_bounded(1).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn readiness_resolves_only_the_recognizer_before_detector_startup() {
+        let root = temporary_directory("recognizer-only-readiness");
+        let recognizer_path = root.join("recognizer.onnx");
+        std::fs::write(&recognizer_path, b"recognizer").unwrap();
+        let mut config = HowyConfig::default();
+        config.ml.recognizer_model = recognizer_path.to_string_lossy().into_owned();
+        config.ml.detector_model = root
+            .join("missing-detector.onnx")
+            .to_string_lossy()
+            .into_owned();
+
+        let recognizer = super::resolve_recognizer_model(&config, None).unwrap();
+        assert_eq!(recognizer.read_all().unwrap(), b"recognizer");
+        assert!(super::resolve_models_with_recognizer(&config, None, recognizer).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn output_counts_are_exact() {
@@ -576,6 +1105,15 @@ mod tests {
         );
         assert!(validate_output_count("recognizer", 0, 1).is_err());
         assert!(validate_output_count("recognizer", 2, 1).is_err());
+    }
+
+    #[test]
+    fn plaintext_peak_covers_inputs_outputs_and_worst_case_nms() {
+        assert_eq!(
+            super::inference_plaintext_scratch_bytes(640, 640).unwrap(),
+            9_047_328
+        );
+        assert!(super::inference_plaintext_scratch_bytes(641, 640).is_err());
     }
 
     #[test]
@@ -877,6 +1415,22 @@ fn postprocess_scrfd(
     threshold: f32,
 ) -> Result<Vec<Face>> {
     let mut faces = Vec::new();
+    let maximum_candidates = SCRFD_STRIDES.iter().try_fold(0usize, |total, stride| {
+        usize::try_from(det_w)
+            .ok()
+            .and_then(|width| width.checked_div(*stride))
+            .and_then(|width| {
+                usize::try_from(det_h)
+                    .ok()
+                    .and_then(|height| height.checked_div(*stride))
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|cells| cells.checked_mul(SCRFD_ANCHORS_PER_CELL))
+            .and_then(|anchors| total.checked_add(anchors))
+    });
+    faces
+        .try_reserve_exact(maximum_candidates.context("SCRFD candidate capacity overflow")?)
+        .context("failed to reserve bounded SCRFD candidates")?;
 
     // SCRFD outputs: for each stride: scores, bboxes, landmarks
     // Standard det_10g has 9 outputs (3 strides x 3), validated before this call.
@@ -967,6 +1521,7 @@ fn nms(mut faces: Vec<Face>, iou_thresh: f32) -> Vec<Face> {
 
     let mut suppressed = vec![false; faces.len()];
     let mut result = Vec::new();
+    result.reserve_exact(faces.len());
 
     for i in 0..faces.len() {
         if suppressed[i] {
@@ -1320,31 +1875,119 @@ where
     }
 }
 
-/// Resolve a model path: use explicit path if set, otherwise search standard locations.
-fn resolve_model_path(configured: &str, default_name: &str) -> Result<PathBuf> {
+fn path_is_exact_credential_location(
+    path: &Path,
+    credential_guard: CredentialSourceIdentity,
+) -> Result<bool> {
+    if path.file_name() != Some(credential_guard.credential_name().as_ref()) {
+        return Ok(false);
+    }
+    let parent = path
+        .parent()
+        .context("model credential candidate has no parent directory")?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(parent)
+        .with_context(|| {
+            format!(
+                "failed to inspect model credential directory {}",
+                parent.display()
+            )
+        })?;
+    Ok(credential_guard.matches_directory(&directory.metadata()?))
+}
+
+fn open_model_candidate(
+    path: PathBuf,
+    credential_guard: Option<CredentialSourceIdentity>,
+) -> Result<ResolvedModel> {
+    if let Some(guard) = credential_guard {
+        if path_is_exact_credential_location(&path, guard)? {
+            return Err(ModelCredentialAlias.into());
+        }
+    }
+
+    // Symlinks are intentionally permitted for ordinary model deployment. The
+    // opened descriptor, not the path spelling, is the security identity.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(&path)
+        .with_context(|| format!("model candidate could not be opened: {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        bail!("model candidate is not a regular file: {}", path.display());
+    }
+    if credential_guard.is_some_and(|guard| guard.matches_credential(&metadata)) {
+        return Err(ModelCredentialAlias.into());
+    }
+    Ok(ResolvedModel {
+        display_path: path,
+        file,
+    })
+}
+
+/// Resolve and descriptor-bind a model: use an explicit path if set, otherwise
+/// search only the two fixed model credential names and standard locations.
+fn resolve_model_path(
+    configured: &str,
+    default_name: &str,
+    credential_guard: Option<CredentialSourceIdentity>,
+) -> Result<ResolvedModel> {
+    let credential_directory = std::env::var_os("CREDENTIALS_DIRECTORY");
+    resolve_model_path_with_credential_directory(
+        configured,
+        default_name,
+        credential_guard,
+        credential_directory.as_deref(),
+    )
+}
+
+fn resolve_model_path_with_credential_directory(
+    configured: &str,
+    default_name: &str,
+    credential_guard: Option<CredentialSourceIdentity>,
+    credential_directory: Option<&OsStr>,
+) -> Result<ResolvedModel> {
     if !configured.is_empty() {
         let path = PathBuf::from(configured);
-        if path.is_file() {
-            return Ok(path);
+        match open_model_candidate(path, credential_guard) {
+            Ok(model) => return Ok(model),
+            Err(error) if error.downcast_ref::<ModelCredentialAlias>().is_some() => {
+                return Err(error);
+            }
+            Err(_) => {}
         }
         bail!("Configured model not found: {configured}");
     }
 
+    if credential_guard.is_some_and(|guard| default_name == guard.credential_name()) {
+        return Err(ModelCredentialAlias.into());
+    }
+
     // Check systemd credentials directory
-    if let Ok(creds_dir) = std::env::var("CREDENTIALS_DIRECTORY") {
-        let cred_path = PathBuf::from(&creds_dir).join(default_name);
-        if cred_path.is_file() {
-            info!(
-                "Using model from systemd credentials: {}",
-                cred_path.display()
-            );
-            return Ok(cred_path);
+    let fixed_model_credential = matches!(default_name, "det_10g.onnx" | "w600k_r50.onnx");
+    if let Some(creds_dir) = credential_directory.filter(|_| fixed_model_credential) {
+        let cred_path = PathBuf::from(creds_dir).join(default_name);
+        match open_model_candidate(cred_path, credential_guard) {
+            Ok(model) => {
+                info!(
+                    "Using model from systemd credentials: {}",
+                    model.display_path().display()
+                );
+                return Ok(model);
+            }
+            Err(error) if error.downcast_ref::<ModelCredentialAlias>().is_some() => {
+                return Err(error);
+            }
+            Err(_) => {}
         }
     }
 
     // Search standard locations
     match howy_common::paths::find_model(default_name) {
-        Some(path) => Ok(path),
+        Some(path) => open_model_candidate(path, credential_guard),
         None => bail!(
             "Model '{}' not found in standard locations. \
              Install models to {} or set the path in config.",
@@ -1352,4 +1995,38 @@ fn resolve_model_path(configured: &str, default_name: &str) -> Result<PathBuf> {
             howy_common::paths::ONNX_DATA_DIR,
         ),
     }
+}
+
+/// Resolve both model paths exactly once into the startup descriptor snapshot.
+pub fn resolve_models(
+    config: &HowyConfig,
+    credential_guard: Option<CredentialSourceIdentity>,
+) -> Result<ResolvedModels> {
+    let recognizer = resolve_recognizer_model(config, credential_guard)?;
+    resolve_models_with_recognizer(config, credential_guard, recognizer)
+}
+
+/// Resolve only the recognizer descriptor needed to bind storage readiness.
+pub fn resolve_recognizer_model(
+    config: &HowyConfig,
+    credential_guard: Option<CredentialSourceIdentity>,
+) -> Result<ResolvedModel> {
+    resolve_model_path(
+        &config.ml.recognizer_model,
+        "w600k_r50.onnx",
+        credential_guard,
+    )
+}
+
+/// Resolve the detector after storage readiness while retaining the exact
+/// recognizer descriptor already used for the storage model digest.
+pub fn resolve_models_with_recognizer(
+    config: &HowyConfig,
+    credential_guard: Option<CredentialSourceIdentity>,
+    recognizer: ResolvedModel,
+) -> Result<ResolvedModels> {
+    Ok(ResolvedModels {
+        detector: resolve_model_path(&config.ml.detector_model, "det_10g.onnx", credential_guard)?,
+        recognizer,
+    })
 }

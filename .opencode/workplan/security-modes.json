@@ -1,0 +1,834 @@
+{
+  "schemaVersion": 2,
+  "id": "security-modes",
+  "kind": "software-engineering",
+  "title": "Security Modes",
+  "goal": "Implement configurable Howy security modes 0 (plaintext), 1 (cached AEAD), and 2 (ephemeral AEAD using a user-type key in a service-private session keyring), reserve mode 3 for future hardware isolation, and add optional prompt-before-capture confirmation with secure new-install bootstrap defaults, backward-compatible explicit upgrades, low authentication latency, and daemon-owned storage.",
+  "scope": [
+    "Stable configurable embedding modes 0 plaintext, 1 cached AEAD, 2 ephemeral AEAD, with mode 3 reserved.",
+    "Explicit insecure mode 0, secure disabled new-install bootstrap, and backward-compatible absent-field behavior.",
+    "Frozen HOWYENC1/HOWYPLN1 formats, exact mode namespaces, one-epoch v1 policy, stable enrollment IDs, generation CAS, mutation table, and atomic durability.",
+    "Daemon-owned live/batch enrollment, presence, authentication load, list, remove, clear, diagnostics, credentials, shutdown, and exhaustive authorization.",
+    "Mode 1 systemd TPM/host credential, guarded daemon key, bounded decrypt-on-load cache, and zero warm-path storage crypto.",
+    "Mode 2 actual ExecStart TPM launcher, `user`-type key in `KEY_SPEC_SESSION_KEYRING`, possessor-only permissions, sanitized exact serial handoff, transient per-operation key read, userspace AEAD, request-local zeroizing records, fail-closed child detachment, and decrypt/camera overlap.",
+    "Optional prompt-before-capture confirmation with same-connection two-phase protocol, lazy camera access, active HUP cancellation, honest claims, and PAM compatibility.",
+    "Transactional fresh install/provisioning, byte-preserving upgrades/reinstalls, explicit namespace reactivation/re-registration choices, recovery, packaging, and operator guidance.",
+    "Cross-feature security, fuzz, compatibility, performance, packaging, and operational validation."
+  ],
+  "nonGoals": [
+    "Implement mode 3 or claim TPM2 can bulk-decrypt embedding records.",
+    "Implement or enable AF_ALG.",
+    "Implement gesture, nod, blink, biometric liveness, or presentation-attack detection.",
+    "Remove mode 0 or prevent users from explicitly choosing insecure operation.",
+    "Automatically import plaintext enrollment records into encrypted modes.",
+    "Add TPM unseal commands to the per-authentication path.",
+    "Protect against live root, kernel compromise, daemon code execution, or malicious same-UID protocol clients.",
+    "Implement TPM NV rollback counters in the initial format.",
+    "Build a hardware-specific HIP/DMA-BUF inference pipeline.",
+    "Change recognition models, thresholds, camera exposure behavior, or execution providers.",
+    "Guarantee password fallback independently of PAM stack control configuration.",
+    "Silently overwrite existing configuration during package upgrades or local reinstall.",
+    "Permit daemon child processes to inherit possession of the mode-2 keyring."
+  ],
+  "constraints": [
+    "All delivered features are optional and independently configurable; explicit insecure mode 0 remains fully supported.",
+    "Mode numbers are stable identifiers, not assurance levels. Documentation must not imply that higher numbers are categorically more secure.",
+    "New-install templates choose a disabled mode-1 bootstrap plus prompt confirmation; existing configs with absent new fields preserve mode 0/prompt-off. A wholly missing daemon config fails with a generation/migration instruction rather than silently choosing a mode.",
+    "Configured encrypted modes fail closed on missing keys, corrupt records, wrong namespaces, unsupported epochs, or incompatible formats; there is no silent downgrade. Users may explicitly provision mode 0.",
+    "Mode 3 is reserved future work only. TPM2 is not treated as a bulk AEAD engine; future hardware-isolated designs require separate research and approval.",
+    "AF_ALG is explicitly rejected and must not be implemented or enabled in service sandboxes.",
+    "Mode 1 unseals through a systemd TPM/host encrypted credential once and retains a guarded daemon key; mode 2 unseals once through the actual ExecStart launcher into a `user`-type key linked only to the service-private session keyring and reads it transiently per operation.",
+    "Prompt confirmation is a supported-client user-intent interaction, not biometric liveness, PAD, trusted-path attestation, or proof against malicious same-UID clients.",
+    "The daemon must not probe, open, configure, or stream the camera before a valid prompt commit when confirmation is enabled; the camera never streams while waiting for human input.",
+    "Enrollment and all storage mutations remain root-only. Authentication, credential operations, and enrollment-presence checks permit root or the matching UID under the exhaustive authorization table.",
+    "All storage modes use daemon-owned enrollment and CRUD; raw embeddings do not cross normal CLI IPC.",
+    "Preserve provider-agnostic inference, current password-fallback-compatible PAM return semantics, and no continuous camera operation.",
+    "No packages, live TPM keys, PAM/systemd changes, production camera/model runs, enrollment deletion, commits, or deployment without explicit approval.",
+    "Do not overwrite or absorb unrelated uncommitted changes. Snapshot the baseline diff before each implementation slice.",
+    "Documentation changes are limited to necessary README/operator sections unless the user separately approves additional committed documents; report stale historical docs explicitly.",
+    "Each implementation slice follows code-writer, adversarial code-checker, writer fixes, rerun evidence, and an explicit gate before the next slice."
+  ],
+  "relevantFiles": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/howy-common/src/config.rs",
+    "crates/howy-common/src/face.rs",
+    "crates/howy-common/src/paths.rs",
+    "crates/howy-common/src/protocol.rs",
+    "crates/howy-common/src/ipc.rs",
+    "crates/howy-daemon/src/main.rs",
+    "crates/howy-daemon/src/server.rs",
+    "crates/howy-daemon/src/inference.rs",
+    "crates/howy-cli/src/main.rs",
+    "crates/howy-pam/src/lib.rs",
+    "proto/howy.proto",
+    "systemd/howy.service",
+    "systemd/howy.socket",
+    "systemd/pam_howy",
+    "scripts/install-local.sh",
+    "README.md",
+    "config.toml",
+    "howy.config",
+    "PKGBUILD",
+    ".SRCINFO",
+    "crates/howy-daemon/src/camera.rs",
+    "crates/howy-daemon/Cargo.toml",
+    "crates/howy-common/Cargo.toml",
+    "crates/howy-cli/Cargo.toml",
+    "crates/howy-pam/Cargo.toml",
+    "scripts/tests/install-local-mock.sh",
+    "scripts/enroll.py",
+    "docs/ENROLLMENT_DESIGN.md",
+    "tests/security-modes/",
+    "fuzz/",
+    "howy.install",
+    "crates/howy-daemon/src/bin/howy-keyring-launcher.rs",
+    "crates/howy-common/src/storage/",
+    "crates/howy-daemon/src/storage/",
+    "crates/howy-common/src/storage/contracts.rs",
+    "crates/howy-common/src/storage/contract_tests.rs",
+    "crates/howy-daemon/src/storage/cache.rs",
+    "crates/howy-daemon/src/storage/plaintext.rs",
+    "crates/howy-cli/src/importer.rs",
+    "crates/howy-daemon/src/prompt_state.rs",
+    "crates/howy-daemon/src/mode1_key.rs",
+    "crates/howy-daemon/src/child_spawn.rs",
+    "sysusers.d/howy.conf",
+    "scripts/uninstall-local.sh",
+    "crates/howy-daemon/src/storage/mode1.rs",
+    "vendor/aes-0.9.1",
+    "vendor/aes-gcm-0.11.0",
+    "vendor/polyval-0.7.0",
+    "crates/howy-daemon/src/storage/readiness.rs"
+  ],
+  "planFile": ".opencode/workplan/security-modes.md",
+  "specFiles": [],
+  "phases": [
+    {
+      "id": "phase-contracts",
+      "title": "Normative security contracts",
+      "status": "completed",
+      "steps": [
+        {
+          "id": "step-config-provenance",
+          "title": "Separate defaults and provenance",
+          "target": "crates/howy-common/src/config.rs, config.toml, howy.config, CLI config generation",
+          "action": "Create distinct legacy deserialization defaults, explicit fresh-install secure template generation, and loaded-config provenance. Missing new fields map to mode 0/off; fresh templates write mode 1/confirm; a wholly missing daemon config fails with a generation instruction.",
+          "validation": "Passed: 4 targeted common config tests; CLI config command/build; touched-file rustfmt and diff checks. Full fmt blocked only by pre-existing unrelated files.",
+          "status": "completed"
+        },
+        {
+          "id": "step-config-contract",
+          "title": "Define security configuration contract",
+          "target": "common config types and status/doctor schemas",
+          "action": "Define stable numeric embedding modes 0/1/2/3, independent presence off/confirm policy, mode-specific required fields, strict validation, and precise unsupported/re-registration errors.",
+          "validation": "Passed: 15 targeted common config tests, targeted rustfmt, and diff check; legacy fresh template remains inactive and secure bootstrap is explicit.",
+          "status": "completed"
+        },
+        {
+          "id": "step-record-spec",
+          "title": "Implement frozen record specification",
+          "target": "common storage module, workplan normative specification, golden-vector fixtures",
+          "action": "Implement the frozen HOWYENC1/HOWYPLN1 layouts, exact NSS canonical-name mapping, byte-framed legacy hashes, random-nonce policy without an unenforceable counter claim, exact offsets/AAD/payload/limits, model digest, and trailing-byte rules.",
+          "validation": "Passed: 26 storage tests, 44 total common tests, cargo check, targeted rustfmt, and diff check; exact pinned dependencies recorded.",
+          "status": "completed"
+        },
+        {
+          "id": "step-mode-namespaces",
+          "title": "Implement exact namespaces and transitions",
+          "target": "paths, storage backends, transition tests",
+          "action": "Implement exact namespaces `/etc/howy/models/<user>.bin|.json`, `/etc/howy/models/mode1/<user>.hye`, and `/etc/howy/models/mode2/<user>.hye`, with mode directories 0700 and files 0600. Implement the frozen transition matrix: only selected namespace is active; selecting a prior mode intentionally reactivates still-valid records; no automatic import/delete/overwrite; explicit clear/purge remains operator-controlled.",
+          "validation": "Passed: 33 storage tests, 2 path tests, cargo check, targeted rustfmt, and diff check.",
+          "status": "completed"
+        },
+        {
+          "id": "step-epoch-policy",
+          "title": "Implement v1 epoch and generation rules",
+          "target": "record format, key config, mutation logic",
+          "action": "Implement one active key epoch per encrypted mode. Initial epoch is 1; every successful mutation increments record generation from 1 with checked overflow. Changing epoch rejects old records and requires re-registration; no multi-key reads or automatic re-encryption.",
+          "validation": "Covered by config validation and storage tests for zero/expected epoch binding, initial generation, checked increment, and overflow; backend application remains explicitly validated in later phases.",
+          "status": "completed"
+        },
+        {
+          "id": "step-storage-contract",
+          "title": "Define storage and concurrency contracts",
+          "target": "common face records and daemon storage/cache interfaces",
+          "action": "Introduce a daemon StorageBackend and lease contract supporting cached immutable and request-local zeroizing records, stable enrollment IDs, persisted record generation, and mutation compare-and-swap.",
+          "validation": "Passed: 43 storage tests, 61 total common tests, cargo check, targeted rustfmt, and diff check; zeroize 1.9.0 alloc-only pinned.",
+          "status": "completed"
+        },
+        {
+          "id": "step-contracts-review",
+          "title": "Review contracts slice",
+          "target": "contracts diff, format, tests, migration matrix",
+          "action": "Conduct adversarial review of the contracts slice.",
+          "validation": "Completed: no critical findings; two major zeroization blockers and five lower findings recorded.",
+          "status": "completed"
+        },
+        {
+          "id": "step-contracts-fix",
+          "title": "Fix contracts findings",
+          "target": "contracts slice",
+          "action": "Apply review fixes and rerun contract checks.",
+          "validation": "Passed final targeted review: no remaining findings. 57 storage tests, 75 total common tests, cargo check, rustfmt, feature-tree and diff checks pass.",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "id": "phase-daemon-storage",
+      "title": "Daemon-owned storage and explicit mode 0",
+      "status": "completed",
+      "steps": [
+        {
+          "id": "step-mode0",
+          "title": "Implement versioned plaintext mode",
+          "target": "common face storage, plaintext backend, legacy decoder",
+          "action": "Preserve legacy `.bin`/`.json` reads. Mode-0 new writes use frozen HOWYPLN1 at the existing `.bin` path. Legacy entries receive deterministic IDs/generation tokens for list/CAS and convert atomically to HOWYPLN1 only on authorized mutation.",
+          "validation": "Passed: 75 common tests, 14 daemon storage tests, daemon cargo check, targeted rustfmt, diff check; no production path touched.",
+          "status": "completed"
+        },
+        {
+          "id": "step-authz-matrix",
+          "title": "Enforce exhaustive request authorization",
+          "target": "protobuf request surface, daemon peer authorization, public/root status schemas",
+          "action": "Implement the exhaustive authorization table in the detailed plan for Authenticate/Begin/Commit/Cancel, Enroll, EnrollBatch, Detect, Ping, public Info, root SecurityInfo/Reload/List/Remove/Clear/Shutdown, CheckCredential, and RevokeCredential. Resolve all target usernames through NSS, including root requests, before side effects.",
+          "validation": "Passed: 11 authorization tests, 31 server tests, 2 protocol tests, daemon cargo check, targeted rustfmt and diff check. Public Info model paths are empty; root SecurityInfo remains next-step scope.",
+          "status": "completed"
+        },
+        {
+          "id": "step-daemon-crud",
+          "title": "Make daemon own every storage transaction",
+          "target": "proto, protocol, daemon, CLI, PAM, batch enrollment",
+          "action": "Move live and batch enrollment commit, enrollment presence, authentication load, list, stable-ID/generation remove, generation-checked clear, reload, and security diagnostics behind daemon storage transactions. Live/batch inference occurs before a short compare-and-swap commit so long capture/processing does not retain record plaintext/key material.",
+          "validation": "Passed reported targeted suites and workspace check; no active handler or CLI CRUD path directly writes UserModels; metadata-only enrollment IPC and CAS operations implemented.",
+          "status": "completed"
+        },
+        {
+          "id": "step-detect-contract",
+          "title": "Close diagnostic embedding leaks",
+          "target": "DetectResult protocol and CLI diagnostics",
+          "action": "Make detect/preview behavior explicit: keep it root-only and remove raw embedding output unless a separately reviewed diagnostic requirement proves necessary.",
+          "validation": "Passed: tag 7 reserved, detector-only response, old field ignored/not re-emitted, 6 protocol and 34 server tests, daemon check and diff check.",
+          "status": "completed"
+        },
+        {
+          "id": "step-cache-coherence",
+          "title": "Define cache coherence and memory budget",
+          "target": "daemon model cache and memory admission",
+          "action": "Adopt daemon-only write coherence: no per-auth filesystem stat in cached mode; CRUD synchronously replaces/invalidates entries; external modification requires explicit reload/restart. Account cache entries, outstanding leases, and transient buffers against one hard plaintext-memory budget.",
+          "validation": "Passed: 25 daemon storage tests, 34 server tests, 6 main tests, 59 common storage tests, workspace check, targeted rustfmt and diff check.",
+          "status": "completed"
+        },
+        {
+          "id": "step-storage-review",
+          "title": "Review daemon storage slice",
+          "target": "daemon storage/protocol diff and tests",
+          "action": "Conduct adversarial review of mode 0 and daemon storage.",
+          "validation": "Completed: no critical issues; one high compatibility regression and five medium correctness/security findings block advancement, plus two low findings.",
+          "status": "completed"
+        },
+        {
+          "id": "step-storage-fix",
+          "title": "Fix daemon storage findings",
+          "target": "daemon storage slice",
+          "action": "Apply review fixes and rerun storage checks.",
+          "validation": "Passed final adversarial gate: no critical/high findings. Importer, batch, live bounds, storage, authorization, protocol, cache, and Python compatibility approved; one medium staged-BMP envelope follow-up tracked.",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "id": "phase-prompt",
+      "title": "Optional prompt confirmation",
+      "status": "completed",
+      "steps": [
+        {
+          "id": "step-pam-conversation",
+          "title": "Implement safe PAM confirmation",
+          "target": "crates/howy-pam/src/lib.rs",
+          "action": "Implement checked PAM echo-on confirmation handling for Enter/OK, callback status, PAM_SILENT, cancellation, EOF, null/overlong responses, allocation cleanup, and panic containment.",
+          "validation": "Passed final review with no findings: 13 debug/release tests; ABI, ownership, cleanup, policy, fallback, and exported panic containment verified.",
+          "status": "completed"
+        },
+        {
+          "id": "step-prompt-protocol",
+          "title": "Add two-phase prompt protocol",
+          "target": "proto, protocol, IPC connection state machine",
+          "action": "Replace confirmation-enabled one-shot auth with a versioned same-connection Begin→Prompt→Commit/Cancel protocol. Cancel is valid only while pending. Commit consumes pending state; no later request frames are valid, and old/new compatibility fails to password without camera access.",
+          "validation": "Passed final adversarial review: frozen wire, tag-21 no-downgrade, real framed coordinator, sequencing/final ownership, timeout application, and inactive runtime boundaries verified.",
+          "status": "completed"
+        },
+        {
+          "id": "step-prompt-state",
+          "title": "Implement prompt transaction state",
+          "target": "daemon transaction manager",
+          "action": "Implement bounded pending and active transaction states. Pending tokens bind daemon instance, peer UID, username, client nonce, and expiry; commit atomically creates active cancellation/deadline state shared by camera and storage work.",
+          "validation": "Passed final adversarial gate: no findings; 18 focused state and 192 daemon tests verify token/state/capacity/deadline/snapshot/zeroization/lifecycle semantics.",
+          "status": "completed"
+        },
+        {
+          "id": "step-lazy-camera",
+          "title": "Move all camera access after confirmation",
+          "target": "daemon startup, server, camera profile lifecycle",
+          "action": "Refactor camera profile probing to be lazy. With confirmation enabled, daemon startup, socket activation, BeginAuth, pending wait, cancellation, and expiry must perform no camera probe/open/configure/start operation.",
+          "validation": "Passed final adversarial gate: no findings; 212 daemon/392 workspace tests verify zero pre-Commit events, retry/concurrency/cleanup, and prompt-off/enrollment behavior.",
+          "status": "completed"
+        },
+        {
+          "id": "step-active-cancel",
+          "title": "Add active HUP and deadline cancellation",
+          "target": "daemon connection worker, cancellation tokens, camera/storage tasks, PAM timeouts",
+          "action": "After commit, run auth work in a subordinate task while the connection worker monitors HUP/EOF and daemon shutdown. Compose admission, first-frame, scan, storage, cleanup, and PAM timeout budgets; HUP/EOF/shutdown/deadline cancels both camera and storage branches.",
+          "validation": "Passed final adversarial gate: no findings; 405 workspace tests verify cancellation/fail-stop/cache/deadline/response/race semantics.",
+          "status": "completed"
+        },
+        {
+          "id": "step-prompt-policy",
+          "title": "Add prompt policy enforcement",
+          "target": "PAM client policy, daemon authorization, prompt UX",
+          "action": "Enforce allowed PAM services, local-only policy, and unsupported-context refusal to password flow before camera access. Document and test service-name spoofability as a claim limitation.",
+          "validation": "Passed final review: no findings; 20 PAM debug/release and 418 workspace tests verify deadlines, fallback, presentation, policy, no-downgrade, cancellation, and zeroization.",
+          "status": "completed"
+        },
+        {
+          "id": "step-prompt-review",
+          "title": "Review prompt slice",
+          "target": "prompt and authentication diff",
+          "action": "Review the complete prompt protocol, state machine, PAM flow, and camera ordering.",
+          "validation": "Completed with one high, four medium, and one low concrete findings; step-prompt-fix required before Mode 1.",
+          "status": "completed"
+        },
+        {
+          "id": "step-prompt-fix",
+          "title": "Fix prompt findings",
+          "target": "prompt and authentication slice",
+          "action": "Apply review fixes and rerun prompt checks.",
+          "validation": "Passed final whole-phase gate: no prompt findings; 425 debug workspace tests and relevant release prompt suites pass.",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "id": "phase-mode1",
+      "title": "Security mode 1 — AEAD cached",
+      "status": "in_progress",
+      "steps": [
+        {
+          "id": "step-mode1-key",
+          "title": "Implement mode 1 key lifecycle",
+          "target": "daemon crypto/storage startup and systemd unit",
+          "action": "Add systemd TPM credential configuration and a host-key fallback using documented credential search paths only. Read exact credential bytes from CREDENTIALS_DIRECTORY. The daemon never invokes systemd-creds. Wipe credentials on every error and panic path.",
+          "validation": "Passed final adversarial gate: no findings; 467 workspace tests plus package/installer/sysusers/systemd/key/child/model validations.",
+          "status": "completed"
+        },
+        {
+          "id": "step-mode1-cache",
+          "title": "Implement cached AEAD backend",
+          "target": "cached AEAD backend and memory accounting",
+          "action": "Implement mode 1 encrypt/decrypt storage, boot-time population, guarded key ownership, hard memory admission, atomic writes, cache synchronization, and reload. No per-auth filesystem stat, AEAD, HKDF, TPM, or protobuf embedding occurs on warm hits.",
+          "validation": "Passed final adversarial gate: no findings; 509 debug/release workspace tests plus crypto/durability/memory/publication/readiness evidence.",
+          "status": "completed"
+        },
+        {
+          "id": "step-mode1-install",
+          "title": "Implement transactional install and migration",
+          "target": "config templates, provisioning CLI, package and installer scripts",
+          "action": "Make fresh install, upgrade, local reinstall and explicit mode 0 transactional. Fresh mode 1 stages key/config, runs a storage-only readiness check with the candidate credential in a transient unit, installs a disabled verified candidate, and requires an explicit enable step. Preserve existing configs/namespaces by default.",
+          "validation": "Pure contracts and daemon strong verifier/status are approved. Begin injected CLI transaction/systemd/recovery/cleanup engine.",
+          "status": "in_progress"
+        },
+        {
+          "id": "step-mode1-ops",
+          "title": "Define mode 1 operations",
+          "target": "README/operator sections and doctor/status",
+          "action": "Document default no-PCR policy, optional signed-PCR provisioning exploration, TPM/host-secret loss, nonportable backup, password recovery, and v1 re-registration rotation.",
+          "validation": "Recovery runbook is exercised in disposable tests and makes no portable-backup or rollback-protection claim.",
+          "status": "draft"
+        },
+        {
+          "id": "step-mode1-perf",
+          "title": "Qualify mode 1 latency",
+          "target": "storage/auth benchmarks",
+          "action": "Benchmark controlled mode 1 phases with fixed release build/hardware/sample policy: startup key activation, cold load, warm storage hit, commit-to-first-frame, inference, and total post-commit machine latency.",
+          "validation": "Warm storage p99 is no more than max(0.25 ms, baseline+5%); instrumentation proves no crypto on hits; total post-commit p95/p99 regression is within approved confidence bounds.",
+          "status": "draft"
+        },
+        {
+          "id": "step-mode1-review",
+          "title": "Review mode 1 slice",
+          "target": "mode 1 diff, tests, benchmarks, runbooks",
+          "action": "Conduct adversarial mode 1 crypto/cache/operations review.",
+          "validation": "code-checker finds no unresolved blocker/critical/major cryptographic, cache, provisioning, recovery, or latency issues.",
+          "status": "draft"
+        },
+        {
+          "id": "step-mode1-fix",
+          "title": "Fix mode 1 findings",
+          "target": "mode 1 slice",
+          "action": "Apply mode 1 review fixes and rerun qualification.",
+          "validation": "Findings are closed with reproducible security and performance evidence.",
+          "status": "draft"
+        }
+      ]
+    },
+    {
+      "id": "phase-mode2-feasibility",
+      "title": "Mode 2 feasibility gate",
+      "status": "draft",
+      "steps": [
+        {
+          "id": "step-mode2-spike",
+          "title": "Prove private-session-keyring lifecycle",
+          "target": "disposable VM/vTPM feasibility harness only",
+          "action": "In a VM/vTPM or separately approved disposable host, prototype the actual ExecStart launcher: TPM-unseal a 32-byte secret, add a `user`-type key to `KEY_SPEC_SESSION_KEYRING`, set desired `KEY_POS_VIEW|KEY_POS_READ` with owner/group/other zero, zero launcher buffers, pass a sanitized exact decimal serial, exec howyd, and read by exact serial after exec.",
+          "validation": "Evidence covers TPM unseal, exact type/description/serial, narrowest sufficient mask, exec inheritance, malformed handoff, restart, revoke, and absence of a persistent plaintext key file.",
+          "status": "draft"
+        },
+        {
+          "id": "step-mode2-isolation",
+          "title": "Prove session-keyring isolation",
+          "target": "VM systemd harness, camera FFmpeg spawn, generic child-spawn helper",
+          "action": "Test isolation from sibling root services and all child processes. FFmpeg and every future external child must join a new empty session keyring in a fail-closed pre-exec hook and receive no serial metadata; mode 2 is rejected if this cannot be guaranteed.",
+          "validation": "Sibling units and spawned helpers cannot read or possess the key; howyd workers can; detachment failure aborts child launch; restart receives a distinct private session.",
+          "status": "draft"
+        },
+        {
+          "id": "step-mode2-gate",
+          "title": "Collect mode 2 feasibility evidence",
+          "target": "VM/vTPM feasibility harness and dependency report",
+          "action": "Collect evidence—not the final decision—for an actual ExecStart launcher using a systemd private session keyring, a `user`-type key linked to `KEY_SPEC_SESSION_KEYRING`, desired key permissions `KEY_POS_VIEW|KEY_POS_READ` with owner/group/other zero, sanitized exact serial handoff, and transient key read after exec.",
+          "validation": "Evidence covers whether the desired mask is sufficient or documents the narrowest required mask, plus key type/description verification and key-read latency.",
+          "status": "draft"
+        },
+        {
+          "id": "step-mode2-feasibility-review",
+          "title": "Review mode 2 feasibility",
+          "target": "mode 2 spike evidence",
+          "action": "Conduct adversarial review of feasibility evidence before production implementation.",
+          "validation": "plan/code checker approves the selected mechanism and records all platform limits before the next phase.",
+          "status": "draft"
+        },
+        {
+          "id": "step-mode2-feasibility-fix",
+          "title": "Fix mode 2 feasibility findings",
+          "target": "mode 2 feasibility harness and evidence",
+          "action": "Apply feasibility-review fixes and rerun the VM/vTPM, session-keyring permission, exec-inheritance, child-detachment, and latency probes.",
+          "validation": "No blocker/critical/major review finding remains and rerun evidence is attached.",
+          "status": "draft"
+        },
+        {
+          "id": "step-mode2-final-gate",
+          "title": "Decide mode 2 implementation gate",
+          "target": "workplan status and mode 2 qualification record",
+          "action": "Make the final mode 2 stop/go decision only after reviewed/fixed evidence. If stopped, retain the enum as unavailable and cancel the production mode 2 phase without weakening other modes.",
+          "validation": "A documented go decision identifies exact supported kernel/systemd/TPM/dependency constraints, or a stop decision cancels production steps with clear diagnostics.",
+          "status": "draft"
+        }
+      ]
+    },
+    {
+      "id": "phase-mode2",
+      "title": "Security mode 2 — AEAD ephemeral",
+      "status": "draft",
+      "steps": [
+        {
+          "id": "step-mode2-launcher",
+          "title": "Implement private-session-keyring launcher",
+          "target": "launcher, provisioning command, mode2-specific unit integration",
+          "action": "Implement the actual ExecStart launcher selected by the feasibility gate. It links a `user`-type key only into `KEY_SPEC_SESSION_KEYRING`, applies the approved possessor-only permission mask, constructs a sanitized environment containing only a nonsecret decimal serial plus required daemon variables, execs howyd, and never uses ExecStartPre or an ambient key search.",
+          "validation": "Exact key type/description/serial/mask checks, malformed serial rejection, exec/restart/revoke tests, sibling isolation, and no persistent plaintext key file pass.",
+          "status": "draft"
+        },
+        {
+          "id": "step-mode2-key-read",
+          "title": "Implement complete transient mode 2 transactions",
+          "target": "mode2 backend, keyring wrapper, every storage/diagnostic operation",
+          "action": "Implement one operation-scoped transient key/plaintext transaction for mode-2 authentication, metadata list, live/batch append commit, remove, generation-checked clear, and authenticated VerifyRecord. Define enrollment presence as bounded outer-header candidate only, public health as backend readiness only, and reload as key/outer-header revalidation without plaintext cache.",
+          "validation": "Tests cover every classified operation, candidate-presence corruption after confirmation, CAS conflicts, memory admission, cancellation, panic, revoke, wrong key metadata, and no long-lived daemon key/cache.",
+          "status": "draft"
+        },
+        {
+          "id": "step-mode2-lease",
+          "title": "Implement ephemeral data lifecycle for all operations",
+          "target": "mode2 storage leases and mutation transactions",
+          "action": "Implement request-local zeroizing leases and operation buffers under the hard plaintext budget. Authentication reuses one lease across frames; list returns metadata then drops; mutations decrypt-modify-encrypt within the short commit transaction; clear authenticates expected generation before unlinking.",
+          "validation": "Auth/list/append/remove/clear success, conflict, timeout, cancellation, memory pressure, panic, and shutdown all release permits and zero sensitive buffers.",
+          "status": "draft"
+        },
+        {
+          "id": "step-mode2-overlap",
+          "title": "Overlap mode 2 decrypt with camera startup",
+          "target": "daemon active transaction state machine",
+          "action": "After optional prompt commit and camera admission, run camera startup and key-read/decrypt/validation concurrently. Join before matching; decrypt failure stops camera, camera failure cancels/zeroizes storage, peer HUP cancels both.",
+          "validation": "Deterministic tests cover every completion order and prove TPM unseal never occurs per auth and no plaintext exists while awaiting prompt/admission.",
+          "status": "draft"
+        },
+        {
+          "id": "step-mode2-perf",
+          "title": "Qualify mode 2 latency",
+          "target": "mode 2 benchmark harness",
+          "action": "Benchmark key read, AEAD, decode/validate/flatten, matching, memory pressure, and total post-commit latency for 1/10/100/1000 embeddings using fixed build/hardware/sample methodology.",
+          "validation": "Typical configured records finish storage work within the measured first-frame window and total post-commit regression stays within approved bounds; report failures rather than hiding them in camera time.",
+          "status": "draft"
+        },
+        {
+          "id": "step-mode2-review",
+          "title": "Review mode 2 slice",
+          "target": "mode 2 production diff and evidence",
+          "action": "Conduct adversarial mode 2 keyring/plaintext/concurrency review.",
+          "validation": "code-checker finds no unresolved blocker/critical/major key exposure, child inheritance, cancellation, memory, recovery, or latency issues.",
+          "status": "draft"
+        },
+        {
+          "id": "step-mode2-fix",
+          "title": "Fix mode 2 findings",
+          "target": "mode 2 slice",
+          "action": "Apply mode 2 review fixes and rerun disposable qualification.",
+          "validation": "Findings are closed; mode remains experimental unless every stop/go criterion is met.",
+          "status": "draft"
+        }
+      ]
+    },
+    {
+      "id": "phase-integration",
+      "title": "Integration, packaging, and final qualification",
+      "status": "draft",
+      "steps": [
+        {
+          "id": "step-final-defaults",
+          "title": "Activate secure defaults safely",
+          "target": "config generation, installer, package upgrade hooks/tests",
+          "action": "Finalize generated defaults only after mode 1 qualification. Preserve existing config byte-for-byte unless explicit migration is selected; separate config replacement from security provisioning confirmations.",
+          "validation": "Fresh install, local reinstall, package upgrade, decline, interruption, rollback, missing config, explicit mode 0, and re-registration scenarios pass.",
+          "status": "draft"
+        },
+        {
+          "id": "step-integration-matrix",
+          "title": "Validate cross-feature matrix",
+          "target": "workspace integration/system tests",
+          "action": "Run the full mode 0/1/2 × prompt off/confirm matrix across live/batch enrollment, presence, list, stable-ID remove/CAS, clear, auth, remote/noninteractive PAM, restart, cancellation, memory pressure, key failure, and password-fallback-compatible stacks.",
+          "validation": "Every supported combination passes without downgrade, pre-confirm camera access, stale data, raw embedding IPC, or leaked permits.",
+          "status": "draft"
+        },
+        {
+          "id": "step-ops-validation",
+          "title": "Validate packaging and operations",
+          "target": "systemd, PKGBUILD, .SRCINFO, installer tests, audit/fuzz harnesses",
+          "action": "Verify systemd units, packaging, install scripts, PAM ABI, protocol compatibility, fuzz targets, dependencies/licenses/advisories, and mode-specific sandbox behavior with reproducible commands.",
+          "validation": "systemd-analyze verify, installer/package simulations, bounded fuzz runs, dependency audit/license review, and PAM mocks pass or are explicitly unavailable.",
+          "status": "draft"
+        },
+        {
+          "id": "step-traceability",
+          "title": "Finalize claims and traceability",
+          "target": "README/operator sections and workplan evidence",
+          "action": "Record a requirement-to-test traceability matrix and precise security claims, including mode 2's narrow passive-memory benefit and prompt confirmation's inability to attest human input from malicious same-UID clients.",
+          "validation": "Every original requirement maps to implementation, tests, defaults, recovery, and documented non-guarantees.",
+          "status": "draft"
+        },
+        {
+          "id": "step-final-validation",
+          "title": "Complete final verification",
+          "target": "entire workspace",
+          "action": "Run formatting, check, clippy, workspace tests, targeted release tests/build, controlled performance suites, and baseline-diff review without concurrent production MIGraphX work.",
+          "validation": "All available checks pass; hardware/PAM/TPM gaps list exact commands and prerequisites; unrelated uncommitted changes remain intact.",
+          "status": "draft"
+        },
+        {
+          "id": "step-final-review",
+          "title": "Review complete implementation",
+          "target": "complete implementation and evidence",
+          "action": "Perform full adversarial implementation review.",
+          "validation": "code-checker reports no unresolved blocker/critical/major findings and confirms scope/spec alignment.",
+          "status": "draft"
+        },
+        {
+          "id": "step-final-fix",
+          "title": "Close final findings",
+          "target": "complete implementation",
+          "action": "Apply final findings, rerun affected and broad checks, and prepare approval/deployment handoff without committing or installing.",
+          "validation": "All findings are resolved, workplan evidence is current, and deployment remains a separate explicit user decision.",
+          "status": "draft"
+        }
+      ]
+    }
+  ],
+  "reviewFindings": [
+    {
+      "severity": "minor",
+      "title": "Importer and daemon staged-BMP size envelopes differ",
+      "detail": "Importer permits normalized BMP outputs larger than daemon's 8 MiB staged per-file cap. Align during final integration; normal 640x480 Python workflow is unaffected.",
+      "source": "crates/howy-cli/src/importer.rs; crates/howy-daemon/src/server.rs",
+      "status": "open"
+    },
+    {
+      "severity": "note",
+      "title": "Mode 1 key and cached AEAD review findings",
+      "detail": "All Mode 1 key/cache blocker/major findings were fixed and passed final adversarial review; detailed history remains in workplan notes.",
+      "source": "step-mode1-key/cache review notes",
+      "status": "resolved"
+    },
+    {
+      "severity": "major",
+      "title": "Provisioning rollback snapshot lacks file metadata",
+      "detail": "Prior file snapshot stores bytes plus opaque metadata hash but no restorable type/uid/gid/mode/nlink. Add canonical versioned metadata snapshot and bind hash for deterministic rollback.",
+      "source": "crates/howy-common/src/provisioning/mod.rs",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Cleanup admission is not descriptor-bound",
+      "detail": "Cleanup classifier accepts a boolean hash match without transaction/path/descriptor metadata binding. Require expected receipt identity and observed path/hash/type/uid/gid/mode/nlink exact match.",
+      "source": "crates/howy-common/src/provisioning/mod.rs cleanup contracts",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Enabled config can exceed provisioning size cap",
+      "detail": "true→false patch can exceed MAX_CONFIG_BYTES. Add checked output length and boundary test.",
+      "source": "crates/howy-common/src/provisioning/mod.rs config patch",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Readiness count and byte totals can be inconsistent",
+      "detail": "Readiness permits impossible record-count/ciphertext-byte tuples. Bind result to validated fingerprint and enforce checked per-record aggregate bound.",
+      "source": "crates/howy-common/src/provisioning/mod.rs readiness result",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Credential parser lacks independent positive fixtures",
+      "detail": "Accepted credential tests self-generate fixtures from implementation assumptions. Add independent systemd v261 host/TPM/combined positive fixtures and malformed/evidence vectors.",
+      "source": "crates/howy-common/src/provisioning/tests.rs",
+      "status": "open"
+    },
+    {
+      "severity": "note",
+      "title": "Staged artifact naming is misclassified",
+      "detail": "Classifier misses actual `.staged.<suffix>` names. Add complete transaction artifact forms.",
+      "source": "crates/howy-common/src/provisioning/mod.rs namespace classifier",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Strong readiness flags are not strictly paired",
+      "detail": "Strong readiness now requires --storage-readiness-only, --config, and --verify-records together; header-only accepts neither candidate flag.",
+      "source": "crates/howy-daemon/src/main.rs argument handling",
+      "status": "resolved"
+    },
+    {
+      "severity": "major",
+      "title": "Verifier deadline excludes setup/output and key drop",
+      "detail": "One 120-second absolute deadline now covers identity/config/key/model/namespace/serialization/output work; guarded key and scratch are dropped before the atomic write.",
+      "source": "crates/howy-daemon/src/main.rs readiness orchestration",
+      "status": "resolved"
+    },
+    {
+      "severity": "major",
+      "title": "Root status reports unobserved credential source",
+      "detail": "Mode 1 consumes an exact bounded no-follow source companion and root status reports the retained unit-configured source rather than inferring it from mode.",
+      "source": "crates/howy-daemon/src/main.rs runtime identity; mode1_key.rs",
+      "status": "resolved"
+    },
+    {
+      "severity": "major",
+      "title": "Strong readiness lacks production-boundary tests",
+      "detail": "The real readiness branch is behind injectable production-identical hooks with empty/nonempty/failure/timeout side-effect assertions and child-process stdout/exit tests.",
+      "source": "daemon readiness/main tests",
+      "status": "resolved"
+    },
+    {
+      "severity": "minor",
+      "title": "Readiness and startup namespace classifiers diverge",
+      "detail": "Production Mode 1 startup and strong readiness now use the common exact classifier; broad startup marker parsers were removed.",
+      "source": "storage/mode1.rs; storage/readiness.rs",
+      "status": "resolved"
+    },
+    {
+      "severity": "minor",
+      "title": "Verifier failure can leave partial stdout",
+      "detail": "Machine output requires pipe/FIFO stdout, validates PIPE_BUF, enables nonblocking mode, and uses one bounded write with full/EAGAIN/error tests.",
+      "source": "crates/howy-daemon/src/main.rs output",
+      "status": "resolved"
+    },
+    {
+      "severity": "minor",
+      "title": "Verifier stderr is not globally bounded/redacted",
+      "detail": "Strong readiness branches before tracing and maps all failures to one bounded static redacted stderr line.",
+      "source": "crates/howy-daemon/src/main.rs error path",
+      "status": "resolved"
+    },
+    {
+      "severity": "minor",
+      "title": "SecurityInfo enums lack strict validation",
+      "detail": "Common strict validation converts every SecurityInfo enum and rejects malformed bounded fields and inconsistent Mode0/Mode1 vectors.",
+      "source": "crates/howy-common/src/protocol.rs",
+      "status": "resolved"
+    },
+    {
+      "severity": "note",
+      "title": "Provisioning receipt hash lacks golden",
+      "detail": "A fixed receipt JSON fixture and SHA-256 now pin field order and schema-version stability.",
+      "source": "crates/howy-common provisioning tests",
+      "status": "resolved"
+    },
+    {
+      "severity": "major",
+      "title": "Strong readiness production boundary is not exercised",
+      "detail": "Actual main and tests now call the same DaemonRuntime-backed daemon_main entry. Runtime methods cover parse/deadline/identity/config/key/verifier/error/output and all normal side-effect gates; child tests assert exact call sequences and zero forbidden methods.",
+      "source": "crates/howy-daemon/src/main.rs readiness harness/tests",
+      "status": "resolved"
+    },
+    {
+      "severity": "minor",
+      "title": "Strong verifier panic bypasses stderr policy",
+      "detail": "A one-time global hook dispatches on an atomic verifier mode, writes one static redacted line, and the entire post-parse strong branch is catch_unwind-contained; child panic output is exact and stdout empty.",
+      "source": "crates/howy-daemon/src/main.rs panic/error path",
+      "status": "resolved"
+    },
+    {
+      "severity": "note",
+      "title": "Guard-page unmap test is flaky",
+      "detail": "The real partial guard failure and mincore observation execute consecutively in a single-threaded fork child, eliminating concurrent virtual-address reuse while retaining real wipe/unlock/munmap execution.",
+      "source": "crates/howy-daemon/src/mode1_key.rs test",
+      "status": "resolved"
+    },
+    {
+      "severity": "major",
+      "title": "Verifier panic containment is process-global",
+      "detail": "Synchronous process entry installs the dormant hook and parses arguments before Tokio construction. Strong mode runs on the initial thread with thread-local panic state and bounded static stderr writes; normal/header-only paths explicitly construct one multithread Tokio runtime.",
+      "source": "crates/howy-daemon/src/main.rs panic/runtime entry",
+      "status": "resolved"
+    },
+    {
+      "severity": "minor",
+      "title": "Verifier deadline excludes hook setup",
+      "detail": "Strong entry captures the absolute deadline origin as its first operation, before TLS arming or any first-use synchronization, and constructs the deadline from that origin inside containment.",
+      "source": "crates/howy-daemon/src/main.rs strong entry; storage/readiness.rs",
+      "status": "resolved"
+    },
+    {
+      "severity": "minor",
+      "title": "Real guarded cleanup test does not prove wipe and unlock",
+      "detail": "Cfg(test) instrumentation at the real disposal sequence observes all-zero key bytes before munlock, successful munlock, successful munmap, and immediate ENOMEM unmapped state in a single-threaded fork child.",
+      "source": "crates/howy-daemon/src/mode1_key.rs cleanup test",
+      "status": "resolved"
+    }
+  ],
+  "notes": [
+    "Research completed 2026-07-12: systemd credential/userspace AEAD is the recommended production backend; TPM Trusted Key plus AF_ALG is viable only as an experimental plaintext-reduced backend because AF_ALG is deprecated and slower than optimized userspace crypto.",
+    "Research completed 2026-07-12: prompt-before-capture confirmation is the recommended UX. Fixed Enter/OK is preferred over random challenges; an opaque one-use protocol token provides transaction freshness.",
+    "Mode 2 should overlap request-local decrypt/decode/validation with camera startup after confirmation and camera admission. Both branches must join before matching, and plaintext must be zeroized on every exit path.",
+    "A common AES-256-GCM record format is preferred for modes 1 and 2 because the kernel AF_ALG backend supports it. The format retains an algorithm identifier for future migrations.",
+    "Existing uncommitted repository changes and reports must not be overwritten or committed as part of this work without explicit approval.",
+    "Superseding earlier research notes: AF_ALG is rejected and removed from implementation scope. Mode 2 uses a `user`-type key linked only into the systemd-created private session keyring, transient `keyctl_read`, and userspace AES-GCM.",
+    "The detailed workplan is the normative v1 storage/security specification; implementation must not defer format, namespace, transition, CAS, authorization, or package-transaction decisions beyond the contracts slice.",
+    "`docs/ENROLLMENT_DESIGN.md` will become historical. Because committed documentation beyond README requires separate user approval, execution must either obtain that approval or mark the supersession in README and report the stale file explicitly.",
+    "Execution approved by user on 2026-07-12. Phase contracts begins serially because config, record, path, and storage contracts overlap shared common-crate files.",
+    "step-config-provenance completed: added distinct legacy/fresh constructors, loaded-config provenance, missing-whole-file failure, CLI fresh-template API, and four passing common config tests. Full cargo fmt remains blocked by pre-existing formatting drift in protocol.rs and integration tests; touched files pass rustfmt/diff checks.",
+    "Execution snag resolved for step-config-contract: detailed plan now freezes exact security/presence TOML field names, defaults, secure bootstrap constructor, and validation ranges. No user decision was required.",
+    "step-config-contract completed after schema clarification: numeric modes 0-3, security/presence nested config, secure bootstrap constructor, strict mode-aware validation, provenance coverage, and 15 passing targeted config tests.",
+    "step-record-spec completed: pinned aes-gcm 0.11.0, sha2 0.11.0, getrandom 0.4.3; added pure HOWYENC1/HOWYPLN1 codecs, canonical storage types, AES-GCM/model/legacy helpers, process-lifetime nonce generator, and 26 passing storage tests (44 total common tests). Review noted a theoretical legacy all-zero digest invariant for phase code-checker scrutiny.",
+    "step-mode-namespaces completed: typed canonical-only paths, mode directory/file permission constants, active/inactive inventory, purge targeting, and pure no-mutation transition decisions; 33 storage and 2 path tests pass.",
+    "step-epoch-policy satisfied by existing config/codec contract implementation: one active epoch, zero rejection, expected-epoch binding, initial/create generation helper, checked increment, overflow rejection, and targeted tests. Mutation backends must consume these helpers in the next phases.",
+    "step-storage-contract completed: pinned zeroize 1.9.0 alloc-only; added synchronous backend operations, sanitized errors, metadata/CAS types, validated flat auth models, cached/ephemeral leases, hard RAII plaintext budget, and test-only mock backend. 43 storage/61 common tests pass.",
+    "Contracts code-checker found no critical issue but two major zeroization blockers plus five lower-severity correctness/API/test findings. Advancement is paused for one scoped fix pass.",
+    "Contracts review cycle 3 completed. Final verifier confirmed GHASH/AES/state zeroization, buffer lifecycles, allocation accounting, vectors, and redacted domain types, but found public serialized plaintext byte types still expose contents through Debug. Workflow stop rule reached; phase blocked pending a bounded SensitiveBytes/redacted-Debug fix and verification.",
+    "User explicitly approved one additional bounded contracts fix/review cycle beyond the normal three-cycle limit, limited to redacted serialized plaintext bytes and decode scratch zeroization.",
+    "User-approved bounded exception completed successfully: SensitiveBytes now redacts serialized plaintext Debug and owns zeroizing bytes; float decode uses borrowed byte arrays. Final targeted code-checker found no remaining issue. Contracts phase gate cleared with 57 storage and 75 common tests passing.",
+    "step-mode0 completed: concrete dirfd-relative plaintext backend, bounded legacy bincode/JSON conversion, HOWYPLN1 first-mutation conversion, CAS/stable-ID operations, atomic fsync/rename writes, sanitized errors, budgeted leases, and 14 daemon storage tests. Phase review should scrutinize global-vs-per-user mutation locking and multi-file clear crash semantics.",
+    "step-authz-matrix completed: centralized pure authorization policy with bounded getpwnam_r resolver, canonical NSS equality, all current/planned operation rules, side-effect gate, handler integration, generic denials, and public Info path redaction. 11 authorization, 31 server, and 2 protocol tests pass.",
+    "step-daemon-crud completed: storage backend initialized in daemon, modes 1-3 fail explicitly, auth/enrollment/batch/presence/list/remove/clear/reload/security info routed through backend, CLI CRUD uses stable IDs+generation, PAM uses presence IPC, and raw enrollment embeddings were removed. Validation: 79 common, 15 daemon storage, 33 server, 11 authorization, 3 CLI, 2 PAM tests plus workspace check.",
+    "step-detect-contract completed after resumed pass: protobuf tag 7 reserved, metadata-only constructors, detector-only InferenceEngine::detect path, and old/new wire privacy tests. 6 protocol and 34 server tests pass.",
+    "step-cache-coherence completed: reusable daemon LRU cache, shared hard budget permits, per-user weak lock registry, no-stat warm hits, synchronous mutation replacement/invalidation, reload barrier, and 25 storage tests. Existing multi-file clear durability remains explicit review item.",
+    "Daemon-storage adversarial review completed. Validation passed for common storage/protocol, CLI, PAM, workspace check, and diff check; daemon tests could not link in the review environment because libonnxruntime/OrtGetApiBase was unavailable. One high and five medium findings block advancement; two low findings are included in the bounded fix pass.",
+    "Daemon-storage fix pass implemented all eight open findings. Reported validation: 58 common storage, 7 common protocol, 27 daemon storage, 39 daemon server, 10 daemon authorization, 5 CLI, and 2 PAM tests pass; workspace check, targeted rustfmt, and diff check pass using `/usr/lib` dynamic ORT for daemon tests. Final adversarial re-review is pending.",
+    "First storage fix re-review: clear ordering, Boolean presence, empty-record handling, RNG scope, and original live silent-loss path are fixed. Advancement remains blocked by a high lock-order deadlock. Residual medium issues require side-effect-free versioned live+batch operations, complete hard-budget accounting, and no-symlink path traversal; handler-level side-effect tests are also required.",
+    "Second storage fix pass reports: uniform reload-before-user lock hierarchy; new oneof tags for side-effect-free mixed-version live/batch enrollment; component-wise no-follow directory traversal; 128 MiB live frame reservation; bounded zeroizing PNG/BMP batch decode with JPEG rejected; dispatch-level zero-side-effect tests. All targeted suites/checks pass. Residual concern: worst-case enrollment plus commit capacity exceeds the 128 MiB default plaintext budget, so default enrollment may fail closed pending review.",
+    "Second storage re-review resolved lock hierarchy, versioned-operation compatibility, component-wise descriptor traversal, and production-boundary side-effect tests. Phase is blocked on a user-facing design decision: strict hard-memory accounting conflicts with the 128 MiB default and the pinned PNG/JPEG decoders. Current default deterministically rejects live and batch enrollment; live capture can hold multiple frames/scratch; PNG lacks contractual strict/zeroizing internal allocation; JPEG is advertised but rejected.",
+    "User approved 2026-07-12: preserve the Python enroller unchanged and add the already locked workspace `image` dependency to howy-cli. Implement a transparent unprivileged Rust importer launched by the root CLI under validated SUDO_UID/GID with no-new-privileges and resource bounds; compressed source images remain debug artifacts, importer streams normalized BMP into root-owned staging, and the daemon processes only strictly bounded BMP. Continue autonomously.",
+    "Final storage fix implementation reports a hidden unprivileged howy importer with hostile framed stdout, root-owned staging, resource/credential sandboxing, PNG/JPEG/BMP normalization, BMP-only daemon parsing, and unchanged Python enroller. Live accounting now caps normalized frames at 32 MiB, accounts two frames/mmap/decoder/inference scratch, and zeroizes image buffers. Calculated total reservations: live 104,063,287 bytes (99.24 MiB), batch 111,721,472 bytes (106.55 MiB), under 128 MiB. 13 CLI, 58 common storage, 7 protocol, 28 daemon storage, 10 authorization, 44 server, 54 camera, 6 inference, and 2 PAM tests pass; workspace/rustfmt/diff checks pass. Final cycle review pending.",
+    "Cycle-three final review: unprivileged importer architecture accepted; PNG/JPEG decoder findings resolved; Python enroller unchanged; batch/default admission resolved. Advancement is blocked by one high live-camera budget/profile finding: supported DCI-4K MJPEG can compute ~129.49 MiB, V4L2 can renegotiate beyond the admitted cached profile, FFmpeg fallback lacks an enforceable envelope, and inference output/candidate bounds are incomplete. Medium follow-ups: importer process-group containment, canonical BMP-only parser acceptance, and removal/scoping of capture backpressure to preserve authentication freshness. Workflow stop rule reached; no fourth fix cycle without explicit user approval.",
+    "User explicitly approved one additional bounded correction/review cycle beyond the normal three-cycle stop rule. Scope is limited to format-specific live peak accounting, V4L2 profile enforcement, bounded FFmpeg envelope, overwrite-latest authentication semantics, importer process-group containment, canonical BMP acceptance, and staging cleanup. Python, dependencies, config defaults, models, deployment, and unrelated files remain out of scope.",
+    "User-approved extra fix implementation reports: format-specific GREY/YUYV/MJPEG phase maxima; post-S_FMT profile equality before mmap/stream; V4L2-only live enrollment with FFmpeg authentication fallback preserved; overwrite-latest authentication and enrollment-only backpressure; exact canonical BMP parser; importer dedicated session/process-group teardown; immediate staging RAII. Maximum totals including storage: GREY 64,310,768, YUYV 131,419,616, 1080p MJPEG 109,301,584, batch 111,785,216 bytes, all below 134,217,728. DCI-4K MJPEG rejects before camera. 14 CLI, 57 camera, 45 server, 7 inference, 28 storage, 10 authorization, 58 common storage, 7 protocol, and 2 PAM tests pass; final adversarial review pending.",
+    "Final approved-exception review passed the daemon-storage gate with no critical/high findings. All five bounded findings resolved. One medium follow-up remains: importer can emit canonical BMPs above daemon's 8 MiB per-file staged cap despite both sides allowing up to 32 MiB active pixels; normal 640x480 Python enrollment is unaffected. Phase may complete and prompt phase may begin. Hardware/real-sudo/real-model checks remain qualification risks, not source blockers.",
+    "step-pam-conversation implementation added an intentionally unwired PAM_PROMPT_ECHO_ON helper in howy-pam. Accepted responses are empty Enter or exact uppercase ASCII OK; PAM_SILENT and all malformed/cancel/error paths map to PAM_AUTHINFO_UNAVAIL. RAII frees callback strings/array. 12 PAM tests, package check, rustfmt, and diff check pass. Adversarial review pending.",
+    "PAM conversation adversarial review found one medium ABI ownership issue: failed pam_conv callbacks retain cleanup responsibility, so caller must check status before touching *resp. Success ownership, ABI shape, prompt lifetime/policy, PAM_SILENT, fallback semantics, panic wrappers, and unwired state were verified.",
+    "PAM ownership fix implemented: failed callbacks return before any response access/free; failure mocks free partial resources and publish null; null appdata and actual exported-entry panic containment tests added. 13 debug and 13 release PAM tests, package check, rustfmt, and diff check pass. Final focused re-review pending.",
+    "step-pam-conversation final review passed with no findings. Linux-PAM ABI shape, callback ownership, response cleanup, null appdata, PAM_SILENT, strict Enter/OK policy, fallback status, exported-entry panic containment, and intentionally unwired state were verified with 13 debug/release tests.",
+    "step-prompt-protocol initially stopped without changes because exact wire details were missing. A plan-checker reviewed the proposed schema and required explicit LOCAL/REMOTE origin, removal of client scan timeout, a post-commit response deadline, snapshot invalidation semantics, exact error/state matrix, and CLI refusal under confirm. The corrected v1 contract is now frozen in the Markdown plan; workplan validation passed.",
+    "step-prompt-protocol implementation added frozen tags 18-20/17-18, strict validators, same-connection IPC, injected connection-local sequencing/final-response ownership, fail-closed old/new behavior, and howy-test refusal under prompt-required status. Production Begin remains prompt_unavailable; PAM prompting, random tokens, global state, expiry, auth activation, lazy camera, and HUP supervisor remain deferred. Reported: 96 common, 157 daemon (1 ignored), 15 CLI, 13 PAM tests plus workspace/rustfmt/diff checks pass. Adversarial review pending.",
+    "Prompt protocol review found one high mixed-version CLI downgrade and two medium coverage/deadline issues. Frozen plan amended: request tag 21 AuthenticateV1 is required for howy test and atomically policy-gated; legacy tag 1 is never retried; prompt client applies commit_response_timeout_ms plus fixed 250ms margin. Production framed coordinator coverage is required before advancing.",
+    "Prompt protocol fix pass implemented AuthenticateV1 tag 21 for howy test with no status preflight/legacy retry, production coordinate_prompt_connection exercised over real UnixStream framing with injected test issuance and side-effect hooks, and commit socket timeout set to advertised deadline + 250ms. Reported: 97 common, 161 daemon (1 ignored), 15 CLI, 13 PAM tests plus workspace/rustfmt/diff checks pass. Re-review pending.",
+    "step-prompt-protocol final re-review passed with no findings. AuthenticateV1 tag 21 closes old-daemon downgrade; production framed coordinator tests use real IPC/authorization/response writes; advertised commit timeout +250ms is applied. Global token/expiry/snapshot state, lazy camera, active HUP supervisor, and PAM activation remain deferred.",
+    "step-prompt-state implementation added daemon-lifetime PromptTransactionManager with OS entropy, instance-keyed SHA-256 lookup, lifetime token non-reuse, redacted/zeroizing sensitive values, per-UID/global pending and single active capacity, post-write expiry, policy/storage/candidate revalidation, cancellation/deadline/shutdown state, and production coordinator integration. Commit deliberately returns prompt_unavailable before auth/camera. Reported: 179 daemon lib + 6 daemon bin, 97 common, 15 CLI, 13 PAM tests and workspace/rustfmt/diff checks pass. Adversarial review pending.",
+    "Prompt-state adversarial review blocked advancement with two high findings and six medium/low cleanup findings. Positive checks confirmed OS CSPRNG, digest token lookup, generic invalid behavior, idempotent cancellation, defensible active bound, one manager before acceptance, and no auth/inference/camera activation.",
+    "User-requested temporary cleanup completed: removed only named Howy/ORT artifacts under /tmp and pruned their stale Git worktree metadata. Preserved `/home/lucas/Projects/howy` performance-branch changes and continued in non-temporary `/home/lucas/Projects/howy-mainline`, which owns this workplan. Prompt-state fix pass reports all eight findings addressed with 100 common, 185 daemon lib (1 ignored), 6 daemon bin, 15 CLI, and 13 PAM tests plus workspace/rustfmt/diff checks; re-review pending.",
+    "Prompt-state fix re-review: bounded tokens, provisional capacity, commit claim structure, backend identity, absolute reads, poison handling, connection digests, and production no-side-effect integration substantially resolved. Gate remains closed on stale pre-lock deadline sampling, remaining capability copies, Mode 0 pre-confirm full decode, and production entropy integration coverage.",
+    "Second prompt-state fix pass reports under-lock Commit/Cancel deadline sampling, cancelled/deadline-aware promotion, zeroizing capability owners/guards with sanitized client PromptMetadata, bounded 126-byte HOWYPLN1 header inspection, streaming legacy generation without model decode/budget use, and production OS-entropy coordinator coverage. Reported: 101 common, 189 daemon lib (1 ignored), 6 daemon bin, 15 CLI, 13 PAM tests plus workspace/rustfmt/diff checks pass. Final state re-review pending.",
+    "Final prompt-state review resolved deadline linearization, zeroization, bounded Mode 0 inspection, envelope arithmetic, production entropy, and prior manager invariants, but found one high ownership-transfer bug: successful CommitClaim promotion is immediately cancelled by the consumed claim's Drop.",
+    "Contained active-lease handoff fix implemented in prompt_state.rs: successful promotion disarms CommitClaim Drop; abandoned claims remain armed; release_active no longer duplicates cancellation. Six lifecycle tests, 192 daemon lib (1 ignored), 6 daemon bin tests, rustfmt, and diff check pass. Final focused review pending.",
+    "step-prompt-state final gate passed with no findings. All prompt-state review issues are resolved: bounded token construction, provisional/commit RAII claims, opaque backend identity, zeroizing capabilities, absolute deadlines, capacity ordering, fail-closed poison handling, connection digests, under-lock expiry, header-only Mode 0 inspection, production entropy, and live ActiveLease handoff. 18 focused state and 192 daemon tests pass.",
+    "step-lazy-camera implementation added injectable profile/provider/factory/capture lifecycle events and retryable Idle→Probing→Ready/Failed/Shutdown state. Confirm mode performs zero camera events through startup/socket/Begin/pending/cancel/malformed/expiry/EOF/HUP/shutdown/restart; valid Commit hands a cold lazy handle to deferred active work. Prompt-off retains one eager probe; root enrollment remains independent. Reported: 201 daemon lib (1 ignored), 6 daemon bin, 101 common, 15 CLI, 13 PAM tests plus workspace/rustfmt/diff checks pass. Adversarial review pending.",
+    "Lazy-camera adversarial review blocked advancement with one high and three medium findings. Confirm-mode idle startup/Begin behavior, ordinary retry/coalescing, shutdown wake, prompt-off eager reuse, exact-profile enforcement, FFmpeg policy, freshness, and zeroization remain intact.",
+    "Lazy-camera fix pass reports panic-safe probe generation guards, typed stale-profile invalidation after cleanup, real admission-serialized probes with already-held proof, automatic discovery DeviceOpen instrumentation, and full run_with_camera_hooks server lifecycle coverage. Reported: 209 daemon lib (1 ignored), 6 daemon bin and all workspace targets including 101 common/15 CLI/13 PAM/44 FP16 tests pass; re-review pending.",
+    "Lazy-camera re-review resolved panic recovery, admission-serialized probing, and production instrumentation/server-path coverage. One medium stale-profile invalidation race remains: invalidation must be generation-conditional and occur while synchronous/reaper cleanup still owns admission.",
+    "User advisory: a VM may temporarily disconnect the physical Howy camera. Continue repository-only/mock validation; do not run physical camera operations, and treat hardware-dependent failures as environmental until user confirms restoration. Stale-profile generation-token fix reports four focused tests, 212 daemon tests (1 ignored), and full workspace/all-target checks passing; final lazy-camera review pending.",
+    "step-lazy-camera final review passed with no findings. Generation-bound invalidate_if_current resolves stale-profile cleanup races; probe panic recovery, admission serialization, complete production lifecycle instrumentation, confirm zero pre-Commit events, prompt-off eager reuse, and root enrollment independence are verified. 212 daemon and 392 workspace tests pass without physical camera access.",
+    "User reports the physical camera is connected again. Continue autonomously but retain the existing no-hardware-run constraint absent explicit qualification approval. step-active-cancel implementation now promotes ActiveLease into one subordinate auth worker, keeps supervisor as sole terminal writer, monitors HUP/EOF/unexpected data/shutdown/deadline, propagates cancellation through camera/storage, overlaps first-frame/storage, and bounds cleanup. Reported: 215 daemon lib (1 ignored) and full workspace tests pass; adversarial review pending.",
+    "Active-cancel adversarial review blocked advancement with one high and three medium findings. Chosen bounded correction: direct camera cancellation plus fail-stop daemon run when a resource-owning worker exceeds cleanup, provisional Mode 0 cache publication, single client-side transport margin, strict remaining-time polling, and production-boundary race tests.",
+    "Recovered active-cancel fix pass: direct camera cancellation endpoint, fatal server-run shutdown for uncooperative probe/start/frame/storage/inference/cleanup, supervisor-only conditional Mode 0 provisional cache promotion, cleanup counted once, server machine ceiling without margin, client-only 250ms margin, and strict remaining-time polling. Reported: 401 workspace tests pass (221 daemon, 1 ignored), workspace check/rustfmt/diff checks pass. Final adversarial review pending.",
+    "Active-cancel re-review confirmed direct camera cancellation, fail-stop return/systemd restart policy, provisional Mode 0 cache promotion, and deadline math. Two medium issues remain: post-accept/pre-dispatch fatal gates and complete production result/cache/post-fatal/late-registration race coverage.",
+    "Final active-cancel race pass added post-accept and worker pre-dispatch fatal gates, real committed-auth result precedence matrix, late resource registration, real framed Mode 0 provisional promotion races, and pre/post-release fail-stop resource assertions. Reported: 225 daemon lib (1 ignored), 405 workspace tests, workspace check/rustfmt/diff checks pass. Final review pending.",
+    "step-active-cancel final review passed with no findings. Direct cancellation, fail-stop daemon return, sole response ownership, provisional Mode 0 cache, strict deadlines, fatal accept/dispatch gates, and production result/cache/blocking race matrices are verified with 405 workspace tests. PAM activation may now begin.",
+    "step-prompt-policy implementation activated PAM-native adaptive presentation: PAM_SILENT zero-IPC fallback, checked PAM_SERVICE/RHOST to exact service and LOCAL/REMOTE context, fresh nonce BeginAuthV1, fixed PAM_PROMPT_ECHO_ON Enter/OK, same-connection Commit/Cancel, and exact prompt-off fallback to AuthenticateV1 tag 21 only. Daemon rechecks allowlist/local_only/policy snapshot; service is documented in code/tests as client-supplied, not attested. Reported: 19 PAM debug/release, 228 daemon (1 ignored), 415 workspace tests pass; adversarial review pending.",
+    "PAM prompt-policy review blocked advancement with one high, one medium, and one low finding: absolute client framed deadlines, explicit pending Drop/panic Cancel, and end-to-end zeroizing nonce ownership. ABI, PAM_SILENT, service/origin policy, presentation ownership, no-downgrade, and status mapping were verified.",
+    "Prompt-policy fix pass added absolute monotonic Begin/Commit/Cancel framed deadlines (10s, advertised+250ms, 250ms), disarmable pending Drop/unwind Cancel guard, exported post-Prompt panic IPC test, and zeroizing PromptNonce/borrowed Begin constructor. Reported: 11 IPC, 20 PAM debug/release, 418 workspace tests pass; final policy re-review pending.",
+    "step-prompt-policy final review passed with no findings. Absolute PAM IPC deadlines, pending Drop/panic Cancel, and zeroizing nonce ownership are verified; PAM-native GUI/TTY presentation, PAM_SILENT fallback, exact service/origin policy, and tag21-only prompt-off path remain intact. One unrelated release tracing test failure is tracked for final integration.",
+    "Whole phase prompt review requires prompt-fix before Mode 1. Positive checks passed for wire, PAM ABI/presentation, token state, zero pre-Commit camera behavior, active fail-stop/sole response, provisional cache, and no-downgrade. Fix scope: supervised Commit revalidation, absolute Commit-to-camera and framing deadlines, metadata-only legacy prompt identity, and README claim limitation.",
+    "step-prompt-fix implemented all whole-review findings: supervised Commit revalidation, absolute Commit-to-camera deadline, absolute tag21 and initial daemon framing deadlines, zero-payload-read legacy metadata identity, and README claim limitation. Reported: 232 daemon tests (1 ignored), full debug workspace, 21 PAM release tests pass; release workspace only fails the separately tracked tracing INFO test. Final whole-prompt re-review pending.",
+    "Final whole-prompt re-review closed five of six findings and found one medium correctness race: capture succeeds before camera deadline, but a post-storage-join cancellation check discards it if storage completes later within its own budget. One bounded fix remains.",
+    "Final prompt timing fix removed the post-storage camera-deadline reclassification, preserves capture-boundary timeliness, and separately checks active cancellation/overall/storage outcomes. Focused debug/release timing, HUP/fail-stop, 233 daemon (1 ignored), full debug workspace, release daemon/PAM checks pass. Final focused review pending.",
+    "Final timing review confirmed the server-side race fix but found one narrow production camera boundary gap: cancellation/deadline must be rechecked immediately before returning a captured frame. No other prompt regression remains.",
+    "Final production capture fix added immediate pre-return cancellation/deadline recheck, explicit rejected-frame zeroization, and zero-copy normal success coverage. Focused debug/release, 234 daemon (1 ignored), full debug workspace, release daemon, rustfmt/diff checks pass. Final approval check pending.",
+    "Final prompt phase approved: no prompt findings remain. Mode 1 next step is step-mode1-key and requires repo configuration changes for systemd encrypted credential loading and shipped bootstrap/templates. Awaiting explicit config-file approval; no live `/etc`, systemctl, TPM, credential, install, or service changes are proposed.",
+    "User approved planned repository systemd/config/template/package edits for Mode 1; live machine changes remain prohibited. Verified systemd 261 official semantics: pathless LoadCredentialEncrypted searches passed credentials and encrypted credstores; missing pathless credential is non-fatal at unit layer; systemd decrypts TPM2, host, or host+TPM2 credentials into CREDENTIALS_DIRECTORY. Daemon will require exact 32 bytes only when configured Mode 1 and never invoke systemd-creds.",
+    "step-mode1-key implementation added pathless systemd encrypted credential load, 64K memlock/no-core unit hardening, strict mode-aware CREDENTIALS_DIRECTORY loader, three-page guarded mapping with mlock/MADV_DONTDUMP/MADV_DONTFORK, borrowed key access, redacted SHA-256 identity, and zeroize-before-unlock cleanup. Reported: 13 debug/release key tests, 438 workspace tests, systemd-analyze verify, rustfmt/diff checks pass. Adversarial review pending; no live credential/TPM/service operation occurred.",
+    "Mode1 key adversarial review blocked cache work: one critical root-FFmpeg credential exposure, three high binary/startup/API findings, and test/identity cleanup. Official systemd unit semantics are correct; guard mapping and loader traversal were otherwise positive. Fix pass must establish child isolation or disable Mode1 FFmpeg.",
+    "Mode1 key fix pass added centralized production child_spawn sandbox, absolute/root-owned FFmpeg validation, parent-opened no-follow camera FD, env/FD allowlist, nobody privilege drop/no_new_privs/regain checks, listener CLOEXEC, exact binary reads/EINTR, consuming storage ownership before inference, random backend identity, and real mmap/fork/traversal/canary tests. Reported: 22 key, 7 sandbox, 8 startup, 456 workspace tests plus release/systemd/rustfmt/diff checks pass; re-review pending.",
+    "Second Mode1 key review confirms critical credential reopening fixed and binary/startup/API/identity findings resolved. Remaining blockers: PDEATHSIG reset after privilege drop and camera-group access for FFmpeg proc-fd reopen. Dedicated howy-ffmpeg sysusers identity and model/key alias rejection are required.",
+    "Final Mode1 child isolation pass added post-drop PDEATHSIG reapply/verify/parent check, dedicated howy-ffmpeg sysusers identity, exact camera GID/reopen and credential-denial checks, descriptor-bound model resolution/key dev+ino alias rejection, and explicitly ignored disposable-root qualification tests. Reported: 464 workspace tests (3 ignored), release focused suites, systemd verify/sysusers dry-run/rustfmt/diff checks pass; final key review pending.",
+    "Third Mode1 key review resolved PDEATHSIG, camera group/reopen, shared identity design, and root-test reporting. Remaining blockers are deployment of sysusers identity and one pinned recognizer descriptor across storage/ORT; Mode0 alias and account lock/uniqueness should close in same pass.",
+    "Final Mode1 key pass installed sysusers config through all package variants/local installer, pinned systemd>=257, added exact local passwd/group/shadow validation and non-destructive uninstall, pinned one detector/recognizer descriptor across storage/provider/CPU/self-test, and extended metadata-only key alias rejection to Mode0. Reported: 10 installer scenarios, 467 workspace tests (3 ignored), release focused suites, makepkg/srcinfo/sysusers/systemd/bash/rustfmt/diff checks pass; final key gate pending.",
+    "Final Mode1 key review found no remaining critical/high key/model/child issue. One medium local-installer transaction gap remains: sysusers setup must precede runtime replacement or all artifacts require rollback. Bounded ordering fix required before cache work.",
+    "Recovered final installer transaction fix: sysusers account setup/validation now precedes unit-state queries, stops, and artifact replacement; precommit failure restores sysusers definition, retains created accounts, leaves all runtime artifacts/service state untouched, and only restarts units actually stopped. Installer mock suite reports 12 passing scenarios; final key gate pending.",
+    "step-mode1-key final review passed with no findings. Systemd encrypted credentials, guarded key memory, child isolation/dedicated identity, exact binary reads, storage-before-inference ownership, package/local account transactions, pinned model descriptors, and Mode0 alias guard are approved. Disposable-root/live credential/V4L2/pacman qualification remains deferred.",
+    "step-mode1-cache resumed validation completed 2026-07-13: existing implementation satisfies the approved cached-AEAD scope without provisioning changes. Focused debug/release passed: 64 common storage tests; 16 Mode 1 backend tests; 23 Mode 1 key tests passed with 1 disposable-root test ignored; prompt pre-camera ordering test; and 2 startup ordering/failure tests. Full `/usr/lib` dynamic-ORT mock workspace passed 487 tests with 3 ignored. Touched Rust files pass rustfmt check, git diff check passes, and no Mode 1/workspace transaction temp artifacts remain.",
+    "Recovered step-mode1-cache implementation: Mode1 backend owns guarded key, header-only readiness, first-load HOWYENC1 decrypt, zero-event warm cache, provisional prompt promotion, OS-random duplicate-tracked nonces, encrypted atomic CRUD, shared budget, cancellation, and Mode0 regression coverage. Reported: 106 focused debug/release and 487 workspace tests pass. Agent prematurely marked complete; parent restored review gate.",
+    "Mode1 cache adversarial review blocked provisioning: two high crypto/durability findings and medium cache/memory/readiness issues. Fix split serially into vendored crypto/nonce/SHA pass then backend durability/admission/integration pass.",
+    "Mode1 cache crypto sub-pass completed: vendored AES 0.9.1/AES-GCM 0.11.0/POLYVAL 0.7.2/GHASH 0.6.0 patches wipe reviewed source-level addressable scratch; retained state still zeroizes. Nonce tracker is fixed at 65,536 accepted process-local nonces with no eviction/reuse. Daemon SHA consolidated to 0.11. Reported: 490 workspace tests plus native/forced-software/vendor/Wycheproof/debug/release checks pass. Backend transaction pass remains.",
+    "Mode1 cache backend fix pass completed: uncertain durability permanently poisons backend and invalidates cache; clear is rename+fsync+unlink+fsync with rollback/poison; warm prompt fast path allocation-tested; provisional promotion follows successful Success/AuthFailed terminal write; actual-shape admission/permit transfer and allocation-free duplicate validation implemented; streamed recognizer hash/capped namespace readiness; concrete framed Mode1 race matrix added. Reported: 498 workspace tests (3 ignored), focused debug/release suites pass. Full cache re-review pending.",
+    "Second Mode1 cache review resolved poisoning, clear, nonce bound, readiness, SHA, and major admission issues. Remaining high is uncovered AArch64/VAES zeroization; medium publication linearization, exact mutation capacity, and stale-temp recovery plus warm instrumentation/diagnostic/tracing cleanup.",
+    "User reconfirmed AES-256-GCM as the authoritative HOWYENC1 v1 algorithm. ChaCha20/XChaCha20-Poly1305 is deferred to a future versioned algorithm/format and is not in current scope. Final backend pass reports publication linearization, exact boxed plaintext ownership, bounded crash-artifact recovery, all warm zero-allocation paths, Mode1 diagnostics, and opt-in release perf tracing fixed with 507 debug/release workspace tests passing; final cache review pending.",
+    "Third Mode1 cache review leaves one AArch64 composite-construction unwind gap, one allocator-byte peak evidence gap, and low post-write deadline/shutdown race coverage. Full debug/release workspace is otherwise green at 507 tests.",
+    "Final Mode1 cache evidence pass completed: AArch64 public AES composite construction guards original/inverse ownership on unwind; byte-aware thread-scoped allocator instrumentation measures live/peak/realloc/dealloc layouts across cold/append/remove/provisional/cache/eviction/leases; blocked post-write deadline/shutdown races prevent publication. Reported: 508 debug and 508 release workspace tests (3 ignored), crypto vectors/rustfmt/diff checks pass. Final cache gate pending.",
+    "Final Mode1 cache review finds no production defect; one medium verification gap remains. Allocator evidence must tag allocations at allocation time and maintain temporal plaintext live/peak instead of subtracting cumulative non-plaintext totals.",
+    "Final allocation-evidence fix tags each allocator entry PlaintextSensitive/Infrastructure at allocation time, tracks independent temporal plaintext live/peak, removes cumulative exclusions, and adds staggered masking/nested/realloc/TLS teardown self-tests. Exact cold/append/remove/provisional/cache/lease scenarios now assert plaintext peak directly against permits. Reported: 509 debug/release workspace tests (3 ignored) plus crypto smoke/rustfmt/diff checks pass. Final cache approval pending.",
+    "step-mode1-cache final review approved with no remaining findings: 509 debug/release workspace tests pass. AES-256-GCM remains v1. Provisioning plan-checker identified pre-implementation blockers requiring normative corrections: V1 nonempty new-key refusal, explicit absolute credential drop-in, non-PK systemd-creds policy, read-only strong verifier, durable journal/receipt, exact config patch, unit-state recovery, and Arch ownership bridge.",
+    "Provisioning plan passed final plan-checker gate after persistent transaction guard, journal phases, explicit credential source, non-PK/PCR validation, strong verifier, receipt/config patch, unit/cleanup policy, release-N bridge, and distinct create_if_absent/replace_exact_packaged_payload corrections. Implementation will proceed serially: pure contracts, daemon verifier/status, CLI transaction engine, release-N packaging/installer, final review.",
+    "Pure provisioning contract review blocked daemon integration with two high schema gaps plus bounded size/readiness/fixture/classifier fixes. Systemd v261 IDs/layout/PCR policy and journal/config/fingerprint core were otherwise verified.",
+    "Daemon strong-readiness review blocked CLI engine with four high integration findings and bounded classifier/output/error/enum/golden issues. Core descriptor inventory/decrypt/fingerprint/empty semantics are otherwise verified.",
+    "Daemon strong-readiness review closure completed: strict three-flag matrix, one whole-operation deadline, source companion, injectable production harness with child-process evidence, shared namespace classifier, atomic nonblocking pipe output, bounded redacted stderr, strict SecurityInfo validation, and receipt golden all pass debug/release workspace tests.",
+    "Readiness re-review verifies flags/deadline/source/atomic output/status core but blocks CLI engine on real daemon_main harness coverage and panic stderr containment; one guard unmap test is flaky under parallel address reuse.",
+    "Final daemon-readiness gate closed: actual daemon_main now uses one production/test runtime interface; child processes cover exact entry success/failure/timeout/panic/output/flag rejection; static panic dispatch is bounded/redacted; guarded unmap observation runs race-free in a single-threaded child. Debug/release workspaces pass.",
+    "Final readiness gate remains blocked by process-global panic handling under multithread Tokio, deadline start ordering, and real cleanup-stage evidence. Core verifier/runtime child coverage remains verified.",
+    "Final runtime/cleanup follow-up closed: synchronous process entry parses before any Tokio runtime; strong readiness stays on the initial thread with an absolute deadline derived before TLS arming; normal/header-only paths construct exactly one Tokio multi-thread runtime and block_on the existing async flow. Panic interception is thread-local and static strong failures use bounded best-effort libc stderr writes. Real guarded disposal now has cfg(test), nonallocating production-sequence observations for zeroization-before-unlock, successful munlock, successful munmap, and immediate ENOMEM unmapped state in a fork child. Focused debug/release, repeated parallel, and full debug/release workspaces pass (556 passed, 3 ignored).",
+    "Daemon strong-readiness/status final gate approved: synchronous pre-Tokio verifier, strict flags/config/source companion, empty/nonempty sequential authentication, atomic output, bounded panic/errors, root runtime identity, and real cleanup stages pass 556 debug/release workspace tests. CLI transaction engine may proceed; no live authorization implied.",
+    "CLI transaction-engine continuation 2026-07-14: current systemd v261 source confirmed named `systemd-creds encrypt` outputs use atomic path replacement, so `/proc/self/fd/N` is not a valid output pathname. Corrected exact argv to `encrypt - -` and bound child stdout directly to an anonymous memfd. Also fixed receipt rollback size selection, rejected unsafe Mode-0 config metadata before journaling, stopped journaled readiness transients during rollback/recovery, retained guard+journal on changed transaction-owned artifacts, and returned exact cleanup commands from crash recovery. CLI debug/release tests pass (37 each); targeted rustfmt and git diff checks pass. Full `cargo fmt --all -- --check` remains blocked by pre-existing formatting in tests/debug_scrfd.rs and tests/real_face_test.rs. Clippy remains blocked by pre-existing common/CLI warnings outside this slice. Temporary ORT symlink directory was removed. Packaging/installer slice and adversarial transaction-engine review remain pending."
+  ],
+  "status": "in_progress",
+  "createdAt": "2026-07-11T19:01:30.768Z",
+  "updatedAt": "2026-07-14T01:12:24.674Z"
+}

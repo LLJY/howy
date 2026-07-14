@@ -16,21 +16,109 @@
 use std::collections::VecDeque;
 use std::io::{self, Cursor, Read};
 use std::os::fd::AsRawFd;
-#[cfg(target_os = "linux")]
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::pin::Pin;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdout};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use howy_common::storage::CancellationSignal;
 use tracing::{debug, info, warn};
 use v4l::buffer::Type as BufType;
 use v4l::io::traits::CaptureStream;
 use v4l::video::Capture as CaptureTraitImport;
+
+use crate::child_spawn::DaemonChildPolicy;
+use crate::prompt_state::ActiveResourceCancellation;
+
+/// Observable camera lifecycle boundaries. Events contain no device path or
+/// negotiated-profile details, so test instrumentation cannot accidentally
+/// widen non-root diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CameraLifecycleEvent {
+    ProfileProbe,
+    DeviceOpen,
+    ConfigureProfile,
+    StreamStart,
+    FrameRead,
+    StopCleanup,
+}
+
+/// Injectable observer used at the production camera call sites.
+pub trait CameraLifecycleObserver: Send + Sync {
+    fn observe(&self, event: CameraLifecycleEvent);
+}
+
+#[derive(Default)]
+struct NoopCameraLifecycleObserver;
+
+impl CameraLifecycleObserver for NoopCameraLifecycleObserver {
+    fn observe(&self, _event: CameraLifecycleEvent) {}
+}
+
+fn default_lifecycle_observer() -> Arc<dyn CameraLifecycleObserver> {
+    Arc::new(NoopCameraLifecycleObserver)
+}
+
+/// Immutable camera settings passed to an injectable profile provider.
+#[derive(Clone)]
+pub struct CameraProfileRequest {
+    device_path: String,
+    width: i32,
+    height: i32,
+    fps: i32,
+    exposure: i32,
+}
+
+impl CameraProfileRequest {
+    pub fn new(device_path: String, width: i32, height: i32, fps: i32, exposure: i32) -> Self {
+        Self {
+            device_path,
+            width,
+            height,
+            fps,
+            exposure,
+        }
+    }
+}
+
+/// Profile discovery hook. Production and tests share the same daemon cache
+/// and coordinator; tests replace only the physical-device boundary.
+pub trait CameraProfileProvider: Send + Sync {
+    fn probe(&self, request: &CameraProfileRequest) -> Result<CameraProfile>;
+}
+
+pub struct ProductionCameraProfileProvider {
+    observer: Arc<dyn CameraLifecycleObserver>,
+}
+
+impl ProductionCameraProfileProvider {
+    pub fn new(observer: Arc<dyn CameraLifecycleObserver>) -> Self {
+        Self { observer }
+    }
+}
+
+impl Default for ProductionCameraProfileProvider {
+    fn default() -> Self {
+        Self::new(default_lifecycle_observer())
+    }
+}
+
+impl CameraProfileProvider for ProductionCameraProfileProvider {
+    fn probe(&self, request: &CameraProfileRequest) -> Result<CameraProfile> {
+        CameraProfile::probe_with_observer(
+            &request.device_path,
+            request.width,
+            request.height,
+            request.fps,
+            request.exposure,
+            &*self.observer,
+        )
+    }
+}
 
 /// Pixel format of a captured frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,7 +137,28 @@ pub struct Frame {
     pub format: FrameFormat,
 }
 
+impl Drop for Frame {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
 impl Frame {
+    fn zeroize(&mut self) {
+        if !self.data.is_empty() {
+            // SAFETY: the Vec uniquely owns a live allocation of exactly len
+            // initialized bytes for the duration of this call. glibc's
+            // explicit_bzero is non-elidable and substantially faster than a
+            // per-byte volatile loop for full camera frames.
+            unsafe {
+                libc::explicit_bzero(
+                    self.data.as_mut_ptr().cast::<libc::c_void>(),
+                    self.data.len(),
+                )
+            };
+        }
+    }
+
     /// Convert to BGR data. If already BGR, returns a borrowed view.
     /// If Gray, expands to BGR.
     pub fn to_bgr_data(&self) -> (std::borrow::Cow<'_, [u8]>, u32, u32) {
@@ -79,11 +188,12 @@ const CAPTURE_CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(75);
 const V4L2_DEQUEUE_TIMEOUT: Duration = Duration::from_millis(500);
 const SYNCHRONOUS_STOP_TIMEOUT: Duration = Duration::from_millis(100);
 
-// 128 MiB accommodates tightly packed 8K BGR output (~95 MiB) and 8K YUYV
-// capture (~63 MiB), while preventing a malformed format from requesting
-// multi-gigabyte mappings or normalized frames in this authentication daemon.
+// The normalized owned-frame cap admits DCI-4K BGR (~25.3 MiB) while keeping
+// two-frame asynchronous capture plus bounded scratch within the default
+// plaintext budget. Raw mmap buffers retain their separate validated ceiling.
 const MAX_MAPPED_BUFFER_BYTES: usize = 128 * 1024 * 1024;
-const MAX_NORMALIZED_FRAME_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_NORMALIZED_FRAME_BYTES: usize = 32 * 1024 * 1024;
+const MMAP_BUFFER_COUNT: usize = 2;
 
 // MJPEG has a tighter decoder envelope than raw capture. These limits admit
 // DCI-4K (4096x2160, including portrait rotation) while bounding zune-jpeg's
@@ -93,6 +203,7 @@ const MAX_NORMALIZED_FRAME_BYTES: usize = 128 * 1024 * 1024;
 const MAX_MJPEG_ENCODED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MJPEG_DIMENSION: u32 = 4096;
 const MAX_MJPEG_PIXELS: usize = 4096 * 2160;
+const MAX_ENROLLMENT_MJPEG_PIXELS: usize = 1920 * 1080;
 
 const FFMPEG_STDERR_TAIL_BYTES: usize = 16 * 1024;
 const FFMPEG_TERMINATION_ESCALATION: Duration = Duration::from_millis(300);
@@ -108,6 +219,7 @@ pub struct CameraProfile {
     format: CaptureFormat,
     fps: i32,
     exposure: i32,
+    mapped_buffer_bytes: usize,
 }
 
 impl CameraProfile {
@@ -119,20 +231,41 @@ impl CameraProfile {
         fps: i32,
         exposure: i32,
     ) -> Result<Self> {
+        Self::probe_with_observer(
+            device_path,
+            req_width,
+            req_height,
+            fps,
+            exposure,
+            &NoopCameraLifecycleObserver,
+        )
+    }
+
+    fn probe_with_observer(
+        device_path: &str,
+        req_width: i32,
+        req_height: i32,
+        fps: i32,
+        exposure: i32,
+        observer: &dyn CameraLifecycleObserver,
+    ) -> Result<Self> {
+        observer.observe(CameraLifecycleEvent::ProfileProbe);
         let path = if device_path.is_empty() {
-            find_camera_device()?
+            find_camera_device(observer)?
         } else {
             device_path.to_string()
         };
 
         info!("Probing camera (one-time): {path}");
 
+        observer.observe(CameraLifecycleEvent::DeviceOpen);
         let device = v4l::Device::with_path(&path)
             .context(format!("failed to open camera device: {path}"))?;
 
         let caps = device.query_caps()?;
         info!("Camera: {} ({})", caps.card, caps.driver);
 
+        observer.observe(CameraLifecycleEvent::ConfigureProfile);
         let (negotiated, format) = negotiate_format(&device, req_width, req_height)?;
         let width = negotiated.width;
         let height = negotiated.height;
@@ -151,6 +284,8 @@ impl CameraProfile {
             format,
             fps,
             exposure,
+            mapped_buffer_bytes: usize::try_from(negotiated.size)
+                .context("negotiated camera buffer size does not fit usize")?,
         })
     }
 
@@ -163,12 +298,136 @@ impl CameraProfile {
             format: CaptureFormat::Grey,
             fps: 30,
             exposure: -1,
+            mapped_buffer_bytes: 640 * 480,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_yuyv_profile(width: u32, height: u32) -> Self {
+        Self::test_format_profile(
+            width,
+            height,
+            CaptureFormat::Yuyv,
+            usize::try_from(width)
+                .ok()
+                .and_then(|width| {
+                    usize::try_from(height)
+                        .ok()
+                        .and_then(|height| width.checked_mul(height))
+                })
+                .and_then(|pixels| pixels.checked_mul(2))
+                .unwrap_or(usize::MAX),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_grey_profile(width: u32, height: u32) -> Self {
+        Self::test_format_profile(
+            width,
+            height,
+            CaptureFormat::Grey,
+            usize::try_from(width)
+                .ok()
+                .and_then(|width| {
+                    usize::try_from(height)
+                        .ok()
+                        .and_then(|height| width.checked_mul(height))
+                })
+                .unwrap_or(usize::MAX),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_mjpeg_profile(width: u32, height: u32, size_image: usize) -> Self {
+        Self::test_format_profile(width, height, CaptureFormat::Mjpeg, size_image)
+    }
+
+    #[cfg(test)]
+    fn test_format_profile(
+        width: u32,
+        height: u32,
+        format: CaptureFormat,
+        mapped_buffer_bytes: usize,
+    ) -> Self {
+        Self {
+            device_path: "test-camera".to_string(),
+            width,
+            height,
+            format,
+            fps: 30,
+            exposure: -1,
+            mapped_buffer_bytes,
+        }
+    }
+
+    pub(crate) fn live_pipeline_bytes(&self, inference_scratch: usize) -> Result<usize> {
+        if self.format == CaptureFormat::Mjpeg {
+            let pixels = usize::try_from(self.width)
+                .ok()
+                .and_then(|width| {
+                    usize::try_from(self.height)
+                        .ok()
+                        .and_then(|height| width.checked_mul(height))
+                })
+                .context("MJPEG enrollment pixel accounting overflow")?;
+            if pixels > MAX_ENROLLMENT_MJPEG_PIXELS {
+                bail!(
+                    "MJPEG live enrollment exceeds the {MAX_ENROLLMENT_MJPEG_PIXELS}-pixel bounded decoder policy"
+                );
+            }
+        }
+        let channels = match self.format {
+            CaptureFormat::Grey => 1,
+            CaptureFormat::Mjpeg | CaptureFormat::Yuyv => 3,
+        };
+        let retained_frame =
+            checked_frame_len(self.width, self.height, channels, "live enrollment profile")?;
+        let mapped = self
+            .mapped_buffer_bytes
+            .checked_mul(MMAP_BUFFER_COUNT)
+            .context("live mapped-buffer accounting overflow")?;
+        let worker_phase = match self.format {
+            CaptureFormat::Grey | CaptureFormat::Yuyv => retained_frame,
+            CaptureFormat::Mjpeg => {
+                mjpeg_decoder_phase_bytes(self.width, self.height, self.mapped_buffer_bytes)?
+            }
+        };
+        // While inference owns one handler/queued frame, the enrollment worker
+        // owns one raw normalization output or one complete MJPEG decoder phase.
+        // The decoder phase already includes its output; do not add it twice.
+        mapped
+            .checked_add(retained_frame)
+            .and_then(|bytes| bytes.checked_add(worker_phase))
+            .and_then(|bytes| bytes.checked_add(inference_scratch))
+            .context("live pipeline accounting overflow")
+    }
+}
+
+fn mjpeg_decoder_phase_bytes(width: u32, height: u32, encoded_bytes: usize) -> Result<usize> {
+    validate_mjpeg_geometry(width, height)?;
+    validate_mjpeg_encoded_len(encoded_bytes)?;
+    let pixels = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .context("MJPEG decoder pixel accounting overflow")?;
+    // image 0.25 retains one encoded copy. zune-jpeg can concurrently retain
+    // progressive i16 coefficients for up to four components, row/upsampling
+    // storage, and a four-channel decoded output before unsupported-color
+    // rejection. Sixteen bytes per bounded pixel conservatively contains those
+    // decoder-owned allocations and includes the final output allocation.
+    pixels
+        .checked_mul(16)
+        .and_then(|phase| phase.checked_add(encoded_bytes))
+        .context("MJPEG decoder phase accounting overflow")
 }
 
 /// A camera capture device.
 pub struct Camera {
+    admitted_profile: CameraProfile,
     width: u32,
     height: u32,
     format: CaptureFormat,
@@ -178,6 +437,49 @@ pub struct Camera {
     worker: Option<CaptureWorker>,
     pending_cleanup: Option<PendingCameraCleanup>,
     selected_backend: Arc<Mutex<Option<CaptureBackendKind>>>,
+    lifecycle_observer: Arc<dyn CameraLifecycleObserver>,
+    child_policy: Arc<DaemonChildPolicy>,
+    direct_cancellation: Arc<DirectCameraCancellation>,
+    #[cfg(test)]
+    frame_discard_observer: Option<Arc<dyn Fn(&Frame) + Send + Sync>>,
+}
+
+struct DirectCameraCancellation {
+    flag: Arc<AtomicBool>,
+    latest_message: Mutex<Option<LatestMessage>>,
+}
+
+impl DirectCameraCancellation {
+    fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            latest_message: Mutex::new(None),
+        }
+    }
+
+    fn attach(&self, latest_message: &LatestMessage) {
+        *self
+            .latest_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(latest_message));
+        if self.flag.load(Ordering::Acquire) {
+            latest_message.1.notify_all();
+        }
+    }
+}
+
+impl ActiveResourceCancellation for DirectCameraCancellation {
+    fn cancel_resource(&self) {
+        self.flag.store(true, Ordering::Release);
+        if let Some(latest_message) = self
+            .latest_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            latest_message.1.notify_all();
+        }
+    }
 }
 
 /// Capture backend actually selected by the production camera worker.
@@ -188,11 +490,13 @@ pub enum CaptureBackendKind {
 }
 
 struct CaptureWorker {
-    latest_message: Arc<Mutex<Option<CaptureMessage>>>,
+    latest_message: LatestMessage,
     notify_rx: mpsc::Receiver<()>,
     cancellation: Arc<AtomicBool>,
     thread_handle: Option<std::thread::JoinHandle<()>>,
 }
+
+type LatestMessage = Arc<(Mutex<Option<CaptureMessage>>, Condvar)>;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +511,144 @@ pub enum CameraStopOutcome {
     Released,
     FailedPanicked,
     Pending(PendingCameraCleanup),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CameraFailureKind {
+    /// Device disappearance, exact-profile rejection, backend startup, or
+    /// frame-read failure invalidates enrollment's admitted profile.
+    StaleProfile,
+    /// A caller-owned cancellation must not invalidate an otherwise valid
+    /// admitted profile.
+    Cancelled,
+    /// Non-device failures retain the cached profile.
+    Other,
+}
+
+#[derive(Debug)]
+pub struct CameraCaptureError {
+    kind: CameraFailureKind,
+    source: anyhow::Error,
+}
+
+impl CameraCaptureError {
+    pub fn stale_profile(source: anyhow::Error) -> Self {
+        Self {
+            kind: CameraFailureKind::StaleProfile,
+            source,
+        }
+    }
+
+    pub fn cancelled(source: anyhow::Error) -> Self {
+        Self {
+            kind: CameraFailureKind::Cancelled,
+            source,
+        }
+    }
+
+    pub fn other(source: anyhow::Error) -> Self {
+        Self {
+            kind: CameraFailureKind::Other,
+            source,
+        }
+    }
+
+    pub const fn kind(&self) -> CameraFailureKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for CameraCaptureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for CameraCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
+}
+
+/// Object-safe capture boundary used by the daemon coordinator.
+pub trait CameraCapture: Send {
+    fn start(&mut self) -> std::result::Result<(), CameraCaptureError>;
+    fn start_enrollment(&mut self) -> std::result::Result<(), CameraCaptureError>;
+    fn capture_frame(&mut self) -> std::result::Result<Frame, CameraCaptureError>;
+    fn stop(&mut self) -> CameraStopOutcome;
+    fn retain_pending_cleanup(&mut self, pending: PendingCameraCleanup);
+
+    fn active_resource_cancellation(&self) -> Option<Arc<dyn ActiveResourceCancellation>> {
+        None
+    }
+
+    fn start_cancellable(
+        &mut self,
+        cancellation: &dyn CancellationSignal,
+    ) -> std::result::Result<(), CameraCaptureError> {
+        if cancellation.is_cancelled() {
+            return Err(CameraCaptureError::cancelled(anyhow!(
+                "camera startup cancelled"
+            )));
+        }
+        let result = self.start();
+        if result.is_ok() && cancellation.is_cancelled() {
+            Err(CameraCaptureError::cancelled(anyhow!(
+                "camera startup cancelled"
+            )))
+        } else {
+            result
+        }
+    }
+
+    fn capture_frame_cancellable(
+        &mut self,
+        cancellation: &dyn CancellationSignal,
+    ) -> std::result::Result<Frame, CameraCaptureError> {
+        if cancellation.is_cancelled() {
+            return Err(CameraCaptureError::cancelled(anyhow!(
+                "camera frame wait cancelled"
+            )));
+        }
+        let result = self.capture_frame();
+        if result.is_ok() && cancellation.is_cancelled() {
+            Err(CameraCaptureError::cancelled(anyhow!(
+                "camera frame wait cancelled"
+            )))
+        } else {
+            result
+        }
+    }
+}
+
+/// Injectable construction hook. Tests replace only the physical camera while
+/// exercising the same auth/enrollment coordinator call sites as production.
+pub trait CameraFactory: Send + Sync {
+    fn create(&self, profile: &CameraProfile) -> Box<dyn CameraCapture>;
+}
+
+pub struct ProductionCameraFactory {
+    observer: Arc<dyn CameraLifecycleObserver>,
+    child_policy: Arc<DaemonChildPolicy>,
+}
+
+impl ProductionCameraFactory {
+    pub fn new(child_policy: Arc<DaemonChildPolicy>) -> Self {
+        Self {
+            observer: default_lifecycle_observer(),
+            child_policy,
+        }
+    }
+}
+
+impl CameraFactory for ProductionCameraFactory {
+    fn create(&self, profile: &CameraProfile) -> Box<dyn CameraCapture> {
+        Box::new(Camera::from_profile_with_observer(
+            profile,
+            Arc::clone(&self.observer),
+            Arc::clone(&self.child_policy),
+        ))
+    }
 }
 
 impl CameraStopOutcome {
@@ -360,6 +802,7 @@ struct V4l2MmapBackend {
     stream: v4l::io::mmap::Stream<'static>,
     _device: Pin<Box<v4l::Device>>,
     negotiated: v4l::format::Format,
+    lifecycle_observer: Arc<dyn CameraLifecycleObserver>,
 }
 
 struct FfmpegBackend {
@@ -370,6 +813,7 @@ struct FfmpegBackend {
     height: u32,
     format: CaptureFormat,
     frame_size: usize,
+    lifecycle_observer: Arc<dyn CameraLifecycleObserver>,
 }
 
 struct StderrDrainer {
@@ -527,7 +971,22 @@ enum CaptureFormat {
 impl Camera {
     /// Create a camera from a pre-probed profile (skips device probe).
     pub fn from_profile(profile: &CameraProfile) -> Self {
+        Self::from_profile_with_observer(
+            profile,
+            default_lifecycle_observer(),
+            Arc::new(DaemonChildPolicy::for_mode(
+                howy_common::config::EmbeddingSecurityMode::Plaintext,
+            )),
+        )
+    }
+
+    fn from_profile_with_observer(
+        profile: &CameraProfile,
+        lifecycle_observer: Arc<dyn CameraLifecycleObserver>,
+        child_policy: Arc<DaemonChildPolicy>,
+    ) -> Self {
         Self {
+            admitted_profile: profile.clone(),
             width: profile.width,
             height: profile.height,
             format: profile.format,
@@ -537,6 +996,11 @@ impl Camera {
             worker: None,
             pending_cleanup: None,
             selected_backend: Arc::new(Mutex::new(None)),
+            lifecycle_observer,
+            child_policy,
+            direct_cancellation: Arc::new(DirectCameraCancellation::new()),
+            #[cfg(test)]
+            frame_discard_observer: None,
         }
     }
 
@@ -561,10 +1025,24 @@ impl Camera {
     /// 1. Try V4L2 mmap first
     /// 2. Fall back to an optional persistent ffmpeg sidecar
     pub fn start(&mut self) -> Result<()> {
+        self.start_with_policy(true)
+    }
+
+    /// Enrollment cannot use FFmpeg because its process-private allocations are
+    /// not enforceably bounded by the daemon plaintext admission budget.
+    pub(crate) fn start_enrollment(&mut self) -> Result<()> {
+        self.start_with_policy(false)
+    }
+
+    fn start_with_policy(&mut self, allow_ffmpeg_fallback: bool) -> Result<()> {
         if self.worker.is_some() {
             return Ok(());
         }
+        if self.direct_cancellation.flag.load(Ordering::Acquire) {
+            bail!("camera startup cancelled before capture worker creation");
+        }
 
+        let profile = self.admitted_profile.clone();
         let device_path = self.device_path.clone();
         let width = self.width;
         let height = self.height;
@@ -572,18 +1050,22 @@ impl Camera {
         let fps = self.fps;
         let exposure = self.exposure;
 
-        let latest_message = Arc::new(Mutex::new(None));
+        let latest_message = Arc::new((Mutex::new(None), Condvar::new()));
         let latest_message_worker = Arc::clone(&latest_message);
         let (notify_tx, notify_rx) = mpsc::sync_channel(1);
-        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::clone(&self.direct_cancellation.flag);
         let cancellation_worker = Arc::clone(&cancellation);
         let selected_backend = Arc::clone(&self.selected_backend);
+        let lifecycle_observer = Arc::clone(&self.lifecycle_observer);
+        let child_policy = Arc::clone(&self.child_policy);
 
+        self.direct_cancellation.attach(&latest_message);
         let handle = thread::Builder::new()
             .name("howy-camera-capture".to_string())
             .spawn(move || {
                 capture_worker_loop(
                     device_path,
+                    profile,
                     width,
                     height,
                     format,
@@ -593,6 +1075,9 @@ impl Camera {
                     notify_tx,
                     cancellation_worker,
                     selected_backend,
+                    allow_ffmpeg_fallback,
+                    lifecycle_observer,
+                    child_policy,
                 );
             })
             .context("failed to spawn camera capture worker")?;
@@ -616,7 +1101,9 @@ impl Camera {
             return CameraStopOutcome::Released;
         };
 
-        worker.cancellation.store(true, Ordering::Release);
+        self.lifecycle_observer
+            .observe(CameraLifecycleEvent::StopCleanup);
+        self.direct_cancellation.cancel_resource();
         let Some(handle) = worker.thread_handle.take() else {
             return CameraStopOutcome::Released;
         };
@@ -670,6 +1157,56 @@ impl Camera {
         }
     }
 
+    fn capture_frame_with_cancellation(
+        &mut self,
+        cancellation: &dyn CancellationSignal,
+    ) -> std::result::Result<Frame, CameraCaptureError> {
+        let worker = self
+            .worker
+            .as_ref()
+            .ok_or_else(|| CameraCaptureError::other(anyhow!("camera not started")))?;
+        loop {
+            if cancellation.is_cancelled() {
+                worker.cancellation.store(true, Ordering::Release);
+                worker.latest_message.1.notify_all();
+                return Err(CameraCaptureError::cancelled(anyhow!(
+                    "camera frame wait cancelled"
+                )));
+            }
+            if let Some(message) = take_latest_message(&worker.latest_message) {
+                let mut frame =
+                    decode_capture_message(message).map_err(CameraCaptureError::stale_profile)?;
+                // Sampling here fixes timeliness at the success boundary: a
+                // candidate obtained after the pre-read check cannot escape a
+                // cancellation or deadline that became visible in between.
+                if cancellation.is_cancelled() {
+                    worker.cancellation.store(true, Ordering::Release);
+                    worker.latest_message.1.notify_all();
+                    frame.zeroize();
+                    #[cfg(test)]
+                    if let Some(observer) = &self.frame_discard_observer {
+                        observer(&frame);
+                    }
+                    return Err(CameraCaptureError::cancelled(anyhow!(
+                        "camera frame wait cancelled"
+                    )));
+                }
+                return Ok(frame);
+            }
+            match worker
+                .notify_rx
+                .recv_timeout(CAPTURE_CANCELLATION_CHECK_INTERVAL)
+            {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(CameraCaptureError::stale_profile(anyhow!(
+                        "camera capture worker stopped unexpectedly"
+                    )));
+                }
+            }
+        }
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }
@@ -684,6 +1221,64 @@ impl Camera {
             .selected_backend
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl CameraCapture for Camera {
+    fn start(&mut self) -> std::result::Result<(), CameraCaptureError> {
+        Camera::start(self).map_err(CameraCaptureError::stale_profile)
+    }
+
+    fn start_enrollment(&mut self) -> std::result::Result<(), CameraCaptureError> {
+        Camera::start_enrollment(self).map_err(CameraCaptureError::stale_profile)
+    }
+
+    fn capture_frame(&mut self) -> std::result::Result<Frame, CameraCaptureError> {
+        Camera::capture_frame(self).map_err(CameraCaptureError::stale_profile)
+    }
+
+    fn stop(&mut self) -> CameraStopOutcome {
+        Camera::stop(self)
+    }
+
+    fn retain_pending_cleanup(&mut self, pending: PendingCameraCleanup) {
+        Camera::retain_pending_cleanup(self, pending);
+    }
+
+    fn active_resource_cancellation(&self) -> Option<Arc<dyn ActiveResourceCancellation>> {
+        Some(self.direct_cancellation.clone())
+    }
+
+    fn start_cancellable(
+        &mut self,
+        cancellation: &dyn CancellationSignal,
+    ) -> std::result::Result<(), CameraCaptureError> {
+        if cancellation.is_cancelled() {
+            return Err(CameraCaptureError::cancelled(anyhow!(
+                "camera startup cancelled"
+            )));
+        }
+        if let Err(error) = Camera::start(self) {
+            return if self.direct_cancellation.flag.load(Ordering::Acquire) {
+                Err(CameraCaptureError::cancelled(error))
+            } else {
+                Err(CameraCaptureError::stale_profile(error))
+            };
+        }
+        if cancellation.is_cancelled() {
+            Err(CameraCaptureError::cancelled(anyhow!(
+                "camera startup cancelled"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn capture_frame_cancellable(
+        &mut self,
+        cancellation: &dyn CancellationSignal,
+    ) -> std::result::Result<Frame, CameraCaptureError> {
+        self.capture_frame_with_cancellation(cancellation)
     }
 }
 
@@ -704,27 +1299,35 @@ impl Drop for Camera {
 
 fn capture_worker_loop(
     device_path: String,
+    admitted_profile: CameraProfile,
     width: u32,
     height: u32,
     format: CaptureFormat,
     fps: i32,
     exposure: i32,
-    latest_message: Arc<Mutex<Option<CaptureMessage>>>,
+    latest_message: LatestMessage,
     notify_tx: mpsc::SyncSender<()>,
     cancellation: Arc<AtomicBool>,
     selected_backend: Arc<Mutex<Option<CaptureBackendKind>>>,
+    allow_ffmpeg_fallback: bool,
+    lifecycle_observer: Arc<dyn CameraLifecycleObserver>,
+    child_policy: Arc<DaemonChildPolicy>,
 ) {
     // Cancellation brackets every controllable construction stage. Individual
     // kernel open/ioctl calls cannot be interrupted safely from userspace; this
     // isolated worker remains owned and can be handed to the tracked reaper.
     let backend = match start_backend(
         &device_path,
+        &admitted_profile,
         width,
         height,
         format,
         fps,
         exposure,
         &cancellation,
+        allow_ffmpeg_fallback,
+        Arc::clone(&lifecycle_observer),
+        Arc::clone(&child_policy),
     ) {
         Ok(BackendStart::Ready(backend)) => backend,
         Ok(BackendStart::Cancelled) => return,
@@ -749,18 +1352,32 @@ fn capture_worker_loop(
             return;
         }
 
-        let event = capture_backend_once(&mut backend, &cancellation, || {
-            FfmpegBackend::new(
-                &device_path,
-                width,
-                height,
-                format,
-                fps,
-                exposure,
-                &cancellation,
-            )
-            .map(Backend::Ffmpeg)
-        });
+        // Authentication always overwrites the latest slot. Enrollment alone
+        // waits for an occupied slot to be consumed so its admitted peak is one
+        // queued/handler frame plus one worker construction/decoder phase.
+        if !allow_ffmpeg_fallback && !wait_for_empty_slot(&latest_message, &cancellation) {
+            return;
+        }
+
+        let event = capture_backend_once_with_policy(
+            &mut backend,
+            &cancellation,
+            allow_ffmpeg_fallback,
+            || {
+                FfmpegBackend::new(
+                    &device_path,
+                    width,
+                    height,
+                    format,
+                    fps,
+                    exposure,
+                    &cancellation,
+                    Arc::clone(&lifecycle_observer),
+                    Arc::clone(&child_policy),
+                )
+                .map(Backend::Ffmpeg)
+            },
+        );
         match event {
             Ok(BackendEvent::Frame(frame)) => {
                 if !publish_message(&latest_message, &notify_tx, CaptureMessage::Frame(frame)) {
@@ -802,24 +1419,28 @@ fn backend_kind(backend: &Backend) -> CaptureBackendKind {
 
 fn start_backend(
     device_path: &str,
+    admitted_profile: &CameraProfile,
     width: u32,
     height: u32,
     format: CaptureFormat,
     fps: i32,
     exposure: i32,
     cancellation: &AtomicBool,
+    allow_ffmpeg_fallback: bool,
+    lifecycle_observer: Arc<dyn CameraLifecycleObserver>,
+    child_policy: Arc<DaemonChildPolicy>,
 ) -> Result<BackendStart<Backend>> {
     start_backend_with(
         cancellation,
+        allow_ffmpeg_fallback,
         || {
             V4l2MmapBackend::new(
                 device_path,
-                width,
-                height,
-                format,
+                admitted_profile,
                 fps,
                 exposure,
                 cancellation,
+                Arc::clone(&lifecycle_observer),
             )
             .map(Backend::V4l2Mmap)
         },
@@ -832,6 +1453,8 @@ fn start_backend(
                 fps,
                 exposure,
                 cancellation,
+                Arc::clone(&lifecycle_observer),
+                Arc::clone(&child_policy),
             )
             .map(Backend::Ffmpeg)
         },
@@ -846,6 +1469,7 @@ enum BackendStart<T> {
 
 fn start_backend_with<T>(
     cancellation: &AtomicBool,
+    allow_ffmpeg_fallback: bool,
     try_v4l2: impl FnOnce() -> Result<T>,
     try_ffmpeg: impl FnOnce() -> Result<T>,
 ) -> Result<BackendStart<T>> {
@@ -864,6 +1488,11 @@ fn start_backend_with<T>(
         Err(v4l2_error) => {
             if cancellation.load(Ordering::Acquire) {
                 return Ok(BackendStart::Cancelled);
+            }
+            if !allow_ffmpeg_fallback {
+                bail!(
+                    "V4L2 enrollment backend unavailable: {v4l2_error:#}; FFmpeg fallback is disabled for enrollment because its process-wide memory cannot be bounded by the plaintext budget"
+                );
             }
             debug!("V4L2 mmap backend unavailable: {v4l2_error:#}; trying optional FFmpeg");
             match try_ffmpeg() {
@@ -893,9 +1522,22 @@ fn construct_fallback_after_release<T, U>(
     construct()
 }
 
+#[cfg(test)]
 fn capture_backend_once<B>(
     backend: &mut Option<B>,
     cancellation: &AtomicBool,
+    construct_fallback: impl FnOnce() -> Result<B>,
+) -> Result<BackendEvent>
+where
+    B: BackendCapture,
+{
+    capture_backend_once_with_policy(backend, cancellation, true, construct_fallback)
+}
+
+fn capture_backend_once_with_policy<B>(
+    backend: &mut Option<B>,
+    cancellation: &AtomicBool,
+    allow_ffmpeg_fallback: bool,
     construct_fallback: impl FnOnce() -> Result<B>,
 ) -> Result<BackendEvent>
 where
@@ -913,7 +1555,7 @@ where
     match frame_result {
         Ok(CaptureStep::Frame(frame)) => Ok(BackendEvent::Frame(frame)),
         Ok(CaptureStep::Cancelled) => Ok(BackendEvent::Cancelled),
-        Err(capture_error) if supports_fallback => {
+        Err(capture_error) if supports_fallback && allow_ffmpeg_fallback => {
             drop(backend.take());
             if cancellation.load(Ordering::Acquire) {
                 return Ok(BackendEvent::Cancelled);
@@ -936,16 +1578,19 @@ where
             *backend = Some(fallback);
             Ok(BackendEvent::FellBack(capture_error))
         }
+        Err(capture_error) if supports_fallback => Err(anyhow!(
+            "V4L2 enrollment capture failed: {capture_error:#}; FFmpeg fallback is disabled for enrollment because its process-wide memory cannot be bounded by the plaintext budget"
+        )),
         Err(error) => Err(error),
     }
 }
 
 fn publish_message(
-    latest_message: &Arc<Mutex<Option<CaptureMessage>>>,
+    latest_message: &LatestMessage,
     notify_tx: &mpsc::SyncSender<()>,
     message: CaptureMessage,
 ) -> bool {
-    let mut slot = match latest_message.lock() {
+    let mut slot = match latest_message.0.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -958,14 +1603,31 @@ fn publish_message(
     }
 }
 
-fn take_latest_message(
-    latest_message: &Arc<Mutex<Option<CaptureMessage>>>,
-) -> Option<CaptureMessage> {
-    let mut slot = match latest_message.lock() {
+fn take_latest_message(latest_message: &LatestMessage) -> Option<CaptureMessage> {
+    let mut slot = match latest_message.0.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    slot.take()
+    let message = slot.take();
+    if message.is_some() {
+        latest_message.1.notify_one();
+    }
+    message
+}
+
+fn wait_for_empty_slot(latest_message: &LatestMessage, cancellation: &AtomicBool) -> bool {
+    let mut slot = latest_message
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while slot.is_some() && !cancellation.load(Ordering::Acquire) {
+        let waited = latest_message
+            .1
+            .wait_timeout(slot, CAPTURE_CANCELLATION_CHECK_INTERVAL)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slot = waited.0;
+    }
+    !cancellation.load(Ordering::Acquire)
 }
 
 fn decode_capture_message(message: CaptureMessage) -> Result<Frame> {
@@ -1068,13 +1730,16 @@ fn apply_v4l2_settings_before_ffmpeg(
     fps: i32,
     exposure: i32,
     cancellation: &AtomicBool,
+    lifecycle_observer: &dyn CameraLifecycleObserver,
 ) {
     if cancellation.load(Ordering::Acquire) {
         return;
     }
+    lifecycle_observer.observe(CameraLifecycleEvent::DeviceOpen);
     match v4l::Device::with_path(device_path) {
         Ok(device) => {
             if !cancellation.load(Ordering::Acquire) {
+                lifecycle_observer.observe(CameraLifecycleEvent::ConfigureProfile);
                 apply_v4l2_settings(&device, fps, exposure);
             }
             drop(device);
@@ -1091,30 +1756,39 @@ impl V4l2MmapBackend {
     /// Create by opening a fresh device.
     fn new(
         device_path: &str,
-        width: u32,
-        height: u32,
-        _format: CaptureFormat,
+        admitted_profile: &CameraProfile,
         fps: i32,
         exposure: i32,
         cancellation: &AtomicBool,
+        lifecycle_observer: Arc<dyn CameraLifecycleObserver>,
     ) -> Result<Self> {
         if cancellation.load(Ordering::Acquire) {
             bail!("camera startup cancelled before V4L2 open");
         }
+        lifecycle_observer.observe(CameraLifecycleEvent::DeviceOpen);
         let dev =
             v4l::Device::with_path(device_path).context("failed to open V4L2 device for mmap")?;
 
-        let (negotiated, _) = negotiate_format(&dev, width as i32, height as i32)
-            .context("V4L2 mmap: failed to set format")?;
+        lifecycle_observer.observe(CameraLifecycleEvent::ConfigureProfile);
+        let requested = v4l::format::Format::new(
+            admitted_profile.width,
+            admitted_profile.height,
+            fourcc_for_capture_format(admitted_profile.format),
+        );
+        let negotiated = CaptureTraitImport::set_format(&dev, &requested)
+            .context("V4L2 mmap: failed to restore admitted format")?;
+        validate_accepted_profile(admitted_profile, &negotiated)
+            .context("V4L2 mmap: driver changed the admitted format")?;
         apply_v4l2_settings(&dev, fps, exposure);
 
         let device = Box::pin(dev);
-        Self::create_stream(device, negotiated)
+        Self::create_stream(device, negotiated, lifecycle_observer)
     }
 
     fn create_stream(
         device: Pin<Box<v4l::Device>>,
         negotiated: v4l::format::Format,
+        lifecycle_observer: Arc<dyn CameraLifecycleObserver>,
     ) -> Result<Self> {
         validate_negotiated_format(&negotiated).context("V4L2 mmap: invalid negotiated format")?;
 
@@ -1122,6 +1796,7 @@ impl V4l2MmapBackend {
         // because the stream is stored in the same struct as the device and
         // fields drop in declaration order (stream before _device). The stream
         // only holds an Arc<Handle> cloned from the device, not a direct reference.
+        lifecycle_observer.observe(CameraLifecycleEvent::StreamStart);
         let mut stream = unsafe {
             let dev_ref: &v4l::Device = &*device;
             let dev_ref_static: &'static v4l::Device = std::mem::transmute(dev_ref);
@@ -1153,6 +1828,7 @@ impl V4l2MmapBackend {
             stream,
             _device: device,
             negotiated,
+            lifecycle_observer,
         })
     }
 
@@ -1160,6 +1836,8 @@ impl V4l2MmapBackend {
         if cancellation.load(Ordering::Acquire) {
             return Ok(CaptureStep::Cancelled);
         }
+        self.lifecycle_observer
+            .observe(CameraLifecycleEvent::FrameRead);
         let (buf, meta) = match classify_v4l_dequeue(self.stream.next(), cancellation)? {
             Some(frame) => frame,
             None => return Ok(CaptureStep::Cancelled),
@@ -1359,10 +2037,10 @@ fn decoded_mjpeg_to_frame(
             let height = image.height();
             validate_mjpeg_dimensions(width, height, negotiated_width, negotiated_height)?;
             let expected = checked_frame_len(width, height, 1, "MJPEG grayscale")?;
-            let data = image.into_raw();
+            let mut data = zeroize::Zeroizing::new(image.into_raw());
             validate_decoded_mjpeg_len(data.len(), expected)?;
             Ok(Frame {
-                data,
+                data: std::mem::take(&mut *data),
                 width,
                 height,
                 format: FrameFormat::Gray,
@@ -1373,11 +2051,11 @@ fn decoded_mjpeg_to_frame(
             let height = image.height();
             validate_mjpeg_dimensions(width, height, negotiated_width, negotiated_height)?;
             let expected = checked_frame_len(width, height, 3, "MJPEG RGB")?;
-            let mut data = image.into_raw();
+            let mut data = zeroize::Zeroizing::new(image.into_raw());
             validate_decoded_mjpeg_len(data.len(), expected)?;
             rgb_to_bgr_in_place(&mut data);
             Ok(Frame {
-                data,
+                data: std::mem::take(&mut *data),
                 width,
                 height,
                 format: FrameFormat::Bgr,
@@ -1413,7 +2091,7 @@ fn normalize_grey(payload: &[u8], format: &v4l::format::Format) -> Result<Frame>
     let output_len = checked_frame_len(format.width, format.height, 1, "GREY")?;
     validate_raw_payload(payload, height, stride, width, format.size, "GREY")?;
 
-    let mut gray = Vec::new();
+    let mut gray = zeroize::Zeroizing::new(Vec::new());
     gray.try_reserve_exact(output_len)
         .context("V4L2 GREY output allocation is too large")?;
     for row in 0..height {
@@ -1427,7 +2105,7 @@ fn normalize_grey(payload: &[u8], format: &v4l::format::Format) -> Result<Frame>
     }
 
     Ok(Frame {
-        data: gray,
+        data: std::mem::take(&mut *gray),
         width: format.width,
         height: format.height,
         format: FrameFormat::Gray,
@@ -1458,7 +2136,7 @@ fn normalize_yuyv(payload: &[u8], format: &v4l::format::Format) -> Result<Frame>
         "YUYV",
     )?;
 
-    let mut bgr = Vec::new();
+    let mut bgr = zeroize::Zeroizing::new(Vec::new());
     bgr.try_reserve_exact(output_len)
         .context("V4L2 YUYV output allocation is too large")?;
     for row in 0..height {
@@ -1476,7 +2154,7 @@ fn normalize_yuyv(payload: &[u8], format: &v4l::format::Format) -> Result<Frame>
     }
 
     Ok(Frame {
-        data: bgr,
+        data: std::mem::take(&mut *bgr),
         width: format.width,
         height: format.height,
         format: FrameFormat::Bgr,
@@ -1636,6 +2314,35 @@ fn validate_negotiated_format(format: &v4l::format::Format) -> Result<()> {
     Ok(())
 }
 
+fn validate_accepted_profile(
+    admitted: &CameraProfile,
+    accepted: &v4l::format::Format,
+) -> Result<()> {
+    validate_negotiated_format(accepted)?;
+    if accepted.width != admitted.width
+        || accepted.height != admitted.height
+        || accepted.fourcc != fourcc_for_capture_format(admitted.format)
+    {
+        bail!(
+            "accepted V4L2 format {:?} {}x{} does not match admitted {:?} {}x{}",
+            accepted.fourcc,
+            accepted.width,
+            accepted.height,
+            admitted.format,
+            admitted.width,
+            admitted.height
+        );
+    }
+    let accepted_size = usize::try_from(accepted.size).context("V4L2 sizeimage overflow")?;
+    if accepted_size > admitted.mapped_buffer_bytes {
+        bail!(
+            "accepted V4L2 sizeimage {accepted_size} exceeds admitted {}-byte envelope",
+            admitted.mapped_buffer_bytes
+        );
+    }
+    Ok(())
+}
+
 fn validate_negotiated_raw_format(
     format: &v4l::format::Format,
     input_bytes_per_pixel: usize,
@@ -1672,6 +2379,8 @@ impl FfmpegBackend {
         fps: i32,
         exposure: i32,
         cancellation: &AtomicBool,
+        lifecycle_observer: Arc<dyn CameraLifecycleObserver>,
+        child_policy: Arc<DaemonChildPolicy>,
     ) -> Result<Self> {
         if cancellation.load(Ordering::Acquire) {
             bail!("camera startup cancelled before FFmpeg preparation");
@@ -1686,27 +2395,25 @@ impl FfmpegBackend {
         if matches!(format, CaptureFormat::Grey) {
             checked_frame_len(width, height, 3, "FFmpeg GREY BGR expansion")?;
         }
-        apply_v4l2_settings_before_ffmpeg(device, fps, exposure, cancellation);
+        apply_v4l2_settings_before_ffmpeg(
+            device,
+            fps,
+            exposure,
+            cancellation,
+            &*lifecycle_observer,
+        );
         if cancellation.load(Ordering::Acquire) {
             bail!("camera startup cancelled before FFmpeg spawn");
         }
-        let args = ffmpeg_args(device, width, height, format, fps);
+        let camera = child_policy.open_camera(device)?;
+        let args = ffmpeg_args(&camera.child_path(), width, height, format, fps);
         if cancellation.load(Ordering::Acquire) {
             bail!("camera startup cancelled before FFmpeg spawn");
         }
-        let mut command = Command::new("ffmpeg");
-        command
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        configure_parent_death_signal(&mut command);
-        let mut child = command
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to spawn optional FFmpeg camera fallback for {device}; ensure ffmpeg is installed"
-                )
-            })?;
+        lifecycle_observer.observe(CameraLifecycleEvent::StreamStart);
+        let mut child = child_policy
+            .spawn_ffmpeg(camera, &args)
+            .context("failed to spawn isolated optional FFmpeg camera fallback")?;
 
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
@@ -1740,30 +2447,31 @@ impl FfmpegBackend {
             height,
             format,
             frame_size,
+            lifecycle_observer,
         })
     }
 
     fn next_frame(&mut self, cancellation: &AtomicBool) -> Result<CaptureStep> {
         match self.format {
             CaptureFormat::Grey => {
-                let mut gray = vec![0u8; self.frame_size];
+                let mut gray = zeroize::Zeroizing::new(vec![0u8; self.frame_size]);
                 if !self.read_frame(&mut gray, "grayscale", cancellation)? {
                     return Ok(CaptureStep::Cancelled);
                 }
                 Ok(CaptureStep::Frame(Frame {
-                    data: gray,
+                    data: std::mem::take(&mut *gray),
                     width: self.width,
                     height: self.height,
                     format: FrameFormat::Gray,
                 }))
             }
             CaptureFormat::Mjpeg | CaptureFormat::Yuyv => {
-                let mut bgr = vec![0u8; self.frame_size];
+                let mut bgr = zeroize::Zeroizing::new(vec![0u8; self.frame_size]);
                 if !self.read_frame(&mut bgr, "BGR", cancellation)? {
                     return Ok(CaptureStep::Cancelled);
                 }
                 Ok(CaptureStep::Frame(Frame {
-                    data: bgr,
+                    data: std::mem::take(&mut *bgr),
                     width: self.width,
                     height: self.height,
                     format: FrameFormat::Bgr,
@@ -1788,6 +2496,8 @@ impl FfmpegBackend {
         timeout: Duration,
         cancellation: &AtomicBool,
     ) -> Result<bool> {
+        self.lifecycle_observer
+            .observe(CameraLifecycleEvent::FrameRead);
         let deadline = Instant::now() + timeout;
         let stdout_fd = self.stdout.as_raw_fd();
         match read_exact_until(
@@ -1851,29 +2561,6 @@ impl FfmpegBackend {
         }
     }
 }
-
-#[cfg(target_os = "linux")]
-fn configure_parent_death_signal(command: &mut Command) {
-    let expected_parent = unsafe { libc::getpid() };
-    // SAFETY: the closure invokes only async-signal-safe libc syscalls before
-    // exec. It installs SIGKILL and closes the parent-death race by comparing
-    // the post-prctl parent with the parent that configured this command.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::getppid() != expected_parent {
-                libc::kill(libc::getpid(), libc::SIGKILL);
-                return Err(io::Error::from_raw_os_error(libc::ECHILD));
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn configure_parent_death_signal(_command: &mut Command) {}
 
 fn read_exact_until<R>(
     reader: &mut R,
@@ -1993,7 +2680,7 @@ impl Drop for FfmpegBackend {
 }
 
 /// Auto-detect a suitable camera device.
-fn find_camera_device() -> Result<String> {
+fn find_camera_device(observer: &dyn CameraLifecycleObserver) -> Result<String> {
     let by_path = Path::new("/dev/v4l/by-path");
     if by_path.is_dir() {
         let mut entries: Vec<_> = std::fs::read_dir(by_path)
@@ -2011,7 +2698,7 @@ fn find_camera_device() -> Result<String> {
                 let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
                 let path = entry.path();
                 if (name.contains("ir") || name.contains("infrared"))
-                    && is_video_capture_device(&path)
+                    && is_video_capture_device(&path, observer)
                 {
                     return Ok(path.to_string_lossy().to_string());
                 }
@@ -2019,7 +2706,7 @@ fn find_camera_device() -> Result<String> {
 
             for entry in entries {
                 let path = entry.path();
-                if is_video_capture_device(&path) {
+                if is_video_capture_device(&path, observer) {
                     return Ok(path.to_string_lossy().to_string());
                 }
             }
@@ -2033,15 +2720,18 @@ fn find_camera_device() -> Result<String> {
     for i in 0..10 {
         let path = format!("/dev/video{i}");
         if Path::new(&path).exists() {
-            if let Ok(dev) = v4l::Device::with_path(&path) {
-                if let Ok(caps) = dev.query_caps() {
-                    if caps
-                        .capabilities
-                        .contains(v4l::capability::Flags::VIDEO_CAPTURE)
-                    {
-                        return Ok(path);
+            let is_capture = inspect_discovery_candidate(Path::new(&path), observer, |path| {
+                if let Ok(dev) = v4l::Device::with_path(path) {
+                    if let Ok(caps) = dev.query_caps() {
+                        return caps
+                            .capabilities
+                            .contains(v4l::capability::Flags::VIDEO_CAPTURE);
                     }
                 }
+                false
+            });
+            if is_capture {
+                return Ok(path);
             }
         }
     }
@@ -2049,8 +2739,8 @@ fn find_camera_device() -> Result<String> {
     bail!("No camera device found. Set video.device_path in config.")
 }
 
-fn is_video_capture_device(path: &Path) -> bool {
-    match v4l::Device::with_path(path) {
+fn is_video_capture_device(path: &Path, observer: &dyn CameraLifecycleObserver) -> bool {
+    inspect_discovery_candidate(path, observer, |path| match v4l::Device::with_path(path) {
         Ok(dev) => match dev.query_caps() {
             Ok(caps) => caps
                 .capabilities
@@ -2058,7 +2748,16 @@ fn is_video_capture_device(path: &Path) -> bool {
             Err(_) => false,
         },
         Err(_) => false,
-    }
+    })
+}
+
+fn inspect_discovery_candidate<T>(
+    path: &Path,
+    observer: &dyn CameraLifecycleObserver,
+    inspect: impl FnOnce(&Path) -> T,
+) -> T {
+    observer.observe(CameraLifecycleEvent::DeviceOpen);
+    inspect(path)
 }
 
 /// Negotiate the best capture format.
@@ -2117,6 +2816,14 @@ fn capture_format_from_fourcc(fourcc: v4l::FourCC) -> Result<CaptureFormat> {
         b"YUYV" => Ok(CaptureFormat::Yuyv),
         b"GREY" => Ok(CaptureFormat::Grey),
         _ => bail!("unsupported V4L2 FourCC: {fourcc:?}"),
+    }
+}
+
+fn fourcc_for_capture_format(format: CaptureFormat) -> v4l::FourCC {
+    match format {
+        CaptureFormat::Mjpeg => v4l::FourCC::new(b"MJPG"),
+        CaptureFormat::Yuyv => v4l::FourCC::new(b"YUYV"),
+        CaptureFormat::Grey => v4l::FourCC::new(b"GREY"),
     }
 }
 
@@ -2194,7 +2901,18 @@ mod tests {
     use super::*;
     use image::ImageEncoder;
     use std::cell::{Cell, RefCell};
+    use std::process::{Command, Stdio};
     use std::rc::Rc;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Clone, Default)]
+    struct RecordingObserver(Arc<Mutex<Vec<CameraLifecycleEvent>>>);
+
+    impl CameraLifecycleObserver for RecordingObserver {
+        fn observe(&self, event: CameraLifecycleEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
 
     fn format(width: u32, height: u32, fourcc: &[u8; 4], stride: u32) -> v4l::format::Format {
         let mut format = v4l::format::Format::new(width, height, v4l::FourCC::new(fourcc));
@@ -2251,6 +2969,7 @@ mod tests {
             height: 1,
             format: CaptureFormat::Grey,
             frame_size,
+            lifecycle_observer: default_lifecycle_observer(),
         }
     }
 
@@ -2262,6 +2981,65 @@ mod tests {
         assert_eq!(frame.data, [1, 2, 3, 4, 5, 6]);
         assert_eq!((frame.width, frame.height), (3, 2));
         assert_eq!(frame.format, FrameFormat::Gray);
+    }
+
+    #[test]
+    fn asynchronous_slot_overwrites_stale_frames_without_wait_or_copy() {
+        let latest = Arc::new((Mutex::new(None), Condvar::new()));
+        let (notify, _receiver) = mpsc::sync_channel(1);
+        let stale = Frame {
+            data: vec![1, 2, 3, 4],
+            width: 4,
+            height: 1,
+            format: FrameFormat::Gray,
+        };
+        assert!(publish_message(
+            &latest,
+            &notify,
+            CaptureMessage::Frame(stale)
+        ));
+
+        let fresh = Frame {
+            data: vec![5, 6, 7, 8],
+            width: 4,
+            height: 1,
+            format: FrameFormat::Gray,
+        };
+        let pointer = fresh.data.as_ptr();
+        let producer_latest = Arc::clone(&latest);
+        let (done_tx, done_rx) = mpsc::channel();
+        let producer = thread::spawn(move || {
+            done_tx
+                .send(publish_message(
+                    &producer_latest,
+                    &notify,
+                    CaptureMessage::Frame(fresh),
+                ))
+                .unwrap();
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+            "producer must not wait for the consumer"
+        );
+        producer.join().unwrap();
+        let CaptureMessage::Frame(frame) = take_latest_message(&latest).unwrap() else {
+            panic!("expected frame");
+        };
+        assert_eq!(frame.data.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn maximum_frame_zeroization_has_a_bounded_cpu_cost() {
+        let frame = Frame {
+            data: vec![0x5a; MAX_NORMALIZED_FRAME_BYTES],
+            width: 4096,
+            height: 2160,
+            format: FrameFormat::Bgr,
+        };
+        let started = Instant::now();
+        drop(frame);
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(100));
     }
 
     #[test]
@@ -2432,14 +3210,16 @@ mod tests {
         undersized_raw.size = 3;
         assert!(validate_negotiated_format(&undersized_raw).is_err());
 
+        let four_k_yuyv = format(4096, 2160, b"YUYV", 8192);
+        assert!(validate_negotiated_format(&four_k_yuyv).is_ok());
         let eight_k_yuyv = format(7680, 4320, b"YUYV", 15_360);
-        assert!(validate_negotiated_format(&eight_k_yuyv).is_ok());
+        assert!(validate_negotiated_format(&eight_k_yuyv).is_err());
     }
 
     #[test]
     fn bounds_grey_eventual_bgr_expansion() {
-        let eight_k_grey = format(7680, 4320, b"GREY", 7680);
-        assert!(validate_negotiated_format(&eight_k_grey).is_ok());
+        let four_k_grey = format(4096, 2160, b"GREY", 4096);
+        assert!(validate_negotiated_format(&four_k_grey).is_ok());
 
         let width = u32::try_from(MAX_NORMALIZED_FRAME_BYTES / 3 + 1).unwrap();
         let expansion_too_large = format(width, 1, b"GREY", width);
@@ -2542,6 +3322,51 @@ mod tests {
     }
 
     #[test]
+    fn format_specific_phase_peaks_admit_maximum_supported_profiles() {
+        let inference = crate::inference::inference_plaintext_scratch_bytes(640, 640).unwrap();
+        // 4094x2732 is an even-width geometry within 8 bytes of the 32-MiB
+        // BGR allocation cap, exercising the maximum accepted byte envelope.
+        let grey = CameraProfile::test_grey_profile(4094, 2732);
+        let yuyv = CameraProfile::test_yuyv_profile(4094, 2732);
+        let mjpeg = CameraProfile::test_mjpeg_profile(1920, 1080, MAX_MJPEG_ENCODED_BYTES);
+        for profile in [&grey, &yuyv, &mjpeg] {
+            assert!(profile.live_pipeline_bytes(inference).unwrap() < 128 * 1024 * 1024);
+        }
+        for dci_profile in [
+            CameraProfile::test_grey_profile(4096, 2160),
+            CameraProfile::test_yuyv_profile(4096, 2160),
+        ] {
+            assert!(dci_profile.live_pipeline_bytes(inference).unwrap() < 128 * 1024 * 1024);
+        }
+        assert!(
+            CameraProfile::test_yuyv_profile(4096, 2731)
+                .live_pipeline_bytes(inference)
+                .is_err()
+        );
+
+        // DCI-4K MJPEG remains geometrically valid, but its conservative
+        // progressive-decoder phase is intentionally unavailable to 128 MiB
+        // enrollment admission. Raw DCI-4K remains admitted.
+        let dci_mjpeg = CameraProfile::test_mjpeg_profile(4096, 2160, 2 * 1024 * 1024);
+        assert!(dci_mjpeg.live_pipeline_bytes(inference).is_err());
+    }
+
+    #[test]
+    fn accepted_v4l2_profile_must_match_admission_before_stream_allocation() {
+        let admitted = CameraProfile::test_yuyv_profile(640, 480);
+        let accepted = format(640, 480, b"YUYV", 1280);
+        assert!(validate_accepted_profile(&admitted, &accepted).is_ok());
+
+        let wrong_dimensions = format(800, 480, b"YUYV", 1600);
+        assert!(validate_accepted_profile(&admitted, &wrong_dimensions).is_err());
+        let wrong_format = format(640, 480, b"GREY", 640);
+        assert!(validate_accepted_profile(&admitted, &wrong_format).is_err());
+        let mut oversized = accepted;
+        oversized.size = u32::try_from(admitted.mapped_buffer_bytes + 1).unwrap();
+        assert!(validate_accepted_profile(&admitted, &oversized).is_err());
+    }
+
+    #[test]
     fn rejects_mjpeg_payload_length_over_daemon_limit_without_allocating() {
         let payload_len = MAX_MAPPED_BUFFER_BYTES + 1;
         assert!(validate_mjpeg_payload_len(payload_len, u32::MAX).is_err());
@@ -2578,6 +3403,7 @@ mod tests {
         let cancellation = AtomicBool::new(false);
         let selected = start_backend_with(
             &cancellation,
+            true,
             || {
                 order.borrow_mut().push("v4l2");
                 Err(anyhow!("unavailable"))
@@ -2594,11 +3420,53 @@ mod tests {
     }
 
     #[test]
+    fn automatic_discovery_candidate_open_is_observed_before_inspection() {
+        let observer = RecordingObserver::default();
+        let inspection_observer = observer.clone();
+        let selected = inspect_discovery_candidate(
+            Path::new("/injected/video-candidate"),
+            &observer,
+            move |path| {
+                assert_eq!(path, Path::new("/injected/video-candidate"));
+                assert_eq!(
+                    *inspection_observer.0.lock().unwrap(),
+                    [CameraLifecycleEvent::DeviceOpen]
+                );
+                true
+            },
+        );
+        assert!(selected);
+        assert_eq!(
+            *observer.0.lock().unwrap(),
+            [CameraLifecycleEvent::DeviceOpen]
+        );
+    }
+
+    #[test]
+    fn enrollment_rejects_ffmpeg_only_backend_before_fallback_construction() {
+        let cancellation = AtomicBool::new(false);
+        let ffmpeg_called = Cell::new(false);
+        let result: Result<BackendStart<&str>> = start_backend_with(
+            &cancellation,
+            false,
+            || Err(anyhow!("V4L2 unavailable")),
+            || {
+                ffmpeg_called.set(true);
+                Ok("ffmpeg")
+            },
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("FFmpeg fallback is disabled for enrollment"));
+        assert!(!ffmpeg_called.get());
+    }
+
+    #[test]
     fn successful_v4l2_start_does_not_try_ffmpeg() {
         let ffmpeg_called = Cell::new(false);
         let cancellation = AtomicBool::new(false);
         let selected = start_backend_with(
             &cancellation,
+            true,
             || Ok("v4l2"),
             || {
                 ffmpeg_called.set(true);
@@ -2618,6 +3486,7 @@ mod tests {
         let ffmpeg_called = Cell::new(false);
         let result = start_backend_with(
             &cancellation,
+            true,
             || {
                 v4l_called.set(true);
                 Ok("v4l")
@@ -2635,6 +3504,7 @@ mod tests {
         cancellation.store(false, Ordering::Release);
         let result: BackendStart<&str> = start_backend_with(
             &cancellation,
+            true,
             || {
                 cancellation.store(true, Ordering::Release);
                 Err(anyhow!("terminal V4L failure"))
@@ -2830,12 +3700,14 @@ mod tests {
     }
 
     fn camera_with_test_worker(run: impl FnOnce(Arc<AtomicBool>) + Send + 'static) -> Camera {
-        let cancellation = Arc::new(AtomicBool::new(false));
+        let direct_cancellation = Arc::new(DirectCameraCancellation::new());
+        let cancellation = Arc::clone(&direct_cancellation.flag);
         let worker_cancellation = Arc::clone(&cancellation);
         let handle = thread::spawn(move || run(worker_cancellation));
         let (notify_tx, notify_rx) = mpsc::sync_channel(1);
         drop(notify_tx);
         Camera {
+            admitted_profile: CameraProfile::test_profile("test-worker"),
             width: 1,
             height: 1,
             format: CaptureFormat::Grey,
@@ -2843,14 +3715,90 @@ mod tests {
             fps: -1,
             exposure: -1,
             worker: Some(CaptureWorker {
-                latest_message: Arc::new(Mutex::new(None)),
+                latest_message: Arc::new((Mutex::new(None), Condvar::new())),
                 notify_rx,
                 cancellation,
                 thread_handle: Some(handle),
             }),
             pending_cleanup: None,
             selected_backend: Arc::new(Mutex::new(None)),
+            lifecycle_observer: default_lifecycle_observer(),
+            child_policy: Arc::new(DaemonChildPolicy::for_mode(
+                howy_common::config::EmbeddingSecurityMode::Plaintext,
+            )),
+            direct_cancellation,
+            frame_discard_observer: None,
         }
+    }
+
+    struct CancelOnCheck {
+        checks: AtomicUsize,
+        cancel_at: usize,
+    }
+
+    impl CancelOnCheck {
+        fn new(cancel_at: usize) -> Self {
+            Self {
+                checks: AtomicUsize::new(0),
+                cancel_at,
+            }
+        }
+    }
+
+    impl CancellationSignal for CancelOnCheck {
+        fn is_cancelled(&self) -> bool {
+            self.checks.fetch_add(1, Ordering::AcqRel) >= self.cancel_at
+        }
+    }
+
+    fn queue_test_frame(camera: &Camera, data: Vec<u8>) -> *const u8 {
+        let frame = Frame {
+            data,
+            width: 4,
+            height: 1,
+            format: FrameFormat::Gray,
+        };
+        let pointer = frame.data.as_ptr();
+        let latest_message = &camera.worker.as_ref().unwrap().latest_message;
+        *latest_message
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CaptureMessage::Frame(frame));
+        pointer
+    }
+
+    #[test]
+    fn production_capture_rechecks_cancellation_before_returning_candidate_frame() {
+        let mut cancelled_camera = camera_with_test_worker(|_| {});
+        queue_test_frame(&cancelled_camera, vec![1, 2, 3, 4]);
+        let zeroized = Arc::new(AtomicBool::new(false));
+        let observed_zeroized = Arc::clone(&zeroized);
+        cancelled_camera.frame_discard_observer = Some(Arc::new(move |frame| {
+            assert_eq!(frame.data, [0, 0, 0, 0]);
+            observed_zeroized.store(true, Ordering::Release);
+        }));
+        let cancellation = CancelOnCheck::new(1);
+
+        let error = match <Camera as CameraCapture>::capture_frame_cancellable(
+            &mut cancelled_camera,
+            &cancellation,
+        ) {
+            Ok(_) => panic!("candidate frame must be rejected at the cancellation boundary"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), CameraFailureKind::Cancelled);
+        assert_eq!(cancellation.checks.load(Ordering::Acquire), 2);
+        assert!(zeroized.load(Ordering::Acquire));
+
+        let mut successful_camera = camera_with_test_worker(|_| {});
+        let expected_pointer = queue_test_frame(&successful_camera, vec![5, 6, 7, 8]);
+        let active = CancelOnCheck::new(usize::MAX);
+        let frame =
+            <Camera as CameraCapture>::capture_frame_cancellable(&mut successful_camera, &active)
+                .expect("uncancelled candidate frame should succeed");
+        assert_eq!(frame.data, [5, 6, 7, 8]);
+        assert_eq!(frame.data.as_ptr(), expected_pointer);
+        assert_eq!(active.checks.load(Ordering::Acquire), 2);
     }
 
     #[test]
@@ -2970,14 +3918,6 @@ mod tests {
             positive_args.get(fps_index + 1).map(String::as_str),
             Some("25")
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn parent_death_signal_pre_exec_contract_allows_child_exec() {
-        let mut command = Command::new("/bin/true");
-        configure_parent_death_signal(&mut command);
-        assert!(command.status().unwrap().success());
     }
 
     #[test]
