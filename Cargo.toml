@@ -6,6 +6,12 @@ members = [
     "crates/howy-pam",
     "crates/howy-cli",
 ]
+exclude = [
+    "vendor/aes-0.9.1",
+    "vendor/aes-gcm-0.11.0",
+    "vendor/ghash-0.6.0",
+    "vendor/polyval-0.7.2",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,7 +27,18 @@ serde_json = "1"
 bincode = "1"
 thiserror = "2"
 anyhow = "1"
-tracing = "0.1"
+# Exact RustCrypto releases are locally patched so addressable key-derived
+# scratch is held by panic-safe zeroizing guards. Retained schedules/state also
+# keep their upstream zeroize-on-drop behavior.
+aes-gcm = { version = "=0.11.0", default-features = false, features = ["aes", "alloc", "zeroize"] }
+aes = { version = "=0.9.1", default-features = false, features = ["zeroize"] }
+ghash = { version = "=0.6.0", default-features = false, features = ["zeroize"] }
+getrandom = "=0.4.3"
+sha2 = { version = "=0.11.0", default-features = false }
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
+# Keep diagnostics in development, but compile non-actionable events out of
+# optimized PAM/daemon hot paths. Warnings and errors remain in release builds.
+tracing = { version = "0.1", features = ["release_max_level_warn"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.8"
 
@@ -31,7 +48,7 @@ prost-build = "0.13"
 
 # Inference
 ort = { version = "2.0.0-rc.10", default-features = false, features = [
-    "ndarray", "std", "tracing", "copy-dylibs",
+    "ndarray", "std", "copy-dylibs",
     "cuda", "tensorrt", "openvino", "migraphx",
 ] }
 ndarray = "0.17"
@@ -51,6 +68,14 @@ tokio = { version = "1", features = ["full"] }
 
 # Credential caching
 linux-keyutils = "0.2"
+
+[patch.crates-io]
+# Exact upstream releases and HOWY zeroization deltas are documented in each
+# vendor directory's HOWY_PATCH.md.
+aes = { path = "vendor/aes-0.9.1" }
+aes-gcm = { path = "vendor/aes-gcm-0.11.0" }
+ghash = { path = "vendor/ghash-0.6.0" }
+polyval = { path = "vendor/polyval-0.7.2" }
 
 [profile.release]
 lto = "fat"

@@ -13,6 +13,7 @@ makedepends=(
   'git'
   'onnxruntime-cpu'
   'protobuf'
+  'systemd>=257'
 )
 source=("${pkgbase}::git+https://github.com/LLJY/howy.git")
 sha256sums=('SKIP')
@@ -53,6 +54,7 @@ _package_common() {
   install -Dm755 scripts/enroll.py "${pkgdir}/usr/bin/howy-enroll"
   install -Dm644 systemd/howy.service "${pkgdir}/usr/lib/systemd/system/howy.service"
   install -Dm644 systemd/howy.socket "${pkgdir}/usr/lib/systemd/system/howy.socket"
+  install -Dm644 sysusers.d/howy.conf "${pkgdir}/usr/lib/sysusers.d/howy.conf"
   install -Dm644 README.md "${pkgdir}/usr/share/doc/${_pkgname}/README.md"
   install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${_pkgname}/LICENSE"
 
@@ -65,7 +67,7 @@ _package_common() {
 
 package_howy-cpu-git() {
   pkgdesc='Linux face authentication daemon using ONNX Runtime CPU backend'
-  depends=('onnxruntime-cpu' 'pam')
+  depends=('onnxruntime-cpu' 'pam' 'systemd>=257')
   optdepends=(
     'curl: download default ONNX models'
     'ffmpeg: optional camera fallback when native V4L2 mmap capture fails'
@@ -82,7 +84,7 @@ package_howy-cpu-git() {
 
 package_howy-rocm-git() {
   pkgdesc='Linux face authentication daemon using ONNX Runtime ROCm backend'
-  depends=('onnxruntime-rocm' 'pam')
+  depends=('onnxruntime-rocm' 'pam' 'systemd>=257')
   optdepends=(
     'curl: download default ONNX models'
     'ffmpeg: optional camera fallback when native V4L2 mmap capture fails'
@@ -99,7 +101,7 @@ package_howy-rocm-git() {
 
 package_howy-cuda-git() {
   pkgdesc='Linux face authentication daemon using ONNX Runtime CUDA backend'
-  depends=('onnxruntime-cuda' 'pam')
+  depends=('onnxruntime-cuda' 'pam' 'systemd>=257')
   optdepends=(
     'curl: download default ONNX models'
     'ffmpeg: optional camera fallback when native V4L2 mmap capture fails'

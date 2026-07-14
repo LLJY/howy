@@ -10,6 +10,7 @@ pkgbase = howy-git
 	makedepends = git
 	makedepends = onnxruntime-cpu
 	makedepends = protobuf
+	makedepends = systemd>=257
 	source = howy-git::git+https://github.com/LLJY/howy.git
 	sha256sums = SKIP
 
@@ -17,6 +18,7 @@ pkgname = howy-cpu-git
 	pkgdesc = Linux face authentication daemon using ONNX Runtime CPU backend
 	depends = onnxruntime-cpu
 	depends = pam
+	depends = systemd>=257
 	optdepends = curl: download default ONNX models
 	optdepends = ffmpeg: optional camera fallback when native V4L2 mmap capture fails
 	optdepends = unzip: extract default ONNX models
@@ -32,6 +34,7 @@ pkgname = howy-rocm-git
 	pkgdesc = Linux face authentication daemon using ONNX Runtime ROCm backend
 	depends = onnxruntime-rocm
 	depends = pam
+	depends = systemd>=257
 	optdepends = curl: download default ONNX models
 	optdepends = ffmpeg: optional camera fallback when native V4L2 mmap capture fails
 	optdepends = unzip: extract default ONNX models
@@ -47,6 +50,7 @@ pkgname = howy-cuda-git
 	pkgdesc = Linux face authentication daemon using ONNX Runtime CUDA backend
 	depends = onnxruntime-cuda
 	depends = pam
+	depends = systemd>=257
 	optdepends = curl: download default ONNX models
 	optdepends = ffmpeg: optional camera fallback when native V4L2 mmap capture fails
 	optdepends = unzip: extract default ONNX models

@@ -3,6 +3,7 @@ Description=howy Face Authentication Daemon
 Documentation=https://github.com/howy/howy
 After=network.target
 Requires=howy.socket
+ConditionPathExists=!/etc/howy/.security-transaction
 
 [Service]
 Type=simple
@@ -11,12 +12,7 @@ Type=simple
 ExecStart=/usr/bin/howyd
 Restart=on-failure
 RestartSec=5
-
-# Systemd credentials: encrypted config and model keys
-# Uncomment the following lines ONLY after provisioning encrypted credentials:
-#   systemd-creds encrypt --name=howy.config /etc/howy/config.toml /etc/credstore.encrypted/howy.config
-# LoadCredentialEncrypted=howy.config
-# ImportCredential=howy.*
+LoadCredentialEncrypted=howy.storage.mode1.epoch1
 
 # Environment
 Environment="RUST_LOG=info"
@@ -30,6 +26,9 @@ Environment="ORT_MIGRAPHX_MODEL_CACHE_PATH=/var/cache/howy"
 Environment="ORT_MIGRAPHX_CACHE_PATH=/var/cache/howy"
 
 # Security hardening
+LimitCORE=0
+# One guarded data page is locked; keep the allowance bounded for page-size variance.
+LimitMEMLOCK=64K
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only

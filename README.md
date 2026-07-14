@@ -139,6 +139,12 @@ howy is designed as a drop-in replacement for howdy. The local installer places
 `pam_howy.so` but never edits PAM service configuration; PAM integration remains
 an explicit administrator step.
 
+The PAM service name and LOCAL/REMOTE origin are client-supplied policy context,
+not attested identity. A same-UID custom client can claim an allowlisted service
+and use the protocol without displaying the supported PAM UI. Confirmation
+therefore proves user intent only in supported clients; it is not liveness/PAD
+and does not provide a trusted-path UI.
+
 ## Project Structure
 
 ```

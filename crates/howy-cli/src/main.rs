@@ -4,17 +4,65 @@ use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use howy_common::config::HowyConfig;
 use howy_common::env::parse_strict_bool;
-use howy_common::face::{FaceModel, UserModels};
 use howy_common::ipc::DaemonClient;
-use howy_common::paths;
-use howy_common::protocol::{Request, RespResult};
+use howy_common::protocol::{
+    EnrollBatchResult, EnrollSuccess, EnrollmentMetadataEntry, LIVE_ENROLLMENT_PROTOCOL_VERSION,
+    ListEnrollmentsResult, Request, RespResult, STORAGE_CONFLICT_ERROR,
+};
+
+mod importer;
+mod security;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliKeySelection {
+    Auto,
+    Host,
+    Tpm2,
+    #[value(name = "host+tpm2")]
+    HostAndTpm2,
+}
+
+impl From<CliKeySelection> for security::KeySelection {
+    fn from(value: CliKeySelection) -> Self {
+        match value {
+            CliKeySelection::Auto => Self::Auto,
+            CliKeySelection::Host => Self::Host,
+            CliKeySelection::Tpm2 => Self::Tpm2,
+            CliKeySelection::HostAndTpm2 => Self::HostAndTpm2,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum SecurityCommands {
+    /// Provision an explicit storage security mode transactionally.
+    Provision {
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=2))]
+        mode: u8,
+        #[arg(long, value_enum, default_value = "auto")]
+        with_key: CliKeySelection,
+        #[arg(long)]
+        adopt_existing: bool,
+    },
+    /// Activate an exact receipted disabled Mode-1 candidate.
+    Enable,
+    /// Deterministically recover the durable security transaction journal.
+    Recover,
+    /// Remove an exact unadopted artifact after reference-safe revalidation.
+    CleanupUnadopted {
+        #[arg(long)]
+        transaction: String,
+        #[arg(long)]
+        artifact_sha256: String,
+    },
+}
 
 #[derive(Parser)]
 #[command(
@@ -37,6 +85,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(name = "__image-import", hide = true)]
+    ImageImport {
+        #[arg(long)]
+        session_dir: String,
+    },
     /// Enroll a new face model.
     Add {
         /// Label for this face model (e.g., "laptop IR", "office webcam").
@@ -90,6 +143,12 @@ enum Commands {
         stdout: bool,
     },
 
+    /// Provision, activate, recover, or clean up storage security state.
+    Security {
+        #[command(subcommand)]
+        command: SecurityCommands,
+    },
+
     /// Print the version.
     Version,
 }
@@ -103,6 +162,7 @@ fn main() -> Result<()> {
     )?;
 
     match command {
+        Commands::ImageImport { session_dir } => importer::run_hidden_importer(&session_dir),
         Commands::Add { label } => {
             let user = resolve_target_user(user.as_deref())?;
             cmd_add(&user, label, yes)
@@ -135,11 +195,76 @@ fn main() -> Result<()> {
         Commands::Doctor => cmd_doctor(),
         Commands::Prewarm => cmd_prewarm(),
         Commands::Config { stdout } => cmd_config(stdout),
+        Commands::Security { command } => cmd_security(command, yes),
         Commands::Version => {
             println!("howy {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }
+}
+
+fn cmd_security(command: SecurityCommands, assume_yes: bool) -> Result<()> {
+    let mut runtime = security::RealSecurityRuntime::new();
+    let mut engine = security::SecurityEngine::new(&mut runtime);
+    let outcome = match command {
+        SecurityCommands::Provision {
+            mode,
+            with_key,
+            adopt_existing,
+        } => {
+            let mode = match mode {
+                0 => security::ProvisionMode::Plaintext,
+                1 => security::ProvisionMode::CachedAead,
+                2 => security::ProvisionMode::EphemeralAead,
+                _ => unreachable!("clap restricts security mode"),
+            };
+            let confirmed = if assume_yes {
+                true
+            } else {
+                if mode == security::ProvisionMode::Plaintext {
+                    eprintln!(
+                        "WARNING: Mode 0 stores face embeddings in plaintext. Encrypted artifacts and namespaces will be preserved."
+                    );
+                }
+                prompt_yes("Proceed with the transactional security migration? [y/N] ")?
+            };
+            engine.provision(security::ProvisionRequest {
+                mode,
+                with_key: with_key.into(),
+                adopt_existing,
+                confirmed,
+            })
+        }
+        SecurityCommands::Enable => engine.enable(),
+        SecurityCommands::Recover => engine.recover(),
+        SecurityCommands::CleanupUnadopted {
+            transaction,
+            artifact_sha256,
+        } => {
+            let artifact_sha256 = howy_common::provisioning::Sha256Digest::parse(artifact_sha256)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            engine.cleanup_unadopted(security::CleanupRequest {
+                transaction_id: transaction,
+                artifact_sha256,
+            })
+        }
+    }
+    .map_err(|error| anyhow::anyhow!(error))?;
+    for message in outcome.messages {
+        println!("{message}");
+    }
+    if let Some(command) = outcome.cleanup_command {
+        println!("Safe cleanup command: {command}");
+    }
+    Ok(())
+}
+
+fn prompt_yes(prompt: &str) -> Result<bool> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().eq_ignore_ascii_case("y"))
 }
 
 fn cmd_add(user: &str, label: Option<String>, _skip_confirm: bool) -> Result<()> {
@@ -166,45 +291,13 @@ fn cmd_add(user: &str, label: Option<String>, _skip_confirm: bool) -> Result<()>
 
     match response.result {
         Some(RespResult::Enrolled(e)) => {
-            // Load or create user models — fail hard on corrupt files
-            // to avoid silently overwriting existing enrollments.
-            let model_path = model_path_for_user(user)?;
-            let mut models = if model_path.exists() {
-                UserModels::load(&model_path)?
-            } else if has_legacy_models(user) {
-                let legacy =
-                    paths::user_model_path_legacy(user).expect("has_legacy_models returned true");
-                UserModels::load(&legacy)?
-            } else {
-                UserModels::new(user)
-            };
-
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            models.models.push(FaceModel {
-                label: label.clone(),
-                created: now,
-                embedding: e.embedding,
-            });
-
-            // Ensure models directory exists
-            if let Some(parent) = model_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            models.save(&model_path)?;
-
+            validate_live_enrollment_result(&e)?;
             println!("Face model added successfully:");
             println!("  Label: {label}");
             println!("  Detection score: {:.3}", e.det_score);
-            println!("  Total models: {}", models.models.len());
+            println!("  Total models: {}", e.total_count);
         }
-        Some(RespResult::Error(e)) => {
-            bail!("Enrollment failed: {}", e.message);
-        }
+        Some(RespResult::Error(error)) => return daemon_storage_error("Enrollment failed", error),
         other => {
             bail!("Unexpected response: {other:?}");
         }
@@ -224,43 +317,27 @@ fn cmd_enroll_batch(
     let label = label.unwrap_or_else(|| "default".to_string());
 
     let dir = Path::new(session_dir);
-    if !dir.is_dir() {
-        bail!("Session directory not found: {session_dir}");
-    }
-
-    // Count image files for user feedback
-    let image_count = std::fs::read_dir(dir)?
-        .flatten()
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| {
-                    matches!(
-                        ext.to_ascii_lowercase().as_str(),
-                        "png" | "jpg" | "jpeg" | "bmp"
-                    )
-                })
-                .unwrap_or(false)
-        })
-        .count();
-
-    if image_count == 0 {
-        bail!("No image files (png/jpg/bmp) found in {session_dir}");
-    }
+    let staged = importer::stage_session(dir)?;
+    let image_count = staged.image_count();
 
     println!("Enrolling {image_count} frame(s) for user '{user}' with label '{label}'...");
 
     let mut client = DaemonClient::default_path().with_timeout(std::time::Duration::from_secs(120));
 
-    let response = client.request(&Request::enroll_batch(user, session_dir, &label))?;
+    let staging_path = staged
+        .path()
+        .to_str()
+        .context("staging path is not valid UTF-8")?;
+    let response = client.request(&Request::enroll_batch(user, staging_path, &label))?;
 
     match response.result {
         Some(RespResult::EnrollBatchDone(r)) => {
+            validate_batch_enrollment_result(&r)?;
             println!("\nEnrollment complete:");
             println!("  Frames found:    {}", r.frames_found);
             println!("  Frames accepted: {}", r.frames_accepted);
             println!("  Frames rejected: {}", r.frames_rejected);
+            println!("  Total models:    {}", r.total_count);
             println!("  Time: {:.1}ms", r.elapsed_ms);
 
             if !r.rejection_details.is_empty() {
@@ -301,9 +378,7 @@ fn cmd_enroll_batch(
                 r.frames_accepted
             );
         }
-        Some(RespResult::Error(e)) => {
-            bail!("Enrollment failed: {}", e.message);
-        }
+        Some(RespResult::Error(error)) => return daemon_storage_error("Enrollment failed", error),
         other => {
             bail!("Unexpected response: {other:?}");
         }
@@ -312,17 +387,44 @@ fn cmd_enroll_batch(
     Ok(())
 }
 
-fn cmd_list(user: &str) -> Result<()> {
-    let model_path = model_path_for_user(user)?;
-
-    if !model_path.exists() && !has_legacy_models(user) {
-        println!("No face models enrolled for user '{user}'");
-        return Ok(());
+fn validate_live_enrollment_result(result: &EnrollSuccess) -> Result<()> {
+    if result.enrollment_protocol_version != LIVE_ENROLLMENT_PROTOCOL_VERSION {
+        bail!(
+            "Enrollment failed: daemon does not support compatible daemon-owned storage enrollment"
+        );
     }
+    if result.enrollment_id.len() != 16
+        || result.enrollment_id.iter().all(|byte| *byte == 0)
+        || result.generation == 0
+        || result.total_count == 0
+        || !result.det_score.is_finite()
+    {
+        bail!("Enrollment failed: daemon returned invalid enrollment metadata");
+    }
+    Ok(())
+}
 
-    let models = UserModels::load(&model_path)?;
+fn validate_batch_enrollment_result(result: &EnrollBatchResult) -> Result<()> {
+    let classified = result
+        .frames_accepted
+        .checked_add(result.frames_rejected)
+        .filter(|classified| *classified == result.frames_found);
+    if classified.is_none()
+        || !result.elapsed_ms.is_finite()
+        || result.elapsed_ms < 0.0
+        || (result.generation == 0 && result.total_count != 0)
+        || (result.frames_accepted > 0
+            && (result.generation == 0 || result.total_count < result.frames_accepted))
+    {
+        bail!("Enrollment failed: daemon returned legacy or invalid batch metadata");
+    }
+    Ok(())
+}
 
-    if models.models.is_empty() {
+fn cmd_list(user: &str) -> Result<()> {
+    check_root()?;
+    let list = fetch_enrollments(user)?;
+    if list.entries.is_empty() {
         println!("No face models enrolled for user '{user}'");
         return Ok(());
     }
@@ -331,33 +433,24 @@ fn cmd_list(user: &str) -> Result<()> {
     println!("{:<6} {:<24} {:<24}", "Index", "Label", "Created");
     println!("{}", "-".repeat(54));
 
-    for (i, model) in models.models.iter().enumerate() {
-        let created = format_timestamp(model.created);
+    for (i, model) in list.entries.iter().enumerate() {
+        let created = format_timestamp(model.created_unix_seconds);
         println!("{:<6} {:<24} {:<24}", i, model.label, created);
     }
 
-    println!("\nTotal: {} model(s)", models.models.len());
+    println!("\nTotal: {} model(s)", list.entries.len());
     Ok(())
 }
 
 fn cmd_remove(user: &str, index: usize, skip_confirm: bool) -> Result<()> {
     check_root()?;
 
-    let model_path = model_path_for_user(user)?;
-    let mut models = UserModels::load(&model_path).context("No face models found")?;
-
-    if models.models.is_empty() {
+    let list = fetch_enrollments(user)?;
+    if list.entries.is_empty() {
         bail!("No face models to remove for user '{user}'");
     }
-
-    if index >= models.models.len() {
-        bail!(
-            "Invalid index {index}. Valid range: 0-{}",
-            models.models.len() - 1
-        );
-    }
-
-    let label = &models.models[index].label;
+    let selected = select_enrollment(&list, index)?;
+    let label = &selected.entry.label;
 
     if !skip_confirm {
         print!("Remove model '{label}' (index {index})? [y/N] ");
@@ -370,20 +463,28 @@ fn cmd_remove(user: &str, index: usize, skip_confirm: bool) -> Result<()> {
         }
     }
 
-    let removed = models.models.remove(index);
-    models.save(&model_path)?;
-
-    println!("Removed model '{}' (index {index})", removed.label);
-    println!("Remaining: {} model(s)", models.models.len());
+    let mut client = DaemonClient::default_path();
+    let response = client.request(&Request::remove_enrollment(
+        user,
+        selected.entry.enrollment_id.clone(),
+        selected.generation,
+    ))?;
+    match response.result {
+        Some(RespResult::RemoveEnrollment(_)) => {
+            println!("Removed model '{}' (index {index})", selected.entry.label);
+            println!("Remaining: {} model(s)", list.entries.len() - 1);
+        }
+        Some(RespResult::Error(error)) => return daemon_storage_error("Removal failed", error),
+        other => bail!("Unexpected response: {other:?}"),
+    }
     Ok(())
 }
 
 fn cmd_clear(user: &str, skip_confirm: bool) -> Result<()> {
     check_root()?;
 
-    let model_path = model_path_for_user(user)?;
-
-    if !model_path.exists() && !has_legacy_models(user) {
+    let list = fetch_enrollments(user)?;
+    if list.entries.is_empty() && list.generation == 0 {
         println!("No face models to clear for user '{user}'");
         return Ok(());
     }
@@ -399,20 +500,14 @@ fn cmd_clear(user: &str, skip_confirm: bool) -> Result<()> {
         }
     }
 
-    // Remove both bincode and legacy JSON files.
-    let mut removed_any = false;
-    if model_path.exists() {
-        std::fs::remove_file(&model_path)?;
-        removed_any = true;
-    }
-    if let Some(legacy) = paths::user_model_path_legacy(user) {
-        if legacy.exists() {
-            std::fs::remove_file(&legacy)?;
-            removed_any = true;
+    let mut client = DaemonClient::default_path();
+    let response = client.request(&Request::clear_enrollments(user, list.generation))?;
+    match response.result {
+        Some(RespResult::ClearEnrollments(_)) => {
+            println!("All face models removed for '{user}'");
         }
-    }
-    if removed_any {
-        println!("All face models removed for '{user}'");
+        Some(RespResult::Error(error)) => return daemon_storage_error("Clear failed", error),
+        other => bail!("Unexpected response: {other:?}"),
     }
     Ok(())
 }
@@ -423,7 +518,7 @@ fn cmd_test(user: &str, perf_trace: bool) -> Result<()> {
     let mut client = DaemonClient::default_path().with_timeout(std::time::Duration::from_secs(10));
 
     let request_started = perf_trace.then(Instant::now);
-    let response = client.authenticate(user, 0);
+    let response = client.request(&test_auth_request(user));
     if let Some(started) = request_started {
         println!(
             "Client request wall: {:.1}ms",
@@ -457,6 +552,10 @@ fn cmd_test(user: &str, perf_trace: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn test_auth_request(user: &str) -> Request {
+    Request::authenticate_v1(user, 0)
 }
 
 fn cmd_status() -> Result<()> {
@@ -647,7 +746,15 @@ fn configure_private_umask(command: &mut Command) {
 
 #[cfg(test)]
 mod tests {
-    use super::configure_private_umask;
+    use super::{
+        Cli, Commands, SecurityCommands, configure_private_umask, select_enrollment,
+        test_auth_request, validate_batch_enrollment_result, validate_live_enrollment_result,
+    };
+    use clap::Parser;
+    use howy_common::protocol::{
+        Cmd, EnrollBatchResult, EnrollSuccess, EnrollmentMetadataEntry,
+        LIVE_ENROLLMENT_PROTOCOL_VERSION, ListEnrollmentsResult, Request,
+    };
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
@@ -677,10 +784,179 @@ mod tests {
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
+
+    #[test]
+    fn security_command_surface_is_exact_and_numeric_modes_are_bounded() {
+        let cli = Cli::try_parse_from([
+            "howy",
+            "security",
+            "provision",
+            "--mode",
+            "1",
+            "--with-key",
+            "host+tpm2",
+            "--adopt-existing",
+        ])
+        .unwrap();
+        let Commands::Security {
+            command:
+                SecurityCommands::Provision {
+                    mode,
+                    adopt_existing,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected security provision")
+        };
+        assert_eq!(mode, 1);
+        assert!(adopt_existing);
+
+        assert!(
+            Cli::try_parse_from([
+                "howy",
+                "security",
+                "cleanup-unadopted",
+                "--transaction",
+                "txn-1",
+                "--artifact-sha256",
+                &"01".repeat(32),
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["howy", "security", "provision", "--mode", "3",]).is_err());
+        assert!(
+            Cli::try_parse_from(["howy", "security", "provision", "--mode", "1", "--new-key",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_command_uses_only_versioned_authenticate_without_preflight_or_legacy_retry() {
+        let request = test_auth_request("alice");
+        let Some(Cmd::AuthenticateV1(request)) = request.cmd else {
+            panic!("howy test must use only AuthenticateV1")
+        };
+        assert_eq!(request.username, "alice");
+        assert_eq!(request.timeout, 0);
+        request.validate().unwrap();
+    }
+
+    #[test]
+    fn remove_display_index_maps_to_stable_id_and_list_generation() {
+        let list = ListEnrollmentsResult {
+            generation: 7,
+            entries: vec![
+                EnrollmentMetadataEntry {
+                    enrollment_id: vec![1; 16],
+                    label: "first".into(),
+                    created_unix_seconds: 1,
+                },
+                EnrollmentMetadataEntry {
+                    enrollment_id: vec![2; 16],
+                    label: "second".into(),
+                    created_unix_seconds: 2,
+                },
+            ],
+        };
+        let selected = select_enrollment(&list, 1).unwrap();
+        let request = Request::remove_enrollment(
+            "alice",
+            selected.entry.enrollment_id.clone(),
+            selected.generation,
+        );
+        let Some(Cmd::RemoveEnrollment(request)) = request.cmd else {
+            panic!("expected remove request");
+        };
+        assert_eq!(request.enrollment_id, vec![2; 16]);
+        assert_eq!(request.expected_generation, 7);
+    }
+
+    #[test]
+    fn remove_index_rejects_invalid_daemon_metadata() {
+        let list = ListEnrollmentsResult {
+            generation: 0,
+            entries: vec![EnrollmentMetadataEntry {
+                enrollment_id: vec![1; 16],
+                label: "invalid".into(),
+                created_unix_seconds: 1,
+            }],
+        };
+        assert!(select_enrollment(&list, 0).is_err());
+        assert!(select_enrollment(&list, 1).is_err());
+    }
+
+    #[test]
+    fn live_enrollment_rejects_legacy_and_invalid_metadata() {
+        let valid = EnrollSuccess {
+            det_score: 0.9,
+            enrollment_id: vec![7; 16],
+            generation: 1,
+            total_count: 1,
+            enrollment_protocol_version: LIVE_ENROLLMENT_PROTOCOL_VERSION,
+        };
+        assert!(validate_live_enrollment_result(&valid).is_ok());
+
+        let mut legacy = valid.clone();
+        legacy.enrollment_protocol_version = 0;
+        legacy.enrollment_id.clear();
+        legacy.generation = 0;
+        legacy.total_count = 0;
+        assert!(validate_live_enrollment_result(&legacy).is_err());
+
+        for invalid in [
+            EnrollSuccess {
+                enrollment_id: vec![0; 16],
+                ..valid.clone()
+            },
+            EnrollSuccess {
+                generation: 0,
+                ..valid.clone()
+            },
+            EnrollSuccess {
+                total_count: 0,
+                ..valid.clone()
+            },
+            EnrollSuccess {
+                det_score: f32::NAN,
+                ..valid
+            },
+        ] {
+            assert!(validate_live_enrollment_result(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn accepted_batch_rejects_legacy_or_inconsistent_metadata() {
+        let valid = EnrollBatchResult {
+            frames_found: 2,
+            frames_accepted: 2,
+            frames_rejected: 0,
+            elapsed_ms: 1.0,
+            rejection_details: Vec::new(),
+            generation: 1,
+            total_count: 2,
+        };
+        assert!(validate_batch_enrollment_result(&valid).is_ok());
+        assert!(
+            validate_batch_enrollment_result(&EnrollBatchResult {
+                generation: 0,
+                ..valid.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_batch_enrollment_result(&EnrollBatchResult {
+                total_count: 1,
+                ..valid
+            })
+            .is_err()
+        );
+    }
 }
 
 fn cmd_config(to_stdout: bool) -> Result<()> {
-    let config_toml = howy_common::config::HowyConfig::default_toml();
+    let config_toml = howy_common::config::HowyConfig::fresh_template_toml();
 
     if to_stdout {
         println!("{config_toml}");
@@ -736,18 +1012,42 @@ fn resolve_target_user(cli_user: Option<&str>) -> Result<String> {
     Ok(user)
 }
 
-fn model_path_for_user(user: &str) -> Result<std::path::PathBuf> {
-    match paths::user_model_path(user) {
-        Some(path) => Ok(path),
-        None => bail!("Invalid username '{user}'"),
+fn fetch_enrollments(user: &str) -> Result<ListEnrollmentsResult> {
+    let mut client = DaemonClient::default_path();
+    let response = client.request(&Request::list_enrollments(user))?;
+    match response.result {
+        Some(RespResult::ListEnrollments(list)) => Ok(list),
+        Some(RespResult::Error(error)) => daemon_storage_error("List failed", error),
+        other => bail!("Unexpected response: {other:?}"),
     }
 }
 
-/// Check if legacy JSON models exist for a user.
-fn has_legacy_models(user: &str) -> bool {
-    paths::user_model_path_legacy(user)
-        .map(|p| p.exists())
-        .unwrap_or(false)
+struct SelectedEnrollment<'a> {
+    generation: u64,
+    entry: &'a EnrollmentMetadataEntry,
+}
+
+fn select_enrollment(list: &ListEnrollmentsResult, index: usize) -> Result<SelectedEnrollment<'_>> {
+    let entry = list.entries.get(index).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Invalid index {index}. Valid range: 0-{}",
+            list.entries.len().saturating_sub(1)
+        )
+    })?;
+    if list.generation == 0 || entry.enrollment_id.len() != 16 {
+        bail!("Daemon returned invalid enrollment metadata");
+    }
+    Ok(SelectedEnrollment {
+        generation: list.generation,
+        entry,
+    })
+}
+
+fn daemon_storage_error<T>(context: &str, error: howy_common::protocol::Error) -> Result<T> {
+    if error.code == STORAGE_CONFLICT_ERROR {
+        bail!("{context}: enrollment data changed; run `howy list` and retry");
+    }
+    bail!("{context}: {}", error.message)
 }
 
 fn find_howyd_binary() -> PathBuf {
