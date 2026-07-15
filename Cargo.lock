@@ -762,6 +762,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "howy-config-bridge"
+version = "0.1.0"
+dependencies = [
+ "howy-common",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml",
+]
+
+[[package]]
 name = "howy-daemon"
 version = "0.1.0"
 dependencies = [

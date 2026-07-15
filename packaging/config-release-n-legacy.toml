@@ -1,0 +1,107 @@
+# howy configuration
+# Face authentication daemon for Linux
+#
+# This file is a generic reference config, not the current known-good local
+# deployment config. Tune ML provider and camera device for each machine.
+
+[core]
+# Print "Attempting facial authentication" notice
+detection_notice = false
+# Print timeout notice
+timeout_notice = true
+# Suppress confirmation on success
+no_confirmation = false
+# Fail silently for users without face models
+suppress_unknown = false
+# Disable in SSH sessions
+# Note: current pam_howy uses its own built-in SSH heuristic and does not yet
+# honor this config value directly.
+abort_if_ssh = true
+# Disable if laptop lid is closed
+# Note: current pam_howy uses its own built-in lid heuristic and does not yet
+# honor this config value directly.
+abort_if_lid_closed = true
+# Master kill switch
+disabled = false
+
+[ml]
+# Execution provider: "auto", "tensorrt", "cuda", "migraphx", "openvino", "cpu"
+# "auto" now tries providers in this order: TensorRT -> CUDA -> MIGraphX -> OpenVINO -> CPU.
+# When "auto" succeeds, howyd caches the first working provider under
+# /var/cache/howy/provider-selection.txt and tries that provider first on later boots.
+# Clear that file if you want the daemon to rediscover the full priority chain.
+# For first deployment, prefer pinning the provider that is known to work on the host.
+provider = "auto"
+# Prefer NPU over GPU when both available
+# Not yet implemented.
+prefer_npu = false
+# Face detection confidence threshold (0.0 - 1.0)
+det_threshold = 0.6
+# Recognition threshold (cosine similarity, 0.0 - 1.0)
+# Higher = stricter. 0.4 - 0.6 recommended.
+recognition_threshold = 0.5
+# Path to SCRFD detector model (empty = auto-find)
+detector_model = ""
+# Path to ArcFace recognizer model (empty = auto-find)
+recognizer_model = ""
+# Detector input size
+det_width = 640
+det_height = 640
+# Inference threads (0 = auto)
+threads = 0
+
+[video]
+# Timeout in seconds
+timeout = 4
+# V4L2 device path (empty = auto-detect)
+# Auto-detect is generic and may pick the wrong camera on multi-camera hosts.
+# For deployment, set the exact device path that was validated locally.
+device_path = ""
+# Maximum capture height for downscaling
+# Not yet implemented.
+max_height = 320
+# Dark frame threshold (0-100)
+dark_threshold = 60.0
+# Maximum consecutive dark frames before failing auth early (0 = no limit).
+# Detects a covered camera or broken IR emitter without burning the full timeout.
+max_dark_frames = 15
+# Requested capture dimensions (-1 = device default)
+frame_width = -1
+frame_height = -1
+# Frame rotation: 0 = landscape, 1 = both, 2 = portrait
+# Not yet implemented.
+rotate = 0
+# Requested capture FPS (-1 = device default)
+# Some IR emitters need a specific frame rate to function properly.
+device_fps = -1
+# Explicit exposure value (-1 = auto-exposure)
+# Disables auto-exposure when set. Use qv4l2 to find a good value.
+exposure = -1
+
+[snapshots]
+# Save snapshots of failed login attempts
+# Not yet implemented.
+save_failed = false
+# Save snapshots of successful login attempts
+# Not yet implemented.
+save_successful = false
+
+[credentials]
+# Experimental kernel keyring credential caching.
+# Disabled for the current PAM deployment until a real PAM session_id is wired
+# end-to-end; leave this off for now.
+enable_cache = false
+# Time-to-live for cached credentials (seconds)
+# Reserved for future session-scoped caching.
+cache_ttl_secs = 300
+# Keyring key description prefix
+# Reserved for future session-scoped caching.
+keyring_prefix = "howy:auth"
+# Use systemd encrypted credentials for secure model/config storage
+use_systemd_creds = false
+
+[debug]
+# Print timing report after auth
+end_report = false
+# Logging level: "error", "warn", "info", "debug", "trace"
+log_level = "info"

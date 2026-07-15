@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/howy-common",
+    "crates/howy-config-bridge",
     "crates/howy-daemon",
     "crates/howy-pam",
     "crates/howy-cli",

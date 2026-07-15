@@ -2016,7 +2016,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_unit_has_only_the_pathless_encrypted_mode1_credential() {
+    fn repository_base_unit_has_no_mode1_credential_directive() {
         let unit = include_str!("../../../systemd/howy.service");
         let active = unit
             .lines()
@@ -2028,10 +2028,7 @@ mod tests {
             .filter(|line| line.starts_with("LoadCredentialEncrypted="))
             .copied()
             .collect::<Vec<_>>();
-        assert_eq!(
-            encrypted,
-            ["LoadCredentialEncrypted=howy.storage.mode1.epoch1"]
-        );
+        assert!(encrypted.is_empty());
         assert!(
             !active
                 .iter()

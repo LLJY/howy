@@ -99,7 +99,12 @@
     "vendor/aes-0.9.1",
     "vendor/aes-gcm-0.11.0",
     "vendor/polyval-0.7.0",
-    "crates/howy-daemon/src/storage/readiness.rs"
+    "crates/howy-daemon/src/storage/readiness.rs",
+    "crates/howy-cli/src/security/real_tests.rs",
+    "packaging/config-release-n-legacy.toml",
+    "packaging/config.bootstrap.toml",
+    "packaging/05-howy-config-stash.hook",
+    "crates/howy-config-bridge"
   ],
   "planFile": ".opencode/workplan/security-modes.md",
   "specFiles": [],
@@ -335,7 +340,7 @@
           "title": "Implement transactional install and migration",
           "target": "config templates, provisioning CLI, package and installer scripts",
           "action": "Make fresh install, upgrade, local reinstall and explicit mode 0 transactional. Fresh mode 1 stages key/config, runs a storage-only readiness check with the candidate credential in a transient unit, installs a disabled verified candidate, and requires an explicit enable step. Preserve existing configs/namespaces by default.",
-          "validation": "Pure contracts and daemon strong verifier/status are approved. Begin injected CLI transaction/systemd/recovery/cleanup engine.",
+          "validation": "Package bridge requires restore-stage cleanup, dual condition policy, local marker/ordering/reload, real ALPM matrix, temp/result/srcinfo/format fixes.",
           "status": "in_progress"
         },
         {
@@ -715,6 +720,328 @@
       "detail": "Cfg(test) instrumentation at the real disposal sequence observes all-zero key bytes before munlock, successful munlock, successful munmap, and immediate ENOMEM unmapped state in a single-threaded fork child.",
       "source": "crates/howy-daemon/src/mode1_key.rs cleanup test",
       "status": "resolved"
+    },
+    {
+      "severity": "blocker",
+      "title": "Recovery can leave enabled config unguarded",
+      "detail": "Recovery removes guard before fallible activation/restoration and returns errors without re-guarding/stopping; malformed journal also remains potentially live. Add fail-closed supervisor on every recovery error.",
+      "source": "crates/howy-cli/src/security/engine.rs recovery paths",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Effective systemd guards and credentials are unverified",
+      "detail": "Engine hashes base service only and never validates effective service/socket guards or credential maps against overrides/drop-ins. Query/bind strict effective unit configuration.",
+      "source": "security engine/runtime systemd observations",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Provisioning state table is not enforced",
+      "detail": "Production hand logic bypasses common provisioning classifier; stale receipts can imply adoption/idempotence without readiness. Use common classifier and rerun strong readiness for all idempotent paths.",
+      "source": "security engine observed-state logic",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Durable side effects precede transaction guard",
+      "detail": "Unit snapshots and systemd-creds occur before durable journal/guard; host secret may be created unjournaled. Journal/guard first, stop/settle/resnapshot, require or journal host secret setup.",
+      "source": "security engine provision/enable ordering",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Unadopted artifact cleanup has TOCTOU",
+      "detail": "Cleanup is unguarded and treats malformed references as absent. Guard/stop/settle and revalidate all references/jobs/transients/daemon/artifact immediately before unlink.",
+      "source": "security engine cleanup path",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Activation can use objects changed after readiness",
+      "detail": "Enable/recovery does not reread artifact/drop-in/config/namespace after readiness. Revalidate every bound object immediately before activation and rerun readiness in activation recovery.",
+      "source": "security engine enable/recovery",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Transient readiness cleanup violates deadline",
+      "detail": "Readiness timeout joins captures before stopping PID1-owned transient and cleanup can run for ~25 minutes. Use one absolute deadline, stop/kill unit before joins, bound every query.",
+      "source": "security real process/systemd runner",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Disabled recovery loses unit restoration target",
+      "detail": "Disabled completion deletes guard/journal before prior unit restoration. Keep journal through guard removal, exact restore and verification; delete last.",
+      "source": "security engine disabled recovery",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Transaction production adapters are unqualified",
+      "detail": "Production adapters differ materially from mocks and lack real syscall/process/systemd transport tests.",
+      "source": "crates/howy-cli/src/security/real.rs",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Atomic exchange backup is not transaction-bound",
+      "detail": "Exchange uses predictable unjournaled backup names and target-check race. Use transaction-owned pre-recorded names and descriptor identity binding.",
+      "source": "security real atomic exchange",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Mode 0 remains coupled to Mode 1 credential",
+      "detail": "Mode0 leaves base pathless credential and can fail on corrupt Mode1 artifact. Install explicit Mode0 drop-in clearing credentials.",
+      "source": "systemd/howy.service; security engine Mode0",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Mode 0 status validation is weak",
+      "detail": "Mode0 activation status does not bind new invocation/build/binary/readiness. Apply strict root status contract.",
+      "source": "security engine Mode0 activation",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Credential output cap is not enforced live",
+      "detail": "Anonymous systemd-creds memfd ignores declared 1024-byte stdout cap until exit. Enforce cap during execution.",
+      "source": "security command/real anonymous output",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Journal claims units stopped too early",
+      "detail": "UnitsStopped is persisted before stop operations; crash can leave running units while journal claims stopped. Persist guarded snapshot, stop+settle, then UnitsStopped.",
+      "source": "crates/howy-cli/src/security/engine.rs unit stop phase",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Fresh provisioning filesystem layout is absent",
+      "detail": "Fresh production path lacks required dirs/config 0600 and package/local paths do not create them. Transactionally create/validate exact directories and secure config.",
+      "source": "security real paths; PKGBUILD; install-local",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Different-mode artifact can be implicitly adopted",
+      "detail": "DifferentMode classifier bypasses artifact adoption; Mode0 config plus Mode1 artifact is silently adopted. Preserve artifact state and require explicit adopt+readiness.",
+      "source": "common provisioning classifier; security engine",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Disabled provisioning cannot restore active service",
+      "detail": "Disabled provision tries to restore service active, but disabled daemon exits success and service becomes inactive. Define safe disabled post-provision target preserving enablement/socket while service inactive.",
+      "source": "security engine unit restore; daemon disabled behavior",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Cleanup can delete newly adopted artifact",
+      "detail": "Cleanup reference checks race reference creation before unlink. Quarantine by transaction-owned rename, fsync, recheck all references/units, restore on conflict, then unlink.",
+      "source": "security engine cleanup; real remove",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Release-N packaging bridge is not implemented",
+      "detail": "Release-N package/config ownership bridge and local installer integration are absent; systemd dependency still 257.",
+      "source": "PKGBUILD .SRCINFO install scripts",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Activation omits public status validation",
+      "detail": "Activation validates root status only, not public Info readiness/policy consistency.",
+      "source": "security engine activation status",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Real transaction integration coverage is partial",
+      "detail": "Real adapter tests do not execute full SecurityEngine against rooted production filesystem/unit lifecycle, hiding fresh/disabled gaps.",
+      "source": "security real_tests",
+      "status": "open"
+    },
+    {
+      "severity": "note",
+      "title": "Credential transport comment is stale",
+      "detail": "Transport comment still says memfd though bounded pipe is used.",
+      "source": "security command.rs",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Bridge stash restoration can expose legacy config",
+      "detail": "Absent/present stashes do not safely restore across variant/reinstall and can suppress bootstrap while leaving enabled legacy config. Implement exact absent removal/present restore/refusal lifecycle.",
+      "source": "howy-config-bridge restore logic",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Removal can proceed after stash failure",
+      "detail": "pre_remove failure does not abort ALPM removal/variant switch; add PreTransaction Remove AbortOnFail hook.",
+      "source": "howy.install; ALPM hook",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Fresh package bootstrap failure is fail-open",
+      "detail": "Fresh post_install failure leaves enabled legacy payload and may later start. Add persistent positive bootstrap-complete guard removed/created only after successful bootstrap.",
+      "source": "package units/install script",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Bridge crash recovery misses control publication windows",
+      "detail": "Bridge control files/stages are not fully crash-atomic; orphan stage/partial JSON can be unrecoverable. Journal before stage and atomically publish controls with kill-window tests.",
+      "source": "howy-config-bridge",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Clean makepkg fails",
+      "detail": "prepare/build use different CARGO_HOME; clean frozen makepkg cannot resolve dependencies.",
+      "source": "PKGBUILD prepare/build",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Local installer stop order is unsafe",
+      "detail": "Local installer stops service before socket, allowing reactivation. Stop socket first, settle both.",
+      "source": "scripts/install-local.sh",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Local rollback can restart cached new units",
+      "detail": "Rollback restores old unit files after daemon-reload but does not reload manager before restart. Track reload and reload restored files; fail stopped on error.",
+      "source": "scripts/install-local.sh rollback",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Bridge stash becomes permanently stale",
+      "detail": "Stash cannot refresh after administrator edits. Add crash-safe refresh/consume/reset lifecycle.",
+      "source": "howy-config-bridge stash",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Release bridge lacks ALPM-root tests",
+      "detail": "Package tests are function/file checks, not isolated ALPM transaction matrix.",
+      "source": "scripts/tests/package-release-n.sh",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Local directory setup follows symlinks",
+      "detail": "Local install -d follows symlinked sensitive components. Use descriptor-safe shared helper.",
+      "source": "scripts/install-local.sh",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Local migration option is misleading",
+      "detail": "Migration flags are advertised but always rejected. Remove pseudo-options or implement safe post-transaction call.",
+      "source": "scripts/install-local.sh",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Local installer misclassifies occupied config",
+      "detail": "create-if-absent Occupied is treated as created. Return distinct result and verify descriptor before state/rollback.",
+      "source": "bridge create-if-absent; install-local",
+      "status": "open"
+    },
+    {
+      "severity": "note",
+      "title": "Package version metadata is stale",
+      "detail": "Package version metadata is stale relative to checkpoint.",
+      "source": "PKGBUILD .SRCINFO",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Bridge recovery can orphan restore stage",
+      "detail": "Restore path returns when target matches stash even if exchanged legacy stage remains, then removes journal/marks complete and detects orphan. Clean exact stage before journal/marker; add kill-window tests.",
+      "source": "howy-config-bridge restore recovery",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Bootstrap marker condition breaks provisioning",
+      "detail": "Units now have positive bootstrap condition but effective policy/common contract accepts only negative transaction guard. Model/require both exact conditions and update hashes/tests.",
+      "source": "systemd units; security real parser; common provisioning",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Local fresh install lacks bootstrap marker",
+      "detail": "Fresh local install creates config but never bootstrap marker, so units cannot activate. Complete local marker transaction after verified config.",
+      "source": "scripts/install-local.sh; bridge",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Local installer still allows socket reactivation",
+      "detail": "Local installer still stops service before socket and lacks stable recheck.",
+      "source": "scripts/install-local.sh",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Local rollback can restart cached new units",
+      "detail": "Rollback restores old units without daemon-reload before restart.",
+      "source": "scripts/install-local.sh rollback",
+      "status": "open"
+    },
+    {
+      "severity": "major",
+      "title": "Release bridge lacks real ALPM matrix",
+      "detail": "Package test does not run actual isolated ALPM transactions or hook failures/backup/pacsave/variant/N+1 matrix.",
+      "source": "scripts/tests/package-release-n.sh",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Local layout/result handling is unsafe",
+      "detail": "Local sensitive dirs use install -d and Created/Occupied are conflated.",
+      "source": "scripts/install-local.sh",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Bridge named temporary leaks on collision",
+      "detail": "Named temporary fallback remains on Occupied publication collision.",
+      "source": "howy-config-bridge atomic publish",
+      "status": "open"
+    },
+    {
+      "severity": "minor",
+      "title": "Package metadata version is stale",
+      "detail": ".SRCINFO versions differ from PKGBUILD.",
+      "source": "PKGBUILD .SRCINFO",
+      "status": "open"
+    },
+    {
+      "severity": "note",
+      "title": "Installer usage is misleading",
+      "detail": "Installer usage advertises rejected migrate option.",
+      "source": "scripts/install-local.sh",
+      "status": "open"
+    },
+    {
+      "severity": "note",
+      "title": "Bridge formatting is not clean",
+      "detail": "New bridge files fail rustfmt check.",
+      "source": "howy-config-bridge",
+      "status": "open"
     }
   ],
   "notes": [
@@ -826,9 +1153,15 @@
     "Final readiness gate remains blocked by process-global panic handling under multithread Tokio, deadline start ordering, and real cleanup-stage evidence. Core verifier/runtime child coverage remains verified.",
     "Final runtime/cleanup follow-up closed: synchronous process entry parses before any Tokio runtime; strong readiness stays on the initial thread with an absolute deadline derived before TLS arming; normal/header-only paths construct exactly one Tokio multi-thread runtime and block_on the existing async flow. Panic interception is thread-local and static strong failures use bounded best-effort libc stderr writes. Real guarded disposal now has cfg(test), nonallocating production-sequence observations for zeroization-before-unlock, successful munlock, successful munmap, and immediate ENOMEM unmapped state in a fork child. Focused debug/release, repeated parallel, and full debug/release workspaces pass (556 passed, 3 ignored).",
     "Daemon strong-readiness/status final gate approved: synchronous pre-Tokio verifier, strict flags/config/source companion, empty/nonempty sequential authentication, atomic output, bounded panic/errors, root runtime identity, and real cleanup stages pass 556 debug/release workspace tests. CLI transaction engine may proceed; no live authorization implied.",
-    "CLI transaction-engine continuation 2026-07-14: current systemd v261 source confirmed named `systemd-creds encrypt` outputs use atomic path replacement, so `/proc/self/fd/N` is not a valid output pathname. Corrected exact argv to `encrypt - -` and bound child stdout directly to an anonymous memfd. Also fixed receipt rollback size selection, rejected unsafe Mode-0 config metadata before journaling, stopped journaled readiness transients during rollback/recovery, retained guard+journal on changed transaction-owned artifacts, and returned exact cleanup commands from crash recovery. CLI debug/release tests pass (37 each); targeted rustfmt and git diff checks pass. Full `cargo fmt --all -- --check` remains blocked by pre-existing formatting in tests/debug_scrfd.rs and tests/real_face_test.rs. Clippy remains blocked by pre-existing common/CLI warnings outside this slice. Temporary ORT symlink directory was removed. Packaging/installer slice and adversarial transaction-engine review remain pending."
+    "CLI transaction-engine continuation 2026-07-14: current systemd v261 source confirmed named `systemd-creds encrypt` outputs use atomic path replacement, so `/proc/self/fd/N` is not a valid output pathname. Corrected exact argv to `encrypt - -` and bound child stdout directly to an anonymous memfd. Also fixed receipt rollback size selection, rejected unsafe Mode-0 config metadata before journaling, stopped journaled readiness transients during rollback/recovery, retained guard+journal on changed transaction-owned artifacts, and returned exact cleanup commands from crash recovery. CLI debug/release tests pass (37 each); targeted rustfmt and git diff checks pass. Full `cargo fmt --all -- --check` remains blocked by pre-existing formatting in tests/debug_scrfd.rs and tests/real_face_test.rs. Clippy remains blocked by pre-existing common/CLI warnings outside this slice. Temporary ORT symlink directory was removed. Packaging/installer slice and adversarial transaction-engine review remain pending.",
+    "Created local checkpoint commit `2dfe39e feat(security): checkpoint secure storage modes` on branch `dev`; 580 tests passed, 3 ignored. NPU report remains untracked/excluded and nothing was pushed. Resume step-mode1-install with adversarial transaction-engine review before package/installer bridge.",
+    "Transaction-engine adversarial review rejected checkpoint: one blocker fail-open recovery, eight high state/effective-unit/deadline/adapter findings, and medium exchange/Mode0/output-cap issues. Release-N packaging remains blocked. Fix split into engine state pass then production-adapter pass.",
+    "Transaction engine fix passes landed: fail-closed state/recovery/classifier/cleanup/revalidation/Mode0 engine with 596 mock workspace tests; production transport adds strict effective-unit/host-secret parsing, bounded process/transient deadlines/output caps and 14 debug/release real tests; atomic writes now use pre-journaled transaction-owned plans/observations with real renameat2 crash-window tests. Whole transaction re-review pending; packaging remains untouched.",
+    "Fresh transaction review after engine/adapter/exchange fixes found no critical issue but five high engine gaps plus mandatory release-N packaging. Next serial passes: engine/fs integration then packaging bridge. Atomic exchange/effective-unit/transient transport core was positively verified.",
+    "Fresh release-N package review rejected bridge: seven high crash/fail-open/build/installer findings, medium stash/ALPM/symlink/migration/result gaps. Core engine remains separate. Package-focused fix pass in progress.",
+    "Fresh release-N bridge review blocked completion: restore orphan, positive-condition integration, local marker/stop/rollback, real ALPM matrix, and bounded temp/metadata/format fixes required. Direct bridge/package mocks pass but CLI integration currently has five failures."
   ],
   "status": "in_progress",
   "createdAt": "2026-07-11T19:01:30.768Z",
-  "updatedAt": "2026-07-14T01:12:24.674Z"
+  "updatedAt": "2026-07-14T20:31:34.641Z"
 }

@@ -12,6 +12,7 @@ pub const CHILD_STDERR_CAP: usize = 16_384;
 pub const CREDENTIAL_DEADLINE: Duration = Duration::from_secs(30);
 pub const READINESS_DEADLINE: Duration = Duration::from_secs(135);
 pub const SYSTEMCTL_DEADLINE: Duration = Duration::from_secs(15);
+pub const TPM2_PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySelection {
@@ -30,11 +31,15 @@ impl KeySelection {
             Self::HostAndTpm2 => "host+tpm2",
         }
     }
+
+    pub const fn may_use_host_secret(self) -> bool {
+        matches!(self, Self::Auto | Self::Host | Self::HostAndTpm2)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
-    pub executable: &'static str,
+    pub executable: String,
     pub arguments: Vec<String>,
     pub clear_environment: bool,
     pub stdin_bytes: usize,
@@ -43,13 +48,12 @@ pub struct CommandSpec {
     pub deadline: Duration,
 }
 
-/// The final `-` directs encrypted output to stdout. The production runner
-/// binds that stdout directly to an anonymous memfd; systemd-creds writes
-/// named output paths atomically, so `/proc/self/fd/*` is not a valid output
-/// pathname.
+/// The final `-` directs encrypted output to the production runner's bounded,
+/// concurrently drained stdout pipe. The hard cap is enforced while the child
+/// runs, before its output can accumulate without bound.
 pub fn credential_encrypt_command(selector: KeySelection) -> CommandSpec {
     CommandSpec {
-        executable: SYSTEMD_CREDS,
+        executable: SYSTEMD_CREDS.into(),
         arguments: vec![
             "--no-ask-password".into(),
             "--refuse-null".into(),
@@ -131,7 +135,7 @@ pub fn readiness_command(
         "--verify-records".into(),
     ]);
     CommandSpec {
-        executable: SYSTEMD_RUN,
+        executable: SYSTEMD_RUN.into(),
         arguments,
         clear_environment: true,
         stdin_bytes: 0,
@@ -149,7 +153,7 @@ pub fn systemctl_command(arguments: impl IntoIterator<Item = String>) -> Command
     ];
     exact.extend(arguments);
     CommandSpec {
-        executable: SYSTEMCTL,
+        executable: SYSTEMCTL.into(),
         arguments: exact,
         clear_environment: true,
         stdin_bytes: 0,
@@ -157,6 +161,53 @@ pub fn systemctl_command(arguments: impl IntoIterator<Item = String>) -> Command
         stderr_cap: CHILD_STDERR_CAP,
         deadline: SYSTEMCTL_DEADLINE,
     }
+}
+
+pub fn tpm2_probe_command() -> CommandSpec {
+    CommandSpec {
+        executable: SYSTEMD_CREDS.into(),
+        arguments: vec!["--quiet".into(), "has-tpm2".into()],
+        clear_environment: true,
+        stdin_bytes: 0,
+        stdout_cap: 0,
+        stderr_cap: CHILD_STDERR_CAP,
+        deadline: TPM2_PROBE_DEADLINE,
+    }
+}
+
+pub fn effective_unit_show_command(unit: &str) -> CommandSpec {
+    let mut properties = vec![
+        "FragmentPath",
+        "DropInPaths",
+        "NeedDaemonReload",
+        "LimitCORE",
+        "LimitMEMLOCK",
+        "LockPersonality",
+        "MemoryDenyWriteExecute",
+        "NoNewPrivileges",
+        "PrivateTmp",
+        "ProtectControlGroups",
+        "ProtectHome",
+        "ProtectKernelModules",
+        "ProtectKernelTunables",
+        "ProtectSystem",
+        "RestrictAddressFamilies",
+        "RestrictNamespaces",
+        "RestrictRealtime",
+        "UMask",
+    ];
+    if unit.ends_with(".socket") {
+        properties.truncate(3);
+    }
+    systemctl_command(
+        ["show".to_owned(), unit.to_owned(), "--all".to_owned()]
+            .into_iter()
+            .chain(
+                properties
+                    .into_iter()
+                    .map(|property| format!("--property={property}")),
+            ),
+    )
 }
 
 #[cfg(test)]
@@ -187,7 +238,7 @@ mod tests {
     #[test]
     fn readiness_argv_is_absolute_no_shell_and_fully_bounded() {
         let spec = readiness_command(
-            "txn-0123456789abcdef",
+            "txn-0123456789abcdef0123456789abcdef",
             "/etc/howy/config.toml",
             "/etc/credstore.encrypted/howy.storage.mode1.epoch1",
         );

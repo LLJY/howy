@@ -51,6 +51,97 @@ pub const PROMPT_PROTOCOL_INCOMPATIBLE_ERROR: &str = "prompt_protocol_incompatib
 pub const PROMPT_PROTOCOL_VIOLATION_ERROR: &str = "prompt_protocol_violation";
 pub const PROMPT_UNAVAILABLE_ERROR: &str = "prompt_unavailable";
 pub const PROMPT_TRANSACTION_INVALID_ERROR: &str = "prompt_transaction_invalid";
+pub const PUBLIC_PROVIDER_MAX_BYTES: usize = 128;
+pub const PUBLIC_EMBEDDING_DIM_MAX: u32 = 16_384;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DaemonInfoValidationError {
+    InvalidField,
+    InconsistentState,
+    UnexpectedAvailability,
+}
+
+impl std::fmt::Display for DaemonInfoValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidField => "public daemon status contains an invalid bounded field",
+            Self::InconsistentState => "public daemon status fields are inconsistent",
+            Self::UnexpectedAvailability => {
+                "public daemon status availability contradicts disabled policy"
+            }
+        })
+    }
+}
+
+impl std::error::Error for DaemonInfoValidationError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DaemonInfoExpectation {
+    pub active_security_mode: u32,
+    pub prompt_required: bool,
+    pub storage_ready: bool,
+    pub disabled: bool,
+}
+
+pub fn validate_daemon_info_for_activation(
+    info: Option<&DaemonInfo>,
+    expected: DaemonInfoExpectation,
+) -> Result<(), DaemonInfoValidationError> {
+    use crate::config::EmbeddingSecurityMode;
+
+    if !matches!(
+        expected.active_security_mode,
+        value if value == EmbeddingSecurityMode::Plaintext as u32
+            || value == EmbeddingSecurityMode::AeadCached as u32
+    ) || (expected.disabled && expected.storage_ready)
+    {
+        return Err(DaemonInfoValidationError::InconsistentState);
+    }
+    if expected.disabled {
+        return if info.is_none() {
+            Ok(())
+        } else {
+            Err(DaemonInfoValidationError::UnexpectedAvailability)
+        };
+    }
+    let info = info.ok_or(DaemonInfoValidationError::UnexpectedAvailability)?;
+    info.validate_strict()?;
+    if info.active_security_mode != expected.active_security_mode
+        || info.prompt_required != expected.prompt_required
+        || info.storage_ready != expected.storage_ready
+    {
+        return Err(DaemonInfoValidationError::InconsistentState);
+    }
+    Ok(())
+}
+
+impl DaemonInfo {
+    pub fn validate_strict(&self) -> Result<(), DaemonInfoValidationError> {
+        use crate::config::EmbeddingSecurityMode;
+
+        if self.provider.is_empty()
+            || self.provider.len() > PUBLIC_PROVIDER_MAX_BYTES
+            || !self
+                .provider
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+            || !self.detector_model.is_empty()
+            || !self.recognizer_model.is_empty()
+            || self.embedding_dim == 0
+            || self.embedding_dim > PUBLIC_EMBEDDING_DIM_MAX
+        {
+            return Err(DaemonInfoValidationError::InvalidField);
+        }
+        if !matches!(
+            self.active_security_mode,
+            value if value == EmbeddingSecurityMode::Plaintext as u32
+                || value == EmbeddingSecurityMode::AeadCached as u32
+        ) {
+            return Err(DaemonInfoValidationError::InconsistentState);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ValidatedSecurityInfoStates {
@@ -1468,6 +1559,91 @@ mod tests {
                 super::SecurityInfoResult::decode(malicious.encode_to_vec().as_slice()).unwrap();
             assert!(decoded.validate_strict().is_err(), "accepted {decoded:?}");
         }
+    }
+
+    #[test]
+    fn public_daemon_status_is_strict_bounded_and_path_redacted() {
+        let valid = super::DaemonInfo {
+            provider: "CPUExecutionProvider".into(),
+            detector_model: String::new(),
+            recognizer_model: String::new(),
+            embedding_dim: 512,
+            uptime_secs: 10,
+            active_security_mode: 1,
+            prompt_required: true,
+            storage_ready: true,
+        };
+        valid.validate_strict().unwrap();
+
+        let mut malformed = Vec::new();
+        let mut item = valid.clone();
+        item.provider = "bad\nprovider".into();
+        malformed.push(item);
+        let mut item = valid.clone();
+        item.provider = "x".repeat(super::PUBLIC_PROVIDER_MAX_BYTES + 1);
+        malformed.push(item);
+        let mut item = valid.clone();
+        item.detector_model = "/secret/model.onnx".into();
+        malformed.push(item);
+        let mut item = valid.clone();
+        item.embedding_dim = 0;
+        malformed.push(item);
+        let mut item = valid.clone();
+        item.embedding_dim = super::PUBLIC_EMBEDDING_DIM_MAX + 1;
+        malformed.push(item);
+        let mut item = valid;
+        item.active_security_mode = 2;
+        malformed.push(item);
+
+        for item in malformed {
+            assert!(item.validate_strict().is_err(), "accepted {item:?}");
+        }
+    }
+
+    #[test]
+    fn public_activation_status_binds_policy_and_disabled_availability() {
+        let valid = super::DaemonInfo {
+            provider: "CPUExecutionProvider".into(),
+            detector_model: String::new(),
+            recognizer_model: String::new(),
+            embedding_dim: 512,
+            uptime_secs: 10,
+            active_security_mode: 1,
+            prompt_required: true,
+            storage_ready: true,
+        };
+        let enabled = super::DaemonInfoExpectation {
+            active_security_mode: 1,
+            prompt_required: true,
+            storage_ready: true,
+            disabled: false,
+        };
+        super::validate_daemon_info_for_activation(Some(&valid), enabled).unwrap();
+        assert!(super::validate_daemon_info_for_activation(None, enabled).is_err());
+
+        for mutation in ["mode", "prompt", "ready", "malformed"] {
+            let mut item = valid.clone();
+            match mutation {
+                "mode" => item.active_security_mode = 0,
+                "prompt" => item.prompt_required = false,
+                "ready" => item.storage_ready = false,
+                "malformed" => item.provider = "bad\nprovider".into(),
+                _ => unreachable!(),
+            }
+            assert!(super::validate_daemon_info_for_activation(Some(&item), enabled).is_err());
+        }
+
+        let disabled = super::DaemonInfoExpectation {
+            active_security_mode: 1,
+            prompt_required: true,
+            storage_ready: false,
+            disabled: true,
+        };
+        super::validate_daemon_info_for_activation(None, disabled).unwrap();
+        assert!(super::validate_daemon_info_for_activation(Some(&valid), disabled).is_err());
+        let mut impossible = disabled;
+        impossible.storage_ready = true;
+        assert!(super::validate_daemon_info_for_activation(None, impossible).is_err());
     }
 
     #[test]

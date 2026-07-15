@@ -27,6 +27,152 @@ fn metadata_for(bytes: &[u8]) -> FileMetadataSnapshotV1 {
     }
 }
 
+fn guard_identity(transaction_id: &str) -> TransactionGuardIdentityV1 {
+    let bytes = TransactionGuardV1::new(transaction_id)
+        .unwrap()
+        .deterministic_bytes()
+        .unwrap();
+    TransactionGuardIdentityV1::new(
+        transaction_id,
+        AtomicFileIdentityV1 {
+            device_id: 8,
+            inode: 77,
+            object_type: FileObjectType::RegularFile,
+            uid: 0,
+            gid: 0,
+            permissions: 0o600,
+            link_count: 1,
+            byte_length: bytes.len() as u64,
+            sha256: digest(&bytes),
+        },
+    )
+    .unwrap()
+}
+
+fn prior_journal_identity(generation: u64) -> Option<AtomicFileIdentityV1> {
+    (generation > 1).then(|| {
+        let bytes = format!("prior-journal-generation-{}", generation - 1);
+        AtomicFileIdentityV1 {
+            device_id: 8,
+            inode: 1_000 + generation,
+            object_type: FileObjectType::RegularFile,
+            uid: 0,
+            gid: 0,
+            permissions: 0o600,
+            link_count: 1,
+            byte_length: bytes.len() as u64,
+            sha256: digest(bytes.as_bytes()),
+        }
+    })
+}
+
+fn security_directories() -> Vec<SecurityDirectoryRecordV1> {
+    REQUIRED_SECURITY_DIRECTORIES
+        .iter()
+        .enumerate()
+        .map(|(index, (path, permissions))| {
+            let identity = DirectoryIdentityV1 {
+                path: (*path).to_owned(),
+                object_type: FileObjectType::Directory,
+                device_id: 8,
+                inode: 100 + index as u64,
+                uid: 0,
+                gid: 0,
+                permissions: *permissions,
+                link_count: 2,
+            };
+            let preexisted = index % 2 == 0;
+            SecurityDirectoryRecordV1 {
+                path: (*path).to_owned(),
+                uid: 0,
+                gid: 0,
+                permissions: *permissions,
+                parent_directory: DirectoryIdentityV1 {
+                    path: Path::new(path)
+                        .parent()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                    object_type: FileObjectType::Directory,
+                    device_id: 8,
+                    inode: 10 + index as u64,
+                    uid: 0,
+                    gid: 0,
+                    permissions: 0o755,
+                    link_count: 2,
+                },
+                expected_directory: preexisted.then(|| identity.clone()),
+                observed_directory: Some(identity),
+                preexisted,
+            }
+        })
+        .collect()
+}
+
+fn effective_file(path: &str, label: &[u8], permissions: u32) -> EffectiveUnitFileV1 {
+    EffectiveUnitFileV1 {
+        path: path.to_owned(),
+        sha256: digest(label),
+        metadata: EffectiveFileMetadataV1 {
+            object_type: FileObjectType::RegularFile,
+            uid: 0,
+            gid: 0,
+            permissions,
+            link_count: 1,
+            byte_length: label.len() as u64,
+        },
+    }
+}
+
+fn effective_units(dropin_sha256: Sha256Digest, mode1: bool) -> EffectiveUnitSetV1 {
+    EffectiveUnitSetV1 {
+        service: EffectiveUnitObservationV1 {
+            unit_kind: UnitKind::Service,
+            fragment: effective_file(BASE_SERVICE_UNIT_PATH, b"service", 0o644),
+            dropins: vec![EffectiveUnitFileV1 {
+                path: MODE1_DROPIN_PATH.to_owned(),
+                sha256: dropin_sha256,
+                metadata: EffectiveFileMetadataV1 {
+                    object_type: FileObjectType::RegularFile,
+                    uid: 0,
+                    gid: 0,
+                    permissions: 0o600,
+                    link_count: 1,
+                    byte_length: b"dropin".len() as u64,
+                },
+            }],
+            conditions: required_unit_conditions().into(),
+            load_credential_encrypted: mode1
+                .then(|| EffectiveCredentialLoadV1 {
+                    name: MODE1_CREDENTIAL_NAME.to_owned(),
+                    source: MODE1_CREDENTIAL_PATH.to_owned(),
+                })
+                .into_iter()
+                .collect(),
+            set_credential: mode1
+                .then(|| EffectiveSetCredentialV1 {
+                    name: MODE1_CREDENTIAL_SOURCE_COMPANION_NAME.to_owned(),
+                    value: MODE1_CREDENTIAL_PATH.to_owned(),
+                })
+                .into_iter()
+                .collect(),
+            exec_start: vec![vec!["/usr/bin/howyd".to_owned()]],
+            hardening: required_service_hardening(),
+        },
+        socket: EffectiveUnitObservationV1 {
+            unit_kind: UnitKind::Socket,
+            fragment: effective_file(BASE_SOCKET_UNIT_PATH, b"socket", 0o644),
+            dropins: Vec::new(),
+            conditions: required_unit_conditions().into(),
+            load_credential_encrypted: Vec::new(),
+            set_credential: Vec::new(),
+            exec_start: Vec::new(),
+            hardening: BTreeMap::new(),
+        },
+    }
+}
+
 fn file_snapshot(bytes: &[u8]) -> ExactFileSnapshot {
     ExactFileSnapshot::new(bytes, metadata_for(bytes)).unwrap()
 }
@@ -78,9 +224,21 @@ fn journal_at(phase: JournalPhase) -> ProvisioningJournalV1 {
         enabled_receipt_sha256: (ordinal >= JournalPhase::EnabledReceiptCommitted.ordinal())
             .then(|| planned_hashes.enabled_receipt_sha256.clone()),
     };
+    let service_unit_state = active_unit();
+    let socket_unit_state = inactive_unit(UnitKind::Socket);
+    let (post_provision_service_target, post_provision_socket_target) =
+        disabled_post_provision_unit_targets(&service_unit_state, &socket_unit_state).unwrap();
     ProvisioningJournalV1 {
         schema_version: 1,
-        transaction_id: "txn-0123456789abcdef".to_owned(),
+        transaction_id: "txn-0123456789abcdef0123456789abcdef".to_owned(),
+        generation: ordinal as u64 + 1,
+        prior_journal_identity: prior_journal_identity(ordinal as u64 + 1),
+        journal_staging_path: canonical_journal_staging_path(
+            "txn-0123456789abcdef0123456789abcdef",
+        )
+        .unwrap(),
+        guard: (ordinal >= JournalPhase::Guarded.ordinal())
+            .then(|| guard_identity("txn-0123456789abcdef0123456789abcdef")),
         phase,
         mode: 1,
         epoch: 1,
@@ -88,16 +246,25 @@ fn journal_at(phase: JournalPhase) -> ProvisioningJournalV1 {
         planned_hashes,
         live_hashes,
         transaction_owned_paths: vec![
-            "/etc/howy/.security-transaction".to_owned(),
             "/etc/howy/config.toml".to_owned(),
+            canonical_journal_staging_path("txn-0123456789abcdef0123456789abcdef").unwrap(),
+            SECURITY_TRANSACTION_GUARD_PATH.to_owned(),
         ],
+        atomic_writes: Vec::new(),
+        security_directories: security_directories(),
         artifact_preexisted: false,
         transient_unit: "howy-readiness-0123456789abcdef.service".to_owned(),
         prior_config: Some(file_snapshot(b"[core]\ndisabled = false\n")),
         prior_dropin: None,
         prior_receipt: None,
-        service_unit_state: active_unit(),
-        socket_unit_state: inactive_unit(UnitKind::Socket),
+        service_unit_state,
+        socket_unit_state,
+        post_provision_service_target,
+        post_provision_socket_target,
+        prior_daemon_invocation_id: Some("23".repeat(32)),
+        prior_effective_units: effective_units(digest(b"prior-dropin"), false),
+        effective_units: (ordinal >= JournalPhase::DropinCommitted.ordinal())
+            .then(|| effective_units(digest(b"dropin"), true)),
         backup_hashes: BackupHashes {
             artifact_sha256: None,
             config_sha256: Some(digest(b"[core]\ndisabled = false\n")),
@@ -105,12 +272,13 @@ fn journal_at(phase: JournalPhase) -> ProvisioningJournalV1 {
             receipt_sha256: None,
         },
         recovery_action: recovery_action_for_phase(phase),
+        supervisor_failed: false,
     }
 }
 
 #[test]
 fn journal_exact_phases_recovery_matrix_and_monotonic_transitions() {
-    assert_eq!(JournalPhase::ALL.len(), 12);
+    assert_eq!(JournalPhase::ALL.len(), 13);
     for (index, phase) in JournalPhase::ALL.into_iter().enumerate() {
         let journal = journal_at(phase);
         journal.validate().unwrap();
@@ -118,7 +286,7 @@ fn journal_exact_phases_recovery_matrix_and_monotonic_transitions() {
         if let Some(next_phase) = phase.next() {
             validate_journal_transition(&journal, &journal_at(next_phase)).unwrap();
         } else {
-            assert_eq!(index, 11);
+            assert_eq!(index, 12);
         }
     }
 
@@ -178,27 +346,214 @@ fn journal_transition_binds_every_stable_field() {
     let current = journal_at(JournalPhase::Prepared);
     let mut next = journal_at(JournalPhase::Guarded);
     next.transaction_owned_paths.push("/etc/howy/z".to_owned());
+    assert!(validate_journal_transition(&current, &next).is_err());
+
+    let mut invalid_target = journal_at(JournalPhase::UnitsStopped);
+    invalid_target.post_provision_service_target = active_unit();
+    assert!(invalid_target.validate().is_err());
+    let valid = journal_at(JournalPhase::UnitsStopped);
     assert_eq!(
-        validate_journal_transition(&current, &next),
-        Err(ProvisioningContractError::InvalidTransition)
+        valid.post_provision_service_target.rollback_target(),
+        Some(StableRollbackTarget::InactiveDead)
     );
+    assert_eq!(
+        valid.post_provision_service_target.unit_file_state,
+        valid.service_unit_state.unit_file_state
+    );
+    assert_eq!(valid.post_provision_socket_target, valid.socket_unit_state);
+}
+
+#[test]
+fn guarded_journal_allows_only_an_identity_bound_same_phase_guard_recreation() {
+    let current = journal_at(JournalPhase::UnitsStarted);
+    let mut next = current.clone();
+    next.generation += 1;
+    next.prior_journal_identity = prior_journal_identity(next.generation);
+    next.guard.as_mut().unwrap().file.inode += 1;
+    validate_journal_transition(&current, &next).unwrap();
+
+    let mut combined = next.clone();
+    combined.live_hashes.config_sha256 = Some(digest(b"other"));
+    assert!(validate_journal_transition(&current, &combined).is_err());
+}
+
+fn atomic_parent(path: &str) -> DirectoryIdentityV1 {
+    DirectoryIdentityV1 {
+        path: path.to_owned(),
+        object_type: FileObjectType::Directory,
+        device_id: 8,
+        inode: 42,
+        uid: 0,
+        gid: 0,
+        permissions: 0o755,
+        link_count: 2,
+    }
+}
+
+fn atomic_identity(bytes: &[u8], inode: u64) -> AtomicFileIdentityV1 {
+    AtomicFileIdentityV1 {
+        device_id: 8,
+        inode,
+        object_type: FileObjectType::RegularFile,
+        uid: 0,
+        gid: 0,
+        permissions: 0o600,
+        link_count: 1,
+        byte_length: bytes.len() as u64,
+        sha256: digest(bytes),
+    }
+}
+
+#[test]
+fn atomic_write_plan_is_canonical_strict_and_cross_directory_safe() {
+    let transaction = "txn-0123456789abcdef0123456789abcdef";
+    let target = "/etc/howy/config.toml";
+    let old = atomic_identity(b"old", 100);
+    let plan = AtomicWritePlanV1::new(
+        transaction,
+        target,
+        atomic_parent("/etc/howy"),
+        AtomicExpectedTargetV1::Present(old),
+        0,
+        0,
+        0o600,
+        None,
+        b"new",
+        AtomicWriteKindV1::Exchange,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.backup_path.as_deref(),
+        Some(plan.staging_path.as_str())
+    );
+    assert!(
+        plan.staging_path
+            .starts_with("/etc/howy/.howy-txn-0123456789abcdef0123456789abcdef-config.toml-")
+    );
+    plan.validate().unwrap();
+
+    let mut traversal = plan.clone();
+    traversal.staging_path = "/etc/howy/../owned.stage".into();
+    assert!(traversal.validate().is_err());
+    let mut cross_directory = plan.clone();
+    cross_directory.staging_path = "/tmp/owned.stage".into();
+    cross_directory.backup_path = Some(cross_directory.staging_path.clone());
+    assert!(cross_directory.validate().is_err());
+    let mut unowned = plan.clone();
+    unowned.staging_path = "/etc/howy/arbitrary.stage".into();
+    unowned.backup_path = Some(unowned.staging_path.clone());
+    assert!(unowned.validate().is_err());
+    let mut malformed_transaction = plan.clone();
+    malformed_transaction.transaction_id = "txn-../../escape".into();
+    assert!(malformed_transaction.validate().is_err());
+
+    let bytes = plan.clone();
+    let mut unknown: serde_json::Value =
+        serde_json::from_slice(&serde_json::to_vec(&bytes).unwrap()).unwrap();
+    unknown["counter"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<AtomicWritePlanV1>(unknown).is_err());
+}
+
+#[test]
+fn atomic_write_records_advance_only_plan_commit_cleanup() {
+    let plan = AtomicWritePlanV1::new(
+        "txn-0123456789abcdef0123456789abcdef",
+        "/etc/howy/config.toml",
+        atomic_parent("/etc/howy"),
+        AtomicExpectedTargetV1::Present(atomic_identity(b"old", 100)),
+        0,
+        0,
+        0o600,
+        None,
+        b"new",
+        AtomicWriteKindV1::Exchange,
+    )
+    .unwrap();
+    let mut planned = journal_at(JournalPhase::Prepared);
+    let initial = planned.clone();
+    planned
+        .transaction_owned_paths
+        .push(plan.staging_path.clone());
+    planned.transaction_owned_paths.sort();
+    planned
+        .atomic_writes
+        .push(AtomicWriteRecordV1::planned(plan.clone()));
+    planned.generation += 1;
+    planned.prior_journal_identity = prior_journal_identity(planned.generation);
+    validate_journal_transition(&initial, &planned).unwrap();
+
+    let staged_identity = atomic_identity(b"new", 101);
+    let mut staged = planned.clone();
+    staged.atomic_writes[0].state = AtomicWriteStateV1::Staged {
+        identity: staged_identity.clone(),
+    };
+    staged.generation += 1;
+    staged.prior_journal_identity = prior_journal_identity(staged.generation);
+    validate_journal_transition(&planned, &staged).unwrap();
+
+    let observation = AtomicWriteObservationV1 {
+        target: staged_identity,
+        backup: Some(atomic_identity(b"old", 100)),
+    };
+    let mut committed = staged.clone();
+    committed.atomic_writes[0].state = AtomicWriteStateV1::Committed {
+        observation: observation.clone(),
+    };
+    committed.generation += 1;
+    committed.prior_journal_identity = prior_journal_identity(committed.generation);
+    validate_journal_transition(&staged, &committed).unwrap();
+    let mut cleaned = committed.clone();
+    cleaned.atomic_writes[0].state = AtomicWriteStateV1::BackupCleaned { observation };
+    cleaned.generation += 1;
+    cleaned.prior_journal_identity = prior_journal_identity(cleaned.generation);
+    validate_journal_transition(&committed, &cleaned).unwrap();
+
+    let mut skipped = planned;
+    skipped.atomic_writes[0].state = AtomicWriteStateV1::BackupCleaned {
+        observation: match &committed.atomic_writes[0].state {
+            AtomicWriteStateV1::Committed { observation } => observation.clone(),
+            _ => unreachable!(),
+        },
+    };
+    assert!(validate_journal_transition(&initial, &skipped).is_err());
 }
 
 fn plaintext_journal_at(phase: PlaintextJournalPhase) -> PlaintextProvisioningJournalV1 {
     let enabled_config_sha256 = digest(b"explicit-mode0");
     PlaintextProvisioningJournalV1 {
         schema_version: 1,
-        transaction_id: "txn-0123456789abcdef".into(),
+        transaction_id: "txn-0123456789abcdef0123456789abcdef".into(),
+        generation: phase.ordinal() as u64 + 1,
+        prior_journal_identity: prior_journal_identity(phase.ordinal() as u64 + 1),
+        journal_staging_path: canonical_journal_staging_path(
+            "txn-0123456789abcdef0123456789abcdef",
+        )
+        .unwrap(),
+        guard: (phase.ordinal() >= PlaintextJournalPhase::Guarded.ordinal())
+            .then(|| guard_identity("txn-0123456789abcdef0123456789abcdef")),
         phase,
         enabled_config_sha256: enabled_config_sha256.clone(),
         live_config_sha256: (phase.ordinal()
             >= PlaintextJournalPhase::EnabledConfigCommitted.ordinal())
         .then_some(enabled_config_sha256),
+        transaction_owned_paths: vec![
+            "/etc/howy/config.toml".to_owned(),
+            canonical_journal_staging_path("txn-0123456789abcdef0123456789abcdef").unwrap(),
+            SECURITY_TRANSACTION_GUARD_PATH.to_owned(),
+        ],
+        atomic_writes: Vec::new(),
+        security_directories: security_directories(),
         prior_config: Some(file_snapshot(b"[core]\ndisabled = true\n")),
         prior_dropin: None,
         service_unit_state: inactive_unit(UnitKind::Service),
         socket_unit_state: inactive_unit(UnitKind::Socket),
+        prior_daemon_invocation_id: None,
+        prior_effective_units: effective_units(digest(b"prior-dropin"), true),
+        effective_units: (phase.ordinal() >= PlaintextJournalPhase::DropinRemoved.ordinal())
+            .then(|| effective_units(digest(b"mode0-dropin"), false)),
+        dropin_sha256: digest(b"mode0-dropin"),
         recovery_action: plaintext_recovery_action_for_phase(phase),
+        supervisor_failed: false,
     }
 }
 
@@ -223,6 +578,198 @@ fn plaintext_mode_has_a_strict_common_transaction_journal() {
     .unwrap();
     unknown["plaintext_key"] = serde_json::json!("forbidden");
     assert!(PlaintextProvisioningJournalV1::parse(&serde_json::to_vec(&unknown).unwrap()).is_err());
+}
+
+#[test]
+fn supervisor_intent_is_strict_and_binds_post_guard_unit_targets() {
+    let prepared = SupervisorJournalV1 {
+        schema_version: 1,
+        transaction_id: "txn-0123456789abcdef0123456789abcdef".into(),
+        generation: 1,
+        prior_journal_identity: None,
+        journal_staging_path: canonical_journal_staging_path(
+            "txn-0123456789abcdef0123456789abcdef",
+        )
+        .unwrap(),
+        guard: None,
+        operation: SupervisorOperationV1::ProvisionMode1,
+        phase: SupervisorPhaseV1::Prepared,
+        prior_config: Some(file_snapshot(b"[core]\ndisabled = false\n")),
+        prior_dropin: None,
+        prior_receipt: None,
+        service_unit_state: Some(active_unit()),
+        socket_unit_state: Some(inactive_unit(UnitKind::Socket)),
+        prior_daemon_invocation_id: Some("23".repeat(32)),
+        prior_effective_units: Some(effective_units(digest(b"prior"), false)),
+        transaction_owned_paths: vec![
+            "/etc/howy/config.toml".to_owned(),
+            canonical_journal_staging_path("txn-0123456789abcdef0123456789abcdef").unwrap(),
+            SECURITY_TRANSACTION_GUARD_PATH.to_owned(),
+        ],
+        atomic_writes: Vec::new(),
+        security_directories: Vec::new(),
+        cleanup_artifact: None,
+        cleanup_manifest: None,
+        cleanup_pre_admission: None,
+        cleanup_quarantine: None,
+        supervisor_failed: false,
+    };
+    let mut guarded = prepared.clone();
+    guarded.phase = SupervisorPhaseV1::Guarded;
+    guarded.generation += 1;
+    guarded.prior_journal_identity = prior_journal_identity(guarded.generation);
+    guarded.guard = Some(guard_identity(&guarded.transaction_id));
+    validate_supervisor_journal_transition(&prepared, &guarded).unwrap();
+    let mut stopped = guarded.clone();
+    stopped.phase = SupervisorPhaseV1::UnitsStopped;
+    stopped.generation += 1;
+    stopped.prior_journal_identity = prior_journal_identity(stopped.generation);
+    validate_supervisor_journal_transition(&guarded, &stopped).unwrap();
+
+    let mut directories_planned = stopped.clone();
+    for record in security_directories() {
+        let mut intent = record.clone();
+        intent.observed_directory = None;
+        let current = directories_planned.clone();
+        directories_planned.security_directories.push(intent);
+        directories_planned.generation += 1;
+        directories_planned.prior_journal_identity =
+            prior_journal_identity(directories_planned.generation);
+        validate_supervisor_journal_transition(&current, &directories_planned).unwrap();
+        let current = directories_planned.clone();
+        directories_planned
+            .security_directories
+            .last_mut()
+            .unwrap()
+            .observed_directory = record.observed_directory;
+        directories_planned.generation += 1;
+        directories_planned.prior_journal_identity =
+            prior_journal_identity(directories_planned.generation);
+        validate_supervisor_journal_transition(&current, &directories_planned).unwrap();
+    }
+    let mut directories_ready = directories_planned.clone();
+    directories_ready.phase = SupervisorPhaseV1::DirectoriesReady;
+    directories_ready.generation += 1;
+    directories_ready.prior_journal_identity = prior_journal_identity(directories_ready.generation);
+    validate_supervisor_journal_transition(&directories_planned, &directories_ready).unwrap();
+
+    let mut failed = directories_ready.clone();
+    failed.supervisor_failed = true;
+    failed.generation += 1;
+    failed.prior_journal_identity = prior_journal_identity(failed.generation);
+    validate_supervisor_journal_transition(&directories_ready, &failed).unwrap();
+    let bytes = failed.deterministic_bytes().unwrap();
+    assert_eq!(SupervisorJournalV1::parse(&bytes).unwrap(), failed);
+
+    let mut lost_target = directories_ready;
+    lost_target.service_unit_state = None;
+    assert!(lost_target.validate().is_err());
+}
+
+#[test]
+fn every_journal_requires_exact_service_activity_and_invocation_presence() {
+    let mut mode1_active_without_id = journal_at(JournalPhase::Guarded);
+    mode1_active_without_id.prior_daemon_invocation_id = None;
+    assert!(mode1_active_without_id.validate().is_err());
+
+    let mut mode1_inactive_with_id = journal_at(JournalPhase::Guarded);
+    mode1_inactive_with_id.service_unit_state = inactive_unit(UnitKind::Service);
+    assert!(mode1_inactive_with_id.validate().is_err());
+
+    let mut mode0_inactive_with_id = plaintext_journal_at(PlaintextJournalPhase::Guarded);
+    mode0_inactive_with_id.prior_daemon_invocation_id = Some("ab".repeat(32));
+    assert!(mode0_inactive_with_id.validate().is_err());
+
+    let mut mode0_active_without_id = plaintext_journal_at(PlaintextJournalPhase::Guarded);
+    mode0_active_without_id.service_unit_state = active_unit();
+    assert!(mode0_active_without_id.validate().is_err());
+
+    let mut supervisor_active_without_id = SupervisorJournalV1 {
+        schema_version: 1,
+        transaction_id: "txn-0123456789abcdef0123456789abcdef".into(),
+        generation: 1,
+        prior_journal_identity: None,
+        journal_staging_path: canonical_journal_staging_path(
+            "txn-0123456789abcdef0123456789abcdef",
+        )
+        .unwrap(),
+        guard: None,
+        operation: SupervisorOperationV1::ProvisionMode1,
+        phase: SupervisorPhaseV1::Prepared,
+        prior_config: None,
+        prior_dropin: None,
+        prior_receipt: None,
+        service_unit_state: Some(active_unit()),
+        socket_unit_state: Some(inactive_unit(UnitKind::Socket)),
+        prior_daemon_invocation_id: None,
+        prior_effective_units: Some(effective_units(digest(b"prior"), false)),
+        transaction_owned_paths: vec![
+            canonical_journal_staging_path("txn-0123456789abcdef0123456789abcdef").unwrap(),
+        ],
+        atomic_writes: Vec::new(),
+        security_directories: Vec::new(),
+        cleanup_artifact: None,
+        cleanup_manifest: None,
+        cleanup_pre_admission: None,
+        cleanup_quarantine: None,
+        supervisor_failed: false,
+    };
+    assert!(supervisor_active_without_id.validate().is_err());
+    supervisor_active_without_id.service_unit_state = Some(inactive_unit(UnitKind::Service));
+    supervisor_active_without_id.prior_daemon_invocation_id = Some("cd".repeat(32));
+    assert!(supervisor_active_without_id.validate().is_err());
+
+    let mut uppercase = journal_at(JournalPhase::Guarded);
+    uppercase.prior_daemon_invocation_id = Some("AB".repeat(32));
+    assert!(uppercase.validate().is_err());
+}
+
+#[test]
+fn effective_unit_policy_rejects_overrides_shadowing_and_missing_guards() {
+    let mode1_hash = digest(b"dropin");
+    let mode1 = effective_units(mode1_hash.clone(), true);
+    mode1.validate_mode1(&mode1_hash).unwrap();
+
+    let mut extra_dropin = mode1.clone();
+    extra_dropin.service.dropins.push(effective_file(
+        "/etc/systemd/system/howy.service.d/99-shadow.conf",
+        b"shadow",
+        0o600,
+    ));
+    assert!(extra_dropin.validate_mode1(&mode1_hash).is_err());
+
+    let mut pathless_shadow = mode1.clone();
+    pathless_shadow.service.load_credential_encrypted[0]
+        .source
+        .clear();
+    assert!(pathless_shadow.validate_mode1(&mode1_hash).is_err());
+
+    let mut missing_service_guard = mode1.clone();
+    missing_service_guard.service.conditions.remove(0);
+    assert!(missing_service_guard.validate_mode1(&mode1_hash).is_err());
+
+    let mut missing_service_marker = mode1.clone();
+    missing_service_marker.service.conditions.remove(1);
+    assert!(missing_service_marker.validate_mode1(&mode1_hash).is_err());
+
+    let mut missing_socket_guard = mode1.clone();
+    missing_socket_guard.socket.conditions.remove(0);
+    assert!(missing_socket_guard.validate_mode1(&mode1_hash).is_err());
+
+    let mut reordered = mode1.clone();
+    reordered.service.conditions.reverse();
+    assert!(reordered.validate_mode1(&mode1_hash).is_err());
+
+    let mut changed_exec = mode1.clone();
+    changed_exec.service.exec_start = vec![vec!["/usr/local/bin/howyd".into()]];
+    assert!(changed_exec.validate_mode1(&mode1_hash).is_err());
+
+    let mode0_hash = digest(b"mode0-dropin");
+    let mode0 = effective_units(mode0_hash.clone(), false);
+    mode0.validate_mode0(&mode0_hash).unwrap();
+    let mut credential_leak = mode0;
+    credential_leak.service.set_credential = mode1.service.set_credential;
+    assert!(credential_leak.validate_mode0(&mode0_hash).is_err());
 }
 
 #[test]
@@ -742,6 +1289,7 @@ fn sample_receipt(state: ReceiptState) -> ProvisioningReceiptV1 {
             source_companion_name: MODE1_CREDENTIAL_SOURCE_COMPANION_NAME.to_owned(),
             configured_credential_source: ConfiguredMode1CredentialSource::production(),
         },
+        effective_units: effective_units(digest(b"drop-in"), true),
         verifier: VerifierReceipt::new(
             VerifierResultV1::new(
                 config_sha256,
@@ -916,9 +1464,10 @@ fn receipt_is_strict_deterministic_nonsecret_and_transitions_exactly() {
             "../../testdata/provisioning-receipt-v1.golden.json"
         ));
     assert_eq!(bytes, golden);
+    assert!(!bytes.windows(9).any(|window| window == b"plaintext"));
     assert_eq!(
         disabled.deterministic_sha256().unwrap().as_str(),
-        "385aa63bf87a36a731139ae15a02ec7d4526f130a131c7d4fe5a362d0016919d"
+        "6dbe82988cb0db5dce5e354d9da8f949e0774962405b77f628a72d8edde767ac"
     );
     let parsed = ProvisioningReceiptV1::parse(&bytes).unwrap();
     assert_eq!(parsed, disabled);
@@ -1165,6 +1714,7 @@ fn provisioning_state_table_is_total_and_nonempty_new_key_always_refuses() {
             artifact,
             namespace_nonempty,
             new_key_requested,
+            adopt_existing: false,
         })
     };
     assert_eq!(
@@ -1193,6 +1743,26 @@ fn provisioning_state_table_is_total_and_nonempty_new_key_always_refuses() {
             false
         ),
         ProvisioningState::Unadopted
+    );
+    assert_eq!(
+        classify_provisioning_state(ProvisioningStateInput {
+            config: ExistingProvisioningConfig::Absent,
+            artifact: ExistingProvisioningArtifact::Verified,
+            namespace_nonempty: false,
+            new_key_requested: false,
+            adopt_existing: true,
+        }),
+        ProvisioningState::Adopt
+    );
+    assert_eq!(
+        classify_provisioning_state(ProvisioningStateInput {
+            config: ExistingProvisioningConfig::Explicit { mode: 1, epoch: 1 },
+            artifact: ExistingProvisioningArtifact::Unverified,
+            namespace_nonempty: true,
+            new_key_requested: false,
+            adopt_existing: true,
+        }),
+        ProvisioningState::Adopt
     );
     assert_eq!(
         classify(
@@ -1237,7 +1807,7 @@ fn provisioning_state_table_is_total_and_nonempty_new_key_always_refuses() {
             false,
             false
         ),
-        ProvisioningState::DifferentMode
+        ProvisioningState::DifferentMode(DifferentModeArtifactState::Receipted)
     );
 
     for config in [
@@ -1251,10 +1821,65 @@ fn provisioning_state_table_is_total_and_nonempty_new_key_always_refuses() {
             ExistingProvisioningArtifact::Unverified,
             ExistingProvisioningArtifact::Mismatch,
         ] {
-            assert_eq!(
-                classify(config, artifact, true, true),
-                ProvisioningState::NewKey
-            );
+            let expected = match config {
+                ExistingProvisioningConfig::Explicit { mode: 0, .. } => {
+                    ProvisioningState::DifferentMode(match artifact {
+                        ExistingProvisioningArtifact::Absent => DifferentModeArtifactState::Absent,
+                        ExistingProvisioningArtifact::Verified => {
+                            DifferentModeArtifactState::Receipted
+                        }
+                        ExistingProvisioningArtifact::Unverified => {
+                            DifferentModeArtifactState::Unadopted
+                        }
+                        ExistingProvisioningArtifact::Mismatch => {
+                            DifferentModeArtifactState::Mismatch
+                        }
+                    })
+                }
+                _ => ProvisioningState::NewKey,
+            };
+            assert_eq!(classify(config, artifact, true, true), expected);
+        }
+    }
+}
+
+#[test]
+fn different_mode_classifier_exhaustively_preserves_artifact_adoption_state() {
+    let artifacts = [
+        ExistingProvisioningArtifact::Absent,
+        ExistingProvisioningArtifact::Verified,
+        ExistingProvisioningArtifact::Unverified,
+        ExistingProvisioningArtifact::Mismatch,
+    ];
+    for artifact in artifacts {
+        for namespace_nonempty in [false, true] {
+            for new_key_requested in [false, true] {
+                for adopt_existing in [false, true] {
+                    let actual = classify_provisioning_state(ProvisioningStateInput {
+                        config: ExistingProvisioningConfig::Explicit { mode: 0, epoch: 1 },
+                        artifact,
+                        namespace_nonempty,
+                        new_key_requested,
+                        adopt_existing,
+                    });
+                    let expected = match artifact {
+                        ExistingProvisioningArtifact::Absent => {
+                            ProvisioningState::DifferentMode(DifferentModeArtifactState::Absent)
+                        }
+                        ExistingProvisioningArtifact::Verified => {
+                            ProvisioningState::DifferentMode(DifferentModeArtifactState::Receipted)
+                        }
+                        ExistingProvisioningArtifact::Unverified => {
+                            ProvisioningState::DifferentMode(DifferentModeArtifactState::Unadopted)
+                        }
+                        ExistingProvisioningArtifact::Mismatch => {
+                            ProvisioningState::DifferentMode(DifferentModeArtifactState::Mismatch)
+                        }
+                    };
+                    assert_eq!(actual, expected);
+                    assert_ne!(actual, ProvisioningState::Idempotent);
+                }
+            }
         }
     }
 }
@@ -1316,7 +1941,7 @@ fn unit_admissibility_settles_refuses_and_never_changes_enablement() {
 
 fn cleanup_artifact_identity() -> CleanupArtifactIdentityV1 {
     CleanupArtifactIdentityV1 {
-        transaction_id: "txn-0123456789abcdef".to_owned(),
+        transaction_id: "txn-0123456789abcdef0123456789abcdef".to_owned(),
         descriptor: ArtifactDescriptorIdentityV1 {
             path: MODE1_CREDENTIAL_PATH.to_owned(),
             device_id: 8,
@@ -1359,14 +1984,14 @@ fn cleanup_input() -> CleanupStateInput {
         service: observation(UnitActiveState::Inactive, UnitSubState::Dead),
         socket,
         readiness_transient_exists: false,
-        daemon_reports_credential: false,
+        daemon_responded: false,
     }
 }
 
 #[test]
 fn cleanup_identity_rejects_swap_path_hash_metadata_and_adoption_races() {
     let mut input = cleanup_input();
-    input.observed_artifact.0.transaction_id = "txn-raced".to_owned();
+    input.observed_artifact.0.transaction_id = "txn-ffffffffffffffffffffffffffffffff".to_owned();
     assert_eq!(
         classify_cleanup_admissibility(input),
         CleanupAdmissibility::Refuse(CleanupRefusal::TransactionMismatch)
@@ -1491,7 +2116,7 @@ fn cleanup_requires_no_references_jobs_transients_daemon_or_live_units() {
         CleanupAdmissibility::Refuse(CleanupRefusal::ReadinessTransient)
     );
     let mut input = cleanup_input();
-    input.daemon_reports_credential = true;
+    input.daemon_responded = true;
     assert_eq!(
         classify_cleanup_admissibility(input),
         CleanupAdmissibility::Refuse(CleanupRefusal::DaemonReference)

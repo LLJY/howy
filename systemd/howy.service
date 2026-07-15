@@ -3,7 +3,8 @@ Description=howy Face Authentication Daemon
 Documentation=https://github.com/howy/howy
 After=network.target
 Requires=howy.socket
-ConditionPathExists=!/etc/howy/.security-transaction
+ConditionPathExists=!/var/lib/howy-security-transaction.guard
+ConditionPathExists=/var/lib/howy-package-bootstrap.complete
 
 [Service]
 Type=simple
@@ -12,7 +13,6 @@ Type=simple
 ExecStart=/usr/bin/howyd
 Restart=on-failure
 RestartSec=5
-LoadCredentialEncrypted=howy.storage.mode1.epoch1
 
 # Environment
 Environment="RUST_LOG=info"

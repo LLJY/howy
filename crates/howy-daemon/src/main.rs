@@ -216,8 +216,8 @@ fn validate_candidate_argument(path: &Path) -> Result<()> {
 fn serialize_strong_readiness_result(verifier: &VerifierResultV1) -> Result<Vec<u8>> {
     let mut output = verifier.deterministic_bytes()?;
     output.push(b'\n');
-    // Keep one success object below Linux PIPE_BUF so transient-unit pipe
-    // capture observes either the complete object or no verifier write.
+    // Keep one success object within the protocol cap. Emission separately
+    // queries the actual pipe/FIFO PIPE_BUF before its sole nonblocking write.
     if output.len() > MAX_VERIFIER_OUTPUT_BYTES {
         bail!("strong readiness result exceeds the atomic output bound");
     }

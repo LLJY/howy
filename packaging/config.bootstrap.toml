@@ -1,0 +1,73 @@
+[core]
+detection_notice = false
+timeout_notice = true
+no_confirmation = false
+suppress_unknown = false
+abort_if_ssh = true
+abort_if_lid_closed = true
+disabled = true
+
+[ml]
+provider = "auto"
+prefer_npu = false
+det_threshold = 0.6000000238418579
+recognition_threshold = 0.5
+detector_model = ""
+recognizer_model = ""
+det_width = 640
+det_height = 640
+threads = 0
+
+[video]
+timeout = 4
+device_path = ""
+max_height = 320
+dark_threshold = 60.0
+max_dark_frames = 15
+frame_width = -1
+frame_height = -1
+rotate = 0
+device_fps = -1
+exposure = -1
+
+[snapshots]
+save_failed = false
+save_successful = false
+
+[credentials]
+enable_cache = false
+cache_ttl_secs = 300
+keyring_prefix = "howy:auth"
+use_systemd_creds = false
+
+[security]
+embedding_mode = 1
+key_epoch = 1
+max_embeddings_per_user = 1000
+max_record_bytes = 2621440
+max_plaintext_bytes = 134217728
+
+[security.cached]
+credential_name = "howy.storage.mode1.epoch1"
+max_cached_users = 64
+max_cache_bytes = 134217728
+require_mlock = true
+
+[security.ephemeral]
+sealed_key_blob = "/var/lib/howy/keys/mode2-epoch1.blob"
+key_description = "howy:storage:mode2:epoch1"
+tpm_parent_handle = "0x81000001"
+
+[presence]
+mode = "confirm"
+local_only = true
+allowed_pam_services = ["sudo"]
+prompt_timeout_ms = 30000
+commit_to_camera_ms = 1000
+scan_timeout_ms = 2000
+max_pending_per_uid = 2
+max_pending_global = 32
+
+[debug]
+end_report = false
+log_level = "info"
