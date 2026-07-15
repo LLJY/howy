@@ -1,7 +1,8 @@
 [Unit]
 Description=howy Face Authentication Socket
 Documentation=https://github.com/howy/howy
-ConditionPathExists=!/etc/howy/.security-transaction
+ConditionPathExists=!/var/lib/howy-security-transaction.guard
+ConditionPathExists=/var/lib/howy-package-bootstrap.complete
 
 [Socket]
 # Installed by scripts/install-local.sh for local machine testing.

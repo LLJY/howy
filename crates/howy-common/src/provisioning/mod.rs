@@ -41,15 +41,34 @@ pub const MAX_NAMESPACE_CIPHERTEXT_BYTES: u64 = 2_621_440;
 pub const MAX_NAMESPACE_TOTAL_BYTES: u64 = 1_073_741_824;
 
 /// Root-only provisioning state paths shared by the CLI transaction engine.
-pub const SECURITY_STATE_DIRECTORY: &str = "/etc/howy/security-state";
-pub const SECURITY_LOCK_PATH: &str = "/etc/howy/security-state/lock";
-pub const SECURITY_JOURNAL_PATH: &str = "/etc/howy/security-state/transaction-v1.json";
-pub const SECURITY_RECEIPT_PATH: &str = "/etc/howy/security-state/receipt-v1.json";
-pub const SECURITY_UNADOPTED_DIRECTORY: &str = "/etc/howy/security-state/unadopted";
-pub const SECURITY_TRANSACTION_GUARD_PATH: &str = "/etc/howy/.security-transaction";
+pub const HOWY_CONFIG_DIRECTORY: &str = "/etc/howy";
+pub const HOWY_MODELS_DIRECTORY: &str = "/etc/howy/models";
+pub const SYSTEMD_SERVICE_DROPIN_DIRECTORY: &str = "/etc/systemd/system/howy.service.d";
+pub const HOWY_STATE_DIRECTORY: &str = "/var/lib/howy";
+pub const SECURITY_STATE_DIRECTORY: &str = "/var/lib/howy/security-state";
+pub const SECURITY_JOURNAL_DIRECTORY: &str = "/var/lib";
+pub const SECURITY_LOCK_PATH: &str = "/run/lock/howy-security.lock";
+pub const SECURITY_JOURNAL_PATH: &str = "/var/lib/howy-security-transaction-v1.json";
+pub const SECURITY_RECEIPT_PATH: &str = "/var/lib/howy/security-state/receipt-v1.json";
+pub const SECURITY_UNADOPTED_DIRECTORY: &str = "/var/lib/howy/security-state/unadopted";
+pub const SECURITY_TRANSACTION_GUARD_PATH: &str = "/var/lib/howy-security-transaction.guard";
+pub const PACKAGE_BOOTSTRAP_MARKER_PATH: &str = "/var/lib/howy-package-bootstrap.complete";
 pub const MODE1_DROPIN_PATH: &str =
     "/etc/systemd/system/howy.service.d/60-howy-mode1-credential.conf";
 pub const BASE_SERVICE_UNIT_PATH: &str = "/usr/lib/systemd/system/howy.service";
+pub const BASE_SOCKET_UNIT_PATH: &str = "/usr/lib/systemd/system/howy.socket";
+pub const SYSTEMD_HOST_SECRET_PATH: &str = "/var/lib/systemd/credential.secret";
+
+pub const REQUIRED_SECURITY_DIRECTORIES: [(&str, u32); 8] = [
+    (HOWY_CONFIG_DIRECTORY, 0o700),
+    (HOWY_MODELS_DIRECTORY, 0o700),
+    (MODE1_NAMESPACE_PATH, 0o700),
+    (MODE1_CREDENTIAL_DIRECTORY, 0o700),
+    (SYSTEMD_SERVICE_DROPIN_DIRECTORY, 0o755),
+    (HOWY_STATE_DIRECTORY, 0o700),
+    (SECURITY_STATE_DIRECTORY, 0o700),
+    (SECURITY_UNADOPTED_DIRECTORY, 0o700),
+];
 
 // systemd v261 creds-util.h: 1 MiB plaintext plus 128 KiB envelope overhead.
 pub const SYSTEMD_CREDENTIAL_ENCRYPTED_SIZE_MAX: usize = 1_048_576 + 131_072;
@@ -288,6 +307,7 @@ pub enum JournalPhase {
     DisabledConfigCommitted,
     ReadinessVerified,
     DisabledReceiptCommitted,
+    DisabledUnitsStarted,
     EnabledConfigCommitted,
     ActivationCommitted,
     UnitsStarted,
@@ -295,7 +315,7 @@ pub enum JournalPhase {
 }
 
 impl JournalPhase {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Prepared,
         Self::Guarded,
         Self::UnitsStopped,
@@ -304,6 +324,7 @@ impl JournalPhase {
         Self::DisabledConfigCommitted,
         Self::ReadinessVerified,
         Self::DisabledReceiptCommitted,
+        Self::DisabledUnitsStarted,
         Self::EnabledConfigCommitted,
         Self::ActivationCommitted,
         Self::UnitsStarted,
@@ -320,10 +341,11 @@ impl JournalPhase {
             Self::DisabledConfigCommitted => 5,
             Self::ReadinessVerified => 6,
             Self::DisabledReceiptCommitted => 7,
-            Self::EnabledConfigCommitted => 8,
-            Self::ActivationCommitted => 9,
-            Self::UnitsStarted => 10,
-            Self::EnabledReceiptCommitted => 11,
+            Self::DisabledUnitsStarted => 8,
+            Self::EnabledConfigCommitted => 9,
+            Self::ActivationCommitted => 10,
+            Self::UnitsStarted => 11,
+            Self::EnabledReceiptCommitted => 12,
         }
     }
 
@@ -426,7 +448,9 @@ pub const fn recovery_action_for_phase(phase: JournalPhase) -> RecoveryAction {
         | JournalPhase::DropinCommitted
         | JournalPhase::DisabledConfigCommitted
         | JournalPhase::ReadinessVerified => RecoveryAction::RestorePriorState,
-        JournalPhase::DisabledReceiptCommitted => RecoveryAction::CompleteDisabledProvisioning,
+        JournalPhase::DisabledReceiptCommitted | JournalPhase::DisabledUnitsStarted => {
+            RecoveryAction::CompleteDisabledProvisioning
+        }
         JournalPhase::EnabledConfigCommitted => RecoveryAction::RestoreDisabledState,
         JournalPhase::ActivationCommitted
         | JournalPhase::UnitsStarted
@@ -520,6 +544,133 @@ pub struct StableUnitState {
     pub unit_file_state: UnitFileState,
 }
 
+/// Durable create intent and exact observation for one required provisioning
+/// directory. The intent (including the no-follow parent identity and whether
+/// the target was absent) is persisted before `mkdirat(2)` is permitted.
+/// `observed_directory` is persisted immediately after creation/reconciliation
+/// and is the rollback identity. Only absent-at-intent entries may be removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityDirectoryRecordV1 {
+    pub path: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub permissions: u32,
+    pub parent_directory: DirectoryIdentityV1,
+    pub expected_directory: Option<DirectoryIdentityV1>,
+    pub observed_directory: Option<DirectoryIdentityV1>,
+    pub preexisted: bool,
+}
+
+impl SecurityDirectoryRecordV1 {
+    pub fn validate(&self) -> Result<(), ProvisioningContractError> {
+        let Some((_, required_mode)) = REQUIRED_SECURITY_DIRECTORIES
+            .iter()
+            .find(|(path, _)| *path == self.path)
+        else {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "security directory path",
+            ));
+        };
+        let expected_parent = Path::new(&self.path)
+            .parent()
+            .and_then(Path::to_str)
+            .ok_or(ProvisioningContractError::InvalidSchema(
+                "security directory parent",
+            ))?;
+        if self.uid != 0
+            || self.gid != 0
+            || self.permissions != *required_mode
+            || self.parent_directory.path != expected_parent
+            || self.parent_directory.object_type != FileObjectType::Directory
+            || self.parent_directory.uid != 0
+            || self.parent_directory.gid != 0
+            || self.parent_directory.permissions & 0o022 != 0
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "security directory metadata",
+            ));
+        }
+        self.parent_directory.validate_shape()?;
+        if self.preexisted != self.expected_directory.is_some() {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "security directory preexistence",
+            ));
+        }
+        if let Some(expected) = &self.expected_directory {
+            validate_security_directory_identity(self, expected)?;
+        }
+        if let Some(observed) = &self.observed_directory {
+            validate_security_directory_identity(self, observed)?;
+            if let Some(expected) = &self.expected_directory
+                && expected != observed
+            {
+                return Err(ProvisioningContractError::InvalidSchema(
+                    "preexisting security directory changed",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_security_directory_identity(
+    record: &SecurityDirectoryRecordV1,
+    identity: &DirectoryIdentityV1,
+) -> Result<(), ProvisioningContractError> {
+    identity.validate_shape()?;
+    if identity.path != record.path
+        || identity.object_type != FileObjectType::Directory
+        || identity.uid != record.uid
+        || identity.gid != record.gid
+        || identity.permissions != record.permissions
+    {
+        return Err(ProvisioningContractError::InvalidSchema(
+            "security directory identity",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_security_directory_record_prefix(
+    records: &[SecurityDirectoryRecordV1],
+) -> Result<(), ProvisioningContractError> {
+    if records.len() > REQUIRED_SECURITY_DIRECTORIES.len() {
+        return Err(ProvisioningContractError::InvalidSchema(
+            "security directory count",
+        ));
+    }
+    for ((required_path, _), record) in REQUIRED_SECURITY_DIRECTORIES.iter().zip(records) {
+        record.validate()?;
+        if record.path != *required_path {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "security directory order",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_security_directory_records(
+    records: &[SecurityDirectoryRecordV1],
+) -> Result<(), ProvisioningContractError> {
+    if records.len() != REQUIRED_SECURITY_DIRECTORIES.len() {
+        return Err(ProvisioningContractError::InvalidSchema(
+            "security directory count",
+        ));
+    }
+    validate_security_directory_record_prefix(records)?;
+    if records
+        .iter()
+        .any(|record| record.observed_directory.is_none())
+    {
+        return Err(ProvisioningContractError::InvalidSchema(
+            "unobserved security directory",
+        ));
+    }
+    Ok(())
+}
+
 impl StableUnitState {
     pub const fn rollback_target(&self) -> Option<StableRollbackTarget> {
         match (self.unit_kind, self.active_state, self.sub_state) {
@@ -547,6 +698,24 @@ impl StableUnitState {
         }
         Ok(())
     }
+}
+
+pub fn disabled_post_provision_unit_targets(
+    service: &StableUnitState,
+    socket: &StableUnitState,
+) -> Result<(StableUnitState, StableUnitState), ProvisioningContractError> {
+    service.validate()?;
+    socket.validate()?;
+    if service.unit_kind != UnitKind::Service || socket.unit_kind != UnitKind::Socket {
+        return Err(ProvisioningContractError::InvalidSchema(
+            "disabled post-provision unit kind",
+        ));
+    }
+    let mut service_target = service.clone();
+    service_target.active_state = UnitActiveState::Inactive;
+    service_target.sub_state = UnitSubState::Dead;
+    service_target.validate()?;
+    Ok((service_target, socket.clone()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -674,6 +843,436 @@ pub struct ExactFileSnapshot {
     pub metadata_sha256: Sha256Digest,
 }
 
+/// Exact identity of a regular file used at an atomic rename boundary.
+/// Timestamps are deliberately excluded: the identity binds the object that
+/// may be exchanged, while timestamps on the replacement are part of the
+/// write plan below.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AtomicFileIdentityV1 {
+    pub device_id: u64,
+    pub inode: u64,
+    pub object_type: FileObjectType,
+    pub uid: u32,
+    pub gid: u32,
+    pub permissions: u32,
+    pub link_count: u64,
+    pub byte_length: u64,
+    pub sha256: Sha256Digest,
+}
+
+impl AtomicFileIdentityV1 {
+    pub fn validate(&self) -> Result<(), ProvisioningContractError> {
+        if self.device_id == 0
+            || self.inode == 0
+            || self.object_type != FileObjectType::RegularFile
+            || self.permissions & !0o7777 != 0
+            || self.link_count != 1
+            || self.byte_length > MAX_JOURNAL_BYTES as u64
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "atomic file identity",
+            ));
+        }
+        self.sha256.validate()
+    }
+}
+
+/// Strict, versioned content of the persistent systemd transaction guard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransactionGuardV1 {
+    pub schema_version: u16,
+    pub transaction_id: String,
+}
+
+impl TransactionGuardV1 {
+    pub fn new(transaction_id: &str) -> Result<Self, ProvisioningContractError> {
+        let guard = Self {
+            schema_version: PROVISIONING_SCHEMA_VERSION,
+            transaction_id: transaction_id.to_owned(),
+        };
+        guard.validate()?;
+        Ok(guard)
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, ProvisioningContractError> {
+        parse_bounded_json(bytes, 256, "transaction guard bytes")
+            .and_then(|value: Self| value.validated())
+    }
+
+    pub fn deterministic_bytes(&self) -> Result<Vec<u8>, ProvisioningContractError> {
+        self.validate()?;
+        canonical_json(self, 256, "transaction guard bytes")
+    }
+
+    pub fn validated(self) -> Result<Self, ProvisioningContractError> {
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<(), ProvisioningContractError> {
+        if self.schema_version != PROVISIONING_SCHEMA_VERSION {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "transaction guard version",
+            ));
+        }
+        validate_transaction_id_v1(&self.transaction_id, "transaction guard id")
+    }
+}
+
+/// Exact durable identity returned by guard creation and carried by every
+/// guarded journal generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransactionGuardIdentityV1 {
+    pub content: TransactionGuardV1,
+    pub file: AtomicFileIdentityV1,
+}
+
+impl TransactionGuardIdentityV1 {
+    pub fn new(
+        transaction_id: &str,
+        file: AtomicFileIdentityV1,
+    ) -> Result<Self, ProvisioningContractError> {
+        let identity = Self {
+            content: TransactionGuardV1::new(transaction_id)?,
+            file,
+        };
+        identity.validate(transaction_id)?;
+        Ok(identity)
+    }
+
+    pub fn validate(&self, transaction_id: &str) -> Result<(), ProvisioningContractError> {
+        self.content.validate()?;
+        self.file.validate()?;
+        let bytes = self.content.deterministic_bytes()?;
+        if self.content.transaction_id != transaction_id
+            || self.file.uid != 0
+            || self.file.gid != 0
+            || self.file.permissions != 0o600
+            || self.file.byte_length != bytes.len() as u64
+            || self.file.sha256 != Sha256Digest::from_bytes(&bytes)
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "transaction guard identity",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "identity", rename_all = "kebab-case")]
+pub enum AtomicExpectedTargetV1 {
+    Absent,
+    Present(AtomicFileIdentityV1),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AtomicWriteKindV1 {
+    NoReplace,
+    Exchange,
+}
+
+/// Fully bound, pre-journaled atomic write intent. The exchange staging name
+/// is also the exact backup name: after `RENAME_EXCHANGE` it names the prior
+/// target until the engine records a terminal phase and explicitly removes
+/// that exact identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AtomicWritePlanV1 {
+    pub schema_version: u16,
+    pub transaction_id: String,
+    pub target_path: String,
+    pub parent_directory: DirectoryIdentityV1,
+    pub expected_target: AtomicExpectedTargetV1,
+    pub staging_path: String,
+    pub backup_path: Option<String>,
+    pub uid: u32,
+    pub gid: u32,
+    pub permissions: u32,
+    pub timestamps: Option<RestorableFileTimestampsV1>,
+    pub bytes_sha256: Sha256Digest,
+    pub byte_length: u64,
+    pub operation: AtomicWriteKindV1,
+}
+
+impl AtomicWritePlanV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        transaction_id: &str,
+        target_path: &str,
+        parent_directory: DirectoryIdentityV1,
+        expected_target: AtomicExpectedTargetV1,
+        uid: u32,
+        gid: u32,
+        permissions: u32,
+        timestamps: Option<RestorableFileTimestampsV1>,
+        bytes: &[u8],
+        operation: AtomicWriteKindV1,
+    ) -> Result<Self, ProvisioningContractError> {
+        let bytes_sha256 = Sha256Digest::from_bytes(bytes);
+        let staging_path =
+            canonical_atomic_staging_path(transaction_id, target_path, &bytes_sha256)?;
+        let backup_path = (operation == AtomicWriteKindV1::Exchange).then(|| staging_path.clone());
+        let plan = Self {
+            schema_version: PROVISIONING_SCHEMA_VERSION,
+            transaction_id: transaction_id.to_owned(),
+            target_path: target_path.to_owned(),
+            parent_directory,
+            expected_target,
+            staging_path,
+            backup_path,
+            uid,
+            gid,
+            permissions,
+            timestamps,
+            bytes_sha256,
+            byte_length: u64::try_from(bytes.len())
+                .map_err(|_| ProvisioningContractError::LimitExceeded("atomic write bytes"))?,
+            operation,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    pub fn validate(&self) -> Result<(), ProvisioningContractError> {
+        if self.schema_version != PROVISIONING_SCHEMA_VERSION
+            || self.permissions & !0o7777 != 0
+            || self.byte_length > MAX_JOURNAL_BYTES as u64
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "atomic write plan",
+            ));
+        }
+        validate_transaction_id_v1(&self.transaction_id, "atomic transaction id")?;
+        validate_absolute_path(&self.target_path, "atomic target path")?;
+        self.parent_directory.validate_shape()?;
+        let target = Path::new(&self.target_path);
+        if target.parent() != Some(Path::new(&self.parent_directory.path)) {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "atomic target parent",
+            ));
+        }
+        match (&self.operation, &self.expected_target, &self.backup_path) {
+            (AtomicWriteKindV1::NoReplace, AtomicExpectedTargetV1::Absent, None) => {}
+            (
+                AtomicWriteKindV1::Exchange,
+                AtomicExpectedTargetV1::Present(identity),
+                Some(backup),
+            ) => {
+                identity.validate()?;
+                if identity.uid != self.uid
+                    || identity.gid != self.gid
+                    || identity.permissions & 0o022 != 0
+                    || backup != &self.staging_path
+                {
+                    return Err(ProvisioningContractError::InvalidSchema(
+                        "atomic exchange backup path",
+                    ));
+                }
+            }
+            _ => {
+                return Err(ProvisioningContractError::InvalidSchema(
+                    "atomic operation target state",
+                ));
+            }
+        }
+        if let Some(timestamps) = &self.timestamps {
+            timestamps.access.validate()?;
+            timestamps.modification.validate()?;
+        }
+        self.bytes_sha256.validate()?;
+        let expected_stage = canonical_atomic_staging_path(
+            &self.transaction_id,
+            &self.target_path,
+            &self.bytes_sha256,
+        )?;
+        if self.staging_path != expected_stage
+            || self.staging_path == self.target_path
+            || Path::new(&self.staging_path).parent()
+                != Some(Path::new(&self.parent_directory.path))
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "atomic staging path",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AtomicWriteObservationV1 {
+    pub target: AtomicFileIdentityV1,
+    pub backup: Option<AtomicFileIdentityV1>,
+}
+
+impl AtomicWriteObservationV1 {
+    pub fn validate_for_plan(
+        &self,
+        plan: &AtomicWritePlanV1,
+    ) -> Result<(), ProvisioningContractError> {
+        plan.validate()?;
+        self.target.validate()?;
+        if self.target.uid != plan.uid
+            || self.target.gid != plan.gid
+            || self.target.permissions != plan.permissions
+            || self.target.byte_length != plan.byte_length
+            || self.target.sha256 != plan.bytes_sha256
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "atomic committed target",
+            ));
+        }
+        match (&plan.expected_target, &self.backup) {
+            (AtomicExpectedTargetV1::Absent, None) => Ok(()),
+            (AtomicExpectedTargetV1::Present(expected), Some(backup)) if expected == backup => {
+                backup.validate()
+            }
+            _ => Err(ProvisioningContractError::InvalidSchema(
+                "atomic committed backup",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "kebab-case")]
+pub enum AtomicWriteStateV1 {
+    Planned,
+    Staged {
+        identity: AtomicFileIdentityV1,
+    },
+    Aborted,
+    Committed {
+        observation: AtomicWriteObservationV1,
+    },
+    BackupCleaned {
+        observation: AtomicWriteObservationV1,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AtomicWriteRecordV1 {
+    pub plan: AtomicWritePlanV1,
+    pub state: AtomicWriteStateV1,
+}
+
+impl AtomicWriteRecordV1 {
+    pub fn planned(plan: AtomicWritePlanV1) -> Self {
+        Self {
+            plan,
+            state: AtomicWriteStateV1::Planned,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ProvisioningContractError> {
+        self.plan.validate()?;
+        match &self.state {
+            AtomicWriteStateV1::Planned | AtomicWriteStateV1::Aborted => Ok(()),
+            AtomicWriteStateV1::Staged { identity } => {
+                validate_atomic_staged_identity(&self.plan, identity)
+            }
+            AtomicWriteStateV1::Committed { observation } => {
+                observation.validate_for_plan(&self.plan)
+            }
+            AtomicWriteStateV1::BackupCleaned { observation } => {
+                observation.validate_for_plan(&self.plan)?;
+                if observation.backup.is_none() {
+                    return Err(ProvisioningContractError::InvalidSchema(
+                        "atomic backup cleanup state",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn validate_atomic_staged_identity(
+    plan: &AtomicWritePlanV1,
+    identity: &AtomicFileIdentityV1,
+) -> Result<(), ProvisioningContractError> {
+    identity.validate()?;
+    if identity.object_type != FileObjectType::RegularFile
+        || identity.uid != plan.uid
+        || identity.gid != plan.gid
+        || identity.permissions != plan.permissions
+        || identity.link_count != 1
+        || identity.byte_length != plan.byte_length
+        || identity.sha256 != plan.bytes_sha256
+    {
+        return Err(ProvisioningContractError::InvalidSchema(
+            "atomic staged identity",
+        ));
+    }
+    Ok(())
+}
+
+pub fn canonical_atomic_staging_path(
+    transaction_id: &str,
+    target_path: &str,
+    bytes_sha256: &Sha256Digest,
+) -> Result<String, ProvisioningContractError> {
+    validate_transaction_id_v1(transaction_id, "atomic transaction id")?;
+    validate_absolute_path(target_path, "atomic target path")?;
+    bytes_sha256.validate()?;
+    let target = Path::new(target_path);
+    let parent = target
+        .parent()
+        .ok_or(ProvisioningContractError::InvalidSchema(
+            "atomic target parent",
+        ))?;
+    let basename = target.file_name().and_then(|value| value.to_str()).ok_or(
+        ProvisioningContractError::InvalidSchema("atomic target basename"),
+    )?;
+    if basename.is_empty()
+        || basename.len() > 128
+        || !basename
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(ProvisioningContractError::InvalidSchema(
+            "atomic target basename",
+        ));
+    }
+    let stage_name = format!(
+        ".howy-{transaction_id}-{basename}-{}.stage",
+        bytes_sha256.as_str()
+    );
+    if stage_name.len() > MAX_NAMESPACE_NAME_BYTES {
+        return Err(ProvisioningContractError::LimitExceeded(
+            "atomic staging basename",
+        ));
+    }
+    Ok(parent.join(stage_name).to_string_lossy().into_owned())
+}
+
+pub fn canonical_journal_staging_path(
+    transaction_id: &str,
+) -> Result<String, ProvisioningContractError> {
+    validate_transaction_id_v1(transaction_id, "journal transaction id")?;
+    Ok(format!(
+        "{SECURITY_JOURNAL_DIRECTORY}/.howy-{transaction_id}-transaction-v1.json-journal.stage"
+    ))
+}
+
+fn validate_journal_staging_path(
+    transaction_id: &str,
+    path: &str,
+) -> Result<(), ProvisioningContractError> {
+    if path != canonical_journal_staging_path(transaction_id)? {
+        return Err(ProvisioningContractError::InvalidSchema(
+            "journal staging path",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackFileReconstructionV1 {
     pub bytes: Vec<u8>,
@@ -734,6 +1333,262 @@ impl ExactFileSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct EffectiveFileMetadataV1 {
+    pub object_type: FileObjectType,
+    pub uid: u32,
+    pub gid: u32,
+    pub permissions: u32,
+    pub link_count: u64,
+    pub byte_length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveUnitFileV1 {
+    pub path: String,
+    pub sha256: Sha256Digest,
+    pub metadata: EffectiveFileMetadataV1,
+}
+
+impl EffectiveUnitFileV1 {
+    fn validate(
+        &self,
+        expected_path: &str,
+        expected_permissions: u32,
+    ) -> Result<(), ProvisioningContractError> {
+        validate_absolute_path(&self.path, "effective unit file path")?;
+        self.sha256.validate()?;
+        if self.path != expected_path
+            || self.metadata.object_type != FileObjectType::RegularFile
+            || self.metadata.uid != 0
+            || self.metadata.gid != 0
+            || self.metadata.permissions != expected_permissions
+            || self.metadata.link_count != 1
+            || self.metadata.byte_length == 0
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "effective unit file",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveUnitConditionV1 {
+    pub condition: String,
+    pub trigger: bool,
+    pub negate: bool,
+    pub parameter: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveCredentialLoadV1 {
+    pub name: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveSetCredentialV1 {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveUnitObservationV1 {
+    pub unit_kind: UnitKind,
+    pub fragment: EffectiveUnitFileV1,
+    /// Exact manager order after all unit search-path precedence rules.
+    pub dropins: Vec<EffectiveUnitFileV1>,
+    pub conditions: Vec<EffectiveUnitConditionV1>,
+    pub load_credential_encrypted: Vec<EffectiveCredentialLoadV1>,
+    pub set_credential: Vec<EffectiveSetCredentialV1>,
+    /// Canonical absolute argv vectors. V1 permits exactly one service command.
+    pub exec_start: Vec<Vec<String>>,
+    /// Complete reviewed property/value set used by the v1 policy.
+    pub hardening: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveUnitSetV1 {
+    pub service: EffectiveUnitObservationV1,
+    pub socket: EffectiveUnitObservationV1,
+}
+
+impl EffectiveUnitSetV1 {
+    pub fn validate_mode1(
+        &self,
+        expected_dropin_sha256: &Sha256Digest,
+    ) -> Result<(), ProvisioningContractError> {
+        self.validate_common(expected_dropin_sha256)?;
+        if self.service.load_credential_encrypted
+            != [EffectiveCredentialLoadV1 {
+                name: MODE1_CREDENTIAL_NAME.to_owned(),
+                source: MODE1_CREDENTIAL_PATH.to_owned(),
+            }]
+            || self.service.set_credential
+                != [EffectiveSetCredentialV1 {
+                    name: MODE1_CREDENTIAL_SOURCE_COMPANION_NAME.to_owned(),
+                    value: MODE1_CREDENTIAL_PATH.to_owned(),
+                }]
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "effective mode 1 credentials",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_mode0(
+        &self,
+        expected_dropin_sha256: &Sha256Digest,
+    ) -> Result<(), ProvisioningContractError> {
+        self.validate_common(expected_dropin_sha256)?;
+        if !self.service.load_credential_encrypted.is_empty()
+            || !self.service.set_credential.is_empty()
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "effective mode 0 credentials",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_common(
+        &self,
+        expected_dropin_sha256: &Sha256Digest,
+    ) -> Result<(), ProvisioningContractError> {
+        expected_dropin_sha256.validate()?;
+        self.service
+            .fragment
+            .validate(BASE_SERVICE_UNIT_PATH, 0o644)?;
+        self.socket
+            .fragment
+            .validate(BASE_SOCKET_UNIT_PATH, 0o644)?;
+        if self.service.unit_kind != UnitKind::Service
+            || self.socket.unit_kind != UnitKind::Socket
+            || self.service.dropins.len() != 1
+            || self.service.dropins[0].path != MODE1_DROPIN_PATH
+            || self.service.dropins[0].sha256 != *expected_dropin_sha256
+            || self.service.dropins[0]
+                .validate(MODE1_DROPIN_PATH, 0o600)
+                .is_err()
+            || !self.socket.dropins.is_empty()
+            || self.service.conditions != required_unit_conditions()
+            || self.socket.conditions != required_unit_conditions()
+            || self.service.exec_start != [vec!["/usr/bin/howyd".to_owned()]]
+            || !self.socket.exec_start.is_empty()
+            || !self.socket.load_credential_encrypted.is_empty()
+            || !self.socket.set_credential.is_empty()
+            || !self.socket.hardening.is_empty()
+            || self.service.hardening != required_service_hardening()
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "effective unit policy",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn transaction_guard_condition() -> EffectiveUnitConditionV1 {
+    EffectiveUnitConditionV1 {
+        condition: "ConditionPathExists".to_owned(),
+        trigger: false,
+        negate: true,
+        parameter: SECURITY_TRANSACTION_GUARD_PATH.to_owned(),
+    }
+}
+
+pub fn package_bootstrap_condition() -> EffectiveUnitConditionV1 {
+    EffectiveUnitConditionV1 {
+        condition: "ConditionPathExists".to_owned(),
+        trigger: false,
+        negate: false,
+        parameter: PACKAGE_BOOTSTRAP_MARKER_PATH.to_owned(),
+    }
+}
+
+pub fn required_unit_conditions() -> [EffectiveUnitConditionV1; 2] {
+    [transaction_guard_condition(), package_bootstrap_condition()]
+}
+
+pub fn required_service_hardening() -> BTreeMap<String, String> {
+    [
+        ("LimitCORE", "0"),
+        ("LimitMEMLOCK", "65536"),
+        ("LockPersonality", "yes"),
+        ("MemoryDenyWriteExecute", "no"),
+        ("NoNewPrivileges", "yes"),
+        ("PrivateTmp", "yes"),
+        ("ProtectControlGroups", "yes"),
+        ("ProtectHome", "read-only"),
+        ("ProtectKernelModules", "yes"),
+        ("ProtectKernelTunables", "yes"),
+        ("ProtectSystem", "strict"),
+        ("RestrictAddressFamilies", "AF_UNIX"),
+        ("RestrictNamespaces", "yes"),
+        ("RestrictRealtime", "yes"),
+        ("UMask", "0077"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+    .collect()
+}
+
+pub fn planned_effective_units(
+    observed_base: &EffectiveUnitSetV1,
+    dropin_sha256: Sha256Digest,
+    dropin_bytes: u64,
+    mode1: bool,
+) -> Result<EffectiveUnitSetV1, ProvisioningContractError> {
+    if dropin_bytes == 0 || dropin_bytes > MAX_DROPIN_BYTES as u64 {
+        return Err(ProvisioningContractError::LimitExceeded(
+            "effective drop-in bytes",
+        ));
+    }
+    let mut planned = observed_base.clone();
+    planned.service.dropins = vec![EffectiveUnitFileV1 {
+        path: MODE1_DROPIN_PATH.to_owned(),
+        sha256: dropin_sha256.clone(),
+        metadata: EffectiveFileMetadataV1 {
+            object_type: FileObjectType::RegularFile,
+            uid: 0,
+            gid: 0,
+            permissions: 0o600,
+            link_count: 1,
+            byte_length: dropin_bytes,
+        },
+    }];
+    planned.service.load_credential_encrypted = mode1
+        .then(|| EffectiveCredentialLoadV1 {
+            name: MODE1_CREDENTIAL_NAME.to_owned(),
+            source: MODE1_CREDENTIAL_PATH.to_owned(),
+        })
+        .into_iter()
+        .collect();
+    planned.service.set_credential = mode1
+        .then(|| EffectiveSetCredentialV1 {
+            name: MODE1_CREDENTIAL_SOURCE_COMPANION_NAME.to_owned(),
+            value: MODE1_CREDENTIAL_PATH.to_owned(),
+        })
+        .into_iter()
+        .collect();
+    if mode1 {
+        planned.validate_mode1(&dropin_sha256)?;
+    } else {
+        planned.validate_mode0(&dropin_sha256)?;
+    }
+    Ok(planned)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlannedObjectHashes {
     pub artifact_sha256: Sha256Digest,
     pub dropin_sha256: Sha256Digest,
@@ -778,6 +1633,10 @@ pub struct BackupHashes {
 pub struct ProvisioningJournalV1 {
     pub schema_version: u16,
     pub transaction_id: String,
+    pub generation: u64,
+    pub prior_journal_identity: Option<AtomicFileIdentityV1>,
+    pub journal_staging_path: String,
+    pub guard: Option<TransactionGuardIdentityV1>,
     pub phase: JournalPhase,
     pub mode: u8,
     pub epoch: u64,
@@ -785,6 +1644,8 @@ pub struct ProvisioningJournalV1 {
     pub planned_hashes: PlannedObjectHashes,
     pub live_hashes: LiveObjectHashes,
     pub transaction_owned_paths: Vec<String>,
+    pub atomic_writes: Vec<AtomicWriteRecordV1>,
+    pub security_directories: Vec<SecurityDirectoryRecordV1>,
     pub artifact_preexisted: bool,
     pub transient_unit: String,
     pub prior_config: Option<ExactFileSnapshot>,
@@ -792,8 +1653,14 @@ pub struct ProvisioningJournalV1 {
     pub prior_receipt: Option<ExactFileSnapshot>,
     pub service_unit_state: StableUnitState,
     pub socket_unit_state: StableUnitState,
+    pub post_provision_service_target: StableUnitState,
+    pub post_provision_socket_target: StableUnitState,
+    pub prior_daemon_invocation_id: Option<String>,
+    pub prior_effective_units: EffectiveUnitSetV1,
+    pub effective_units: Option<EffectiveUnitSetV1>,
     pub backup_hashes: BackupHashes,
     pub recovery_action: RecoveryAction,
+    pub supervisor_failed: bool,
 }
 
 impl ProvisioningJournalV1 {
@@ -821,14 +1688,32 @@ impl ProvisioningJournalV1 {
         if self.schema_version != PROVISIONING_SCHEMA_VERSION {
             return Err(ProvisioningContractError::InvalidSchema("journal version"));
         }
-        validate_safe_name(
+        validate_transaction_id_v1(&self.transaction_id, "transaction id")?;
+        if self.generation == 0 {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "journal generation",
+            ));
+        }
+        validate_prior_journal_identity(self.generation, self.prior_journal_identity.as_ref())?;
+        validate_journal_staging_path(&self.transaction_id, &self.journal_staging_path)?;
+        validate_journal_guard(
             &self.transaction_id,
-            MAX_TRANSACTION_ID_BYTES,
-            "transaction id",
+            self.phase.ordinal() >= JournalPhase::Guarded.ordinal(),
+            self.guard.as_ref(),
         )?;
         validate_mode1_identity(self.mode, self.epoch, &self.credential_name)?;
         self.planned_hashes.validate()?;
         validate_paths(&self.transaction_owned_paths)?;
+        validate_owned_journal_staging_path(
+            &self.transaction_owned_paths,
+            &self.journal_staging_path,
+        )?;
+        validate_atomic_write_records(
+            &self.transaction_id,
+            &self.transaction_owned_paths,
+            &self.atomic_writes,
+        )?;
+        validate_security_directory_records(&self.security_directories)?;
         validate_transient_unit(&self.transient_unit)?;
         if let Some(snapshot) = &self.prior_config {
             snapshot.validate(MAX_CONFIG_BYTES, "prior config bytes")?;
@@ -889,6 +1774,37 @@ impl ProvisioningJournalV1 {
         {
             return Err(ProvisioningContractError::InvalidSchema("unit kind"));
         }
+        let (service_target, socket_target) = disabled_post_provision_unit_targets(
+            &self.service_unit_state,
+            &self.socket_unit_state,
+        )?;
+        if self.post_provision_service_target != service_target
+            || self.post_provision_socket_target != socket_target
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "post-provision unit target",
+            ));
+        }
+        validate_prior_daemon_invocation(
+            &self.service_unit_state,
+            self.prior_daemon_invocation_id.as_deref(),
+        )?;
+        if self.prior_effective_units.service.unit_kind != UnitKind::Service
+            || self.prior_effective_units.socket.unit_kind != UnitKind::Socket
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "prior effective unit kind",
+            ));
+        }
+        let effective_required = self.phase.ordinal() >= JournalPhase::DropinCommitted.ordinal();
+        if effective_required != self.effective_units.is_some() {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "journal effective unit presence",
+            ));
+        }
+        if let Some(effective) = &self.effective_units {
+            effective.validate_mode1(&self.planned_hashes.dropin_sha256)?;
+        }
         validate_optional_digests([
             self.backup_hashes.artifact_sha256.as_ref(),
             self.backup_hashes.config_sha256.as_ref(),
@@ -944,11 +1860,11 @@ impl ProvisioningJournalV1 {
     fn stable_fields_equal(&self, next: &Self) -> bool {
         self.schema_version == next.schema_version
             && self.transaction_id == next.transaction_id
+            && self.journal_staging_path == next.journal_staging_path
             && self.mode == next.mode
             && self.epoch == next.epoch
             && self.credential_name == next.credential_name
             && self.planned_hashes == next.planned_hashes
-            && self.transaction_owned_paths == next.transaction_owned_paths
             && self.artifact_preexisted == next.artifact_preexisted
             && self.transient_unit == next.transient_unit
             && self.prior_config == next.prior_config
@@ -956,6 +1872,11 @@ impl ProvisioningJournalV1 {
             && self.prior_receipt == next.prior_receipt
             && self.service_unit_state == next.service_unit_state
             && self.socket_unit_state == next.socket_unit_state
+            && self.post_provision_service_target == next.post_provision_service_target
+            && self.post_provision_socket_target == next.post_provision_socket_target
+            && self.prior_daemon_invocation_id == next.prior_daemon_invocation_id
+            && self.prior_effective_units == next.prior_effective_units
+            && self.security_directories == next.security_directories
             && self.backup_hashes == next.backup_hashes
     }
 }
@@ -966,7 +1887,52 @@ pub fn validate_journal_transition(
 ) -> Result<(), ProvisioningContractError> {
     current.validate()?;
     next.validate()?;
-    if current.phase.next() != Some(next.phase) || !current.stable_fields_equal(next) {
+    let effective_transition = match (&current.effective_units, &next.effective_units) {
+        (None, Some(_)) => next.phase == JournalPhase::DropinCommitted,
+        (left, right) => left == right,
+    };
+    let supervisor_transition = current.supervisor_failed == next.supervisor_failed
+        || (!current.supervisor_failed && next.supervisor_failed && current.phase == next.phase);
+    let ordinary_phase = current.phase.next() == Some(next.phase)
+        && current.supervisor_failed == next.supervisor_failed;
+    let supervisor_phase = current.phase == next.phase
+        && !current.supervisor_failed
+        && next.supervisor_failed
+        && current.effective_units == next.effective_units;
+    let guard_identity_phase = current.phase == next.phase
+        && current.guard.is_some()
+        && next.guard.is_some()
+        && current.guard != next.guard
+        && current.supervisor_failed == next.supervisor_failed
+        && current.live_hashes == next.live_hashes
+        && current.effective_units == next.effective_units
+        && current.recovery_action == next.recovery_action
+        && current.atomic_writes == next.atomic_writes
+        && current.transaction_owned_paths == next.transaction_owned_paths;
+    let atomic_phase = current.phase == next.phase
+        && current.supervisor_failed == next.supervisor_failed
+        && current.live_hashes == next.live_hashes
+        && current.effective_units == next.effective_units
+        && current.recovery_action == next.recovery_action
+        && validate_atomic_write_records_transition(&current.atomic_writes, &next.atomic_writes)
+        && validate_atomic_owned_paths_transition(
+            &current.transaction_owned_paths,
+            &next.transaction_owned_paths,
+            &current.atomic_writes,
+            &next.atomic_writes,
+        );
+    let records_stable = atomic_phase || current.atomic_writes == next.atomic_writes;
+    let paths_stable =
+        atomic_phase || current.transaction_owned_paths == next.transaction_owned_paths;
+    if current.generation.checked_add(1) != Some(next.generation)
+        || !validate_guard_transition(&current.guard, &next.guard, current.phase == next.phase)
+        || !(ordinary_phase || supervisor_phase || atomic_phase || guard_identity_phase)
+        || !current.stable_fields_equal(next)
+        || !effective_transition
+        || !supervisor_transition
+        || !records_stable
+        || !paths_stable
+    {
         return Err(ProvisioningContractError::InvalidTransition);
     }
     Ok(())
@@ -977,14 +1943,26 @@ pub fn validate_journal_transition(
 pub struct PlaintextProvisioningJournalV1 {
     pub schema_version: u16,
     pub transaction_id: String,
+    pub generation: u64,
+    pub prior_journal_identity: Option<AtomicFileIdentityV1>,
+    pub journal_staging_path: String,
+    pub guard: Option<TransactionGuardIdentityV1>,
     pub phase: PlaintextJournalPhase,
     pub enabled_config_sha256: Sha256Digest,
     pub live_config_sha256: Option<Sha256Digest>,
+    pub transaction_owned_paths: Vec<String>,
+    pub atomic_writes: Vec<AtomicWriteRecordV1>,
+    pub security_directories: Vec<SecurityDirectoryRecordV1>,
     pub prior_config: Option<ExactFileSnapshot>,
     pub prior_dropin: Option<ExactFileSnapshot>,
     pub service_unit_state: StableUnitState,
     pub socket_unit_state: StableUnitState,
+    pub prior_daemon_invocation_id: Option<String>,
+    pub prior_effective_units: EffectiveUnitSetV1,
+    pub effective_units: Option<EffectiveUnitSetV1>,
+    pub dropin_sha256: Sha256Digest,
     pub recovery_action: PlaintextRecoveryAction,
+    pub supervisor_failed: bool,
 }
 
 impl PlaintextProvisioningJournalV1 {
@@ -1009,12 +1987,32 @@ impl PlaintextProvisioningJournalV1 {
                 "plaintext journal version",
             ));
         }
-        validate_safe_name(
+        validate_transaction_id_v1(&self.transaction_id, "transaction id")?;
+        if self.generation == 0 {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "plaintext journal generation",
+            ));
+        }
+        validate_prior_journal_identity(self.generation, self.prior_journal_identity.as_ref())?;
+        validate_journal_staging_path(&self.transaction_id, &self.journal_staging_path)?;
+        validate_journal_guard(
             &self.transaction_id,
-            MAX_TRANSACTION_ID_BYTES,
-            "transaction id",
+            self.phase.ordinal() >= PlaintextJournalPhase::Guarded.ordinal(),
+            self.guard.as_ref(),
         )?;
+        validate_paths(&self.transaction_owned_paths)?;
+        validate_owned_journal_staging_path(
+            &self.transaction_owned_paths,
+            &self.journal_staging_path,
+        )?;
+        validate_atomic_write_records(
+            &self.transaction_id,
+            &self.transaction_owned_paths,
+            &self.atomic_writes,
+        )?;
+        validate_security_directory_records(&self.security_directories)?;
         self.enabled_config_sha256.validate()?;
+        self.dropin_sha256.validate()?;
         if let Some(hash) = &self.live_config_sha256 {
             hash.validate()?;
         }
@@ -1026,6 +2024,10 @@ impl PlaintextProvisioningJournalV1 {
         }
         self.service_unit_state.validate()?;
         self.socket_unit_state.validate()?;
+        validate_prior_daemon_invocation(
+            &self.service_unit_state,
+            self.prior_daemon_invocation_id.as_deref(),
+        )?;
         if self.service_unit_state.unit_kind != UnitKind::Service
             || self.socket_unit_state.unit_kind != UnitKind::Socket
             || self.recovery_action != plaintext_recovery_action_for_phase(self.phase)
@@ -1033,6 +2035,16 @@ impl PlaintextProvisioningJournalV1 {
             return Err(ProvisioningContractError::InvalidSchema(
                 "plaintext journal state",
             ));
+        }
+        let effective_required =
+            self.phase.ordinal() >= PlaintextJournalPhase::DropinRemoved.ordinal();
+        if effective_required != self.effective_units.is_some() {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "plaintext journal effective unit presence",
+            ));
+        }
+        if let Some(effective) = &self.effective_units {
+            effective.validate_mode0(&self.dropin_sha256)?;
         }
         let config_committed =
             self.phase.ordinal() >= PlaintextJournalPhase::EnabledConfigCommitted.ordinal();
@@ -1049,11 +2061,16 @@ impl PlaintextProvisioningJournalV1 {
     fn stable_fields_equal(&self, next: &Self) -> bool {
         self.schema_version == next.schema_version
             && self.transaction_id == next.transaction_id
+            && self.journal_staging_path == next.journal_staging_path
             && self.enabled_config_sha256 == next.enabled_config_sha256
             && self.prior_config == next.prior_config
             && self.prior_dropin == next.prior_dropin
             && self.service_unit_state == next.service_unit_state
             && self.socket_unit_state == next.socket_unit_state
+            && self.prior_daemon_invocation_id == next.prior_daemon_invocation_id
+            && self.prior_effective_units == next.prior_effective_units
+            && self.dropin_sha256 == next.dropin_sha256
+            && self.security_directories == next.security_directories
     }
 }
 
@@ -1063,10 +2080,489 @@ pub fn validate_plaintext_journal_transition(
 ) -> Result<(), ProvisioningContractError> {
     current.validate()?;
     next.validate()?;
-    if current.phase.next() != Some(next.phase) || !current.stable_fields_equal(next) {
+    let effective_transition = match (&current.effective_units, &next.effective_units) {
+        (None, Some(_)) => next.phase == PlaintextJournalPhase::DropinRemoved,
+        (left, right) => left == right,
+    };
+    let ordinary_phase = current.phase.next() == Some(next.phase)
+        && current.supervisor_failed == next.supervisor_failed;
+    let supervisor_phase = current.phase == next.phase
+        && !current.supervisor_failed
+        && next.supervisor_failed
+        && current.effective_units == next.effective_units;
+    let guard_identity_phase = current.phase == next.phase
+        && current.guard.is_some()
+        && next.guard.is_some()
+        && current.guard != next.guard
+        && current.supervisor_failed == next.supervisor_failed
+        && current.live_config_sha256 == next.live_config_sha256
+        && current.effective_units == next.effective_units
+        && current.recovery_action == next.recovery_action
+        && current.atomic_writes == next.atomic_writes
+        && current.transaction_owned_paths == next.transaction_owned_paths;
+    let atomic_phase = current.phase == next.phase
+        && current.supervisor_failed == next.supervisor_failed
+        && current.live_config_sha256 == next.live_config_sha256
+        && current.effective_units == next.effective_units
+        && current.recovery_action == next.recovery_action
+        && validate_atomic_write_records_transition(&current.atomic_writes, &next.atomic_writes)
+        && validate_atomic_owned_paths_transition(
+            &current.transaction_owned_paths,
+            &next.transaction_owned_paths,
+            &current.atomic_writes,
+            &next.atomic_writes,
+        );
+    let records_stable = atomic_phase || current.atomic_writes == next.atomic_writes;
+    let paths_stable =
+        atomic_phase || current.transaction_owned_paths == next.transaction_owned_paths;
+    if current.generation.checked_add(1) != Some(next.generation)
+        || !validate_guard_transition(&current.guard, &next.guard, current.phase == next.phase)
+        || !(ordinary_phase || supervisor_phase || atomic_phase || guard_identity_phase)
+        || !current.stable_fields_equal(next)
+        || !effective_transition
+        || !records_stable
+        || !paths_stable
+    {
         return Err(ProvisioningContractError::InvalidTransition);
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupervisorOperationV1 {
+    ProvisionMode1,
+    EnableMode1,
+    ProvisionMode0,
+    CleanupUnadopted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupervisorPhaseV1 {
+    Prepared,
+    Guarded,
+    UnitsStopped,
+    DirectoriesReady,
+    MutationCommitted,
+    UnitsRestored,
+}
+
+impl SupervisorPhaseV1 {
+    pub const fn ordinal(self) -> usize {
+        match self {
+            Self::Prepared => 0,
+            Self::Guarded => 1,
+            Self::UnitsStopped => 2,
+            Self::DirectoriesReady => 3,
+            Self::MutationCommitted => 4,
+            Self::UnitsRestored => 5,
+        }
+    }
+
+    pub const fn next(self) -> Option<Self> {
+        match self {
+            Self::Prepared => Some(Self::Guarded),
+            Self::Guarded => Some(Self::UnitsStopped),
+            Self::UnitsStopped => Some(Self::DirectoriesReady),
+            Self::DirectoriesReady => Some(Self::MutationCommitted),
+            Self::MutationCommitted => Some(Self::UnitsRestored),
+            Self::UnitsRestored => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CleanupQuarantineStateV1 {
+    Planned,
+    Renamed,
+    Removed,
+    Restored,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupQuarantineV1 {
+    pub path: String,
+    pub state: CleanupQuarantineStateV1,
+}
+
+/// Exact descriptor and canonical-content identity of the unadopted manifest
+/// authorized by a cleanup transaction. Recovery may unlink this path only if
+/// the same inode and deterministic manifest bytes are still present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupManifestIdentityV1 {
+    pub path: String,
+    pub file: AtomicFileIdentityV1,
+}
+
+impl CleanupManifestIdentityV1 {
+    fn validate(
+        &self,
+        artifact: &CleanupArtifactIdentityV1,
+    ) -> Result<(), ProvisioningContractError> {
+        let expected_path = format!(
+            "{SECURITY_UNADOPTED_DIRECTORY}/{}.json",
+            artifact.transaction_id
+        );
+        let expected_bytes = UnadoptedArtifactV1::new(artifact.clone())?.deterministic_bytes()?;
+        self.file.validate()?;
+        if self.path != expected_path
+            || self.path.len() > MAX_PATH_BYTES
+            || self.file.object_type != FileObjectType::RegularFile
+            || self.file.uid != 0
+            || self.file.gid != 0
+            || self.file.permissions != 0o600
+            || self.file.link_count != 1
+            || self.file.byte_length != expected_bytes.len() as u64
+            || self.file.byte_length > MAX_RECEIPT_BYTES as u64
+            || self.file.sha256 != Sha256Digest::from_bytes(&expected_bytes)
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "cleanup manifest identity",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl CleanupQuarantineV1 {
+    pub fn validate(&self, transaction_id: &str) -> Result<(), ProvisioningContractError> {
+        let expected = format!("{MODE1_CREDENTIAL_DIRECTORY}/.howy-{transaction_id}.quarantine");
+        if self.path != expected || self.path.len() > MAX_PATH_BYTES {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "cleanup quarantine path",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Minimal durable intent written after fallible immutable snapshots and the
+/// prior unit/invocation observation, but before the transaction guard or any
+/// persistent mutation. A mode-specific journal replaces this only after
+/// guarded unit quiescence and planning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorJournalV1 {
+    pub schema_version: u16,
+    pub transaction_id: String,
+    pub generation: u64,
+    pub prior_journal_identity: Option<AtomicFileIdentityV1>,
+    pub journal_staging_path: String,
+    pub guard: Option<TransactionGuardIdentityV1>,
+    pub operation: SupervisorOperationV1,
+    pub phase: SupervisorPhaseV1,
+    pub prior_config: Option<ExactFileSnapshot>,
+    pub prior_dropin: Option<ExactFileSnapshot>,
+    pub prior_receipt: Option<ExactFileSnapshot>,
+    pub service_unit_state: Option<StableUnitState>,
+    pub socket_unit_state: Option<StableUnitState>,
+    pub prior_daemon_invocation_id: Option<String>,
+    pub prior_effective_units: Option<EffectiveUnitSetV1>,
+    pub transaction_owned_paths: Vec<String>,
+    pub atomic_writes: Vec<AtomicWriteRecordV1>,
+    pub security_directories: Vec<SecurityDirectoryRecordV1>,
+    pub cleanup_artifact: Option<CleanupArtifactIdentityV1>,
+    pub cleanup_manifest: Option<CleanupManifestIdentityV1>,
+    pub cleanup_pre_admission: Option<CleanupPreAdmissionV1>,
+    pub cleanup_quarantine: Option<CleanupQuarantineV1>,
+    pub supervisor_failed: bool,
+}
+
+impl SupervisorJournalV1 {
+    pub fn parse(bytes: &[u8]) -> Result<Self, ProvisioningContractError> {
+        parse_bounded_json(bytes, MAX_JOURNAL_BYTES, "supervisor journal bytes")
+            .and_then(|value: Self| value.validated())
+    }
+
+    pub fn deterministic_bytes(&self) -> Result<Vec<u8>, ProvisioningContractError> {
+        self.validate()?;
+        canonical_json(self, MAX_JOURNAL_BYTES, "supervisor journal bytes")
+    }
+
+    pub fn validated(self) -> Result<Self, ProvisioningContractError> {
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<(), ProvisioningContractError> {
+        if self.schema_version != PROVISIONING_SCHEMA_VERSION {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "supervisor journal version",
+            ));
+        }
+        validate_transaction_id_v1(&self.transaction_id, "transaction id")?;
+        if self.generation == 0 {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "supervisor journal generation",
+            ));
+        }
+        validate_prior_journal_identity(self.generation, self.prior_journal_identity.as_ref())?;
+        validate_journal_staging_path(&self.transaction_id, &self.journal_staging_path)?;
+        validate_journal_guard(
+            &self.transaction_id,
+            self.phase.ordinal() >= SupervisorPhaseV1::Guarded.ordinal(),
+            self.guard.as_ref(),
+        )?;
+        validate_paths(&self.transaction_owned_paths)?;
+        validate_owned_journal_staging_path(
+            &self.transaction_owned_paths,
+            &self.journal_staging_path,
+        )?;
+        validate_atomic_write_records(
+            &self.transaction_id,
+            &self.transaction_owned_paths,
+            &self.atomic_writes,
+        )?;
+        let directories_ready =
+            self.phase.ordinal() >= SupervisorPhaseV1::DirectoriesReady.ordinal();
+        if directories_ready {
+            validate_security_directory_records(&self.security_directories)?;
+        } else {
+            validate_security_directory_record_prefix(&self.security_directories)?;
+        }
+        if let Some(snapshot) = &self.prior_config {
+            snapshot.validate(MAX_CONFIG_BYTES, "prior config bytes")?;
+        }
+        if let Some(snapshot) = &self.prior_dropin {
+            snapshot.validate(MAX_DROPIN_BYTES, "prior drop-in bytes")?;
+        }
+        if let Some(snapshot) = &self.prior_receipt {
+            snapshot.validate(MAX_RECEIPT_BYTES, "prior receipt bytes")?;
+        }
+        if self.service_unit_state.is_none()
+            || self.socket_unit_state.is_none()
+            || self.prior_effective_units.is_none()
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "supervisor unit snapshot presence",
+            ));
+        }
+        if let (Some(service), Some(socket), Some(effective)) = (
+            &self.service_unit_state,
+            &self.socket_unit_state,
+            &self.prior_effective_units,
+        ) {
+            service.validate()?;
+            socket.validate()?;
+            if service.unit_kind != UnitKind::Service
+                || socket.unit_kind != UnitKind::Socket
+                || effective.service.unit_kind != UnitKind::Service
+                || effective.socket.unit_kind != UnitKind::Socket
+            {
+                return Err(ProvisioningContractError::InvalidSchema(
+                    "supervisor unit kind",
+                ));
+            }
+            validate_prior_daemon_invocation(service, self.prior_daemon_invocation_id.as_deref())?;
+        } else if self.prior_daemon_invocation_id.is_some() {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "premature daemon invocation snapshot",
+            ));
+        }
+        match (
+            &self.operation,
+            &self.cleanup_artifact,
+            &self.cleanup_manifest,
+            &self.cleanup_pre_admission,
+            &self.cleanup_quarantine,
+        ) {
+            (
+                SupervisorOperationV1::CleanupUnadopted,
+                Some(identity),
+                Some(manifest),
+                Some(pre_admission),
+                Some(quarantine),
+            ) => {
+                identity.validate_expected()?;
+                manifest.validate(identity)?;
+                pre_admission.validate(identity)?;
+                quarantine.validate(&self.transaction_id)?;
+                if self
+                    .transaction_owned_paths
+                    .binary_search(&quarantine.path)
+                    .is_err()
+                {
+                    return Err(ProvisioningContractError::InvalidSchema(
+                        "transaction-owned cleanup quarantine",
+                    ));
+                }
+            }
+            (SupervisorOperationV1::CleanupUnadopted, _, _, _, _) => {
+                return Err(ProvisioningContractError::InvalidSchema(
+                    "cleanup supervisor identity",
+                ));
+            }
+            (_, Some(_), _, _, _)
+            | (_, _, Some(_), _, _)
+            | (_, _, _, Some(_), _)
+            | (_, _, _, _, Some(_)) => {
+                return Err(ProvisioningContractError::InvalidSchema(
+                    "unexpected cleanup supervisor identity",
+                ));
+            }
+            (_, None, None, None, None) => {}
+        }
+        Ok(())
+    }
+}
+
+pub fn validate_supervisor_journal_transition(
+    current: &SupervisorJournalV1,
+    next: &SupervisorJournalV1,
+) -> Result<(), ProvisioningContractError> {
+    current.validate()?;
+    next.validate()?;
+    let ordinary = (current.phase.next() == Some(next.phase)
+        || (current.phase == SupervisorPhaseV1::UnitsStopped
+            && next.phase == SupervisorPhaseV1::UnitsRestored)
+        || (current.phase == SupervisorPhaseV1::DirectoriesReady
+            && next.phase == SupervisorPhaseV1::UnitsRestored))
+        && current.supervisor_failed == next.supervisor_failed;
+    let fail_closed =
+        current.phase == next.phase && !current.supervisor_failed && next.supervisor_failed;
+    let guard_identity_phase = current.phase == next.phase
+        && current.guard.is_some()
+        && next.guard.is_some()
+        && current.guard != next.guard
+        && current.supervisor_failed == next.supervisor_failed
+        && current.atomic_writes == next.atomic_writes
+        && current.security_directories == next.security_directories
+        && current.cleanup_quarantine == next.cleanup_quarantine
+        && current.service_unit_state == next.service_unit_state
+        && current.socket_unit_state == next.socket_unit_state
+        && current.prior_daemon_invocation_id == next.prior_daemon_invocation_id
+        && current.prior_effective_units == next.prior_effective_units;
+    let snapshots_stable = current.schema_version == next.schema_version
+        && current.transaction_id == next.transaction_id
+        && current.journal_staging_path == next.journal_staging_path
+        && current.operation == next.operation
+        && current.prior_config == next.prior_config
+        && current.prior_dropin == next.prior_dropin
+        && current.prior_receipt == next.prior_receipt
+        && current.transaction_owned_paths == next.transaction_owned_paths
+        && current.cleanup_artifact == next.cleanup_artifact
+        && current.cleanup_manifest == next.cleanup_manifest
+        && current.cleanup_pre_admission == next.cleanup_pre_admission;
+    let units_transition = current.service_unit_state == next.service_unit_state
+        && current.socket_unit_state == next.socket_unit_state
+        && current.prior_daemon_invocation_id == next.prior_daemon_invocation_id
+        && current.prior_effective_units == next.prior_effective_units;
+    let directories_transition = validate_security_directory_records_transition(
+        current.phase,
+        next.phase,
+        &current.security_directories,
+        &next.security_directories,
+    );
+    let quarantine_transition = match (&current.cleanup_quarantine, &next.cleanup_quarantine) {
+        (None, None) => true,
+        (Some(left), Some(right)) if left.path == right.path => matches!(
+            (left.state, right.state),
+            (
+                CleanupQuarantineStateV1::Planned,
+                CleanupQuarantineStateV1::Planned
+            ) | (
+                CleanupQuarantineStateV1::Planned,
+                CleanupQuarantineStateV1::Renamed
+            ) | (
+                CleanupQuarantineStateV1::Renamed,
+                CleanupQuarantineStateV1::Renamed
+            ) | (
+                CleanupQuarantineStateV1::Renamed,
+                CleanupQuarantineStateV1::Removed
+            ) | (
+                CleanupQuarantineStateV1::Renamed,
+                CleanupQuarantineStateV1::Restored
+            ) | (
+                CleanupQuarantineStateV1::Removed,
+                CleanupQuarantineStateV1::Removed
+            ) | (
+                CleanupQuarantineStateV1::Restored,
+                CleanupQuarantineStateV1::Restored
+            )
+        ),
+        _ => false,
+    };
+    let quarantine_phase = current.phase == next.phase
+        && current.supervisor_failed == next.supervisor_failed
+        && current.atomic_writes == next.atomic_writes
+        && current.cleanup_quarantine != next.cleanup_quarantine
+        && quarantine_transition;
+    let directory_phase = current.phase == SupervisorPhaseV1::UnitsStopped
+        && next.phase == SupervisorPhaseV1::UnitsStopped
+        && current.supervisor_failed == next.supervisor_failed
+        && current.atomic_writes == next.atomic_writes
+        && current.cleanup_quarantine == next.cleanup_quarantine
+        && current.security_directories != next.security_directories
+        && directories_transition;
+    let atomic = current.phase == next.phase
+        && current.supervisor_failed == next.supervisor_failed
+        && current.service_unit_state == next.service_unit_state
+        && current.socket_unit_state == next.socket_unit_state
+        && current.prior_daemon_invocation_id == next.prior_daemon_invocation_id
+        && current.prior_effective_units == next.prior_effective_units
+        && current.security_directories == next.security_directories
+        && validate_atomic_write_records_transition(&current.atomic_writes, &next.atomic_writes);
+    let records_stable = atomic || current.atomic_writes == next.atomic_writes;
+    if current.generation.checked_add(1) != Some(next.generation)
+        || !validate_guard_transition(&current.guard, &next.guard, current.phase == next.phase)
+        || !(ordinary
+            || fail_closed
+            || atomic
+            || quarantine_phase
+            || directory_phase
+            || guard_identity_phase)
+        || !snapshots_stable
+        || !units_transition
+        || !directories_transition
+        || !quarantine_transition
+        || !records_stable
+    {
+        return Err(ProvisioningContractError::InvalidTransition);
+    }
+    Ok(())
+}
+
+fn validate_security_directory_records_transition(
+    current_phase: SupervisorPhaseV1,
+    next_phase: SupervisorPhaseV1,
+    current: &[SecurityDirectoryRecordV1],
+    next: &[SecurityDirectoryRecordV1],
+) -> bool {
+    if current == next {
+        return true;
+    }
+    if current_phase != SupervisorPhaseV1::UnitsStopped
+        || next_phase != SupervisorPhaseV1::UnitsStopped
+    {
+        return false;
+    }
+    if next.len() == current.len() + 1
+        && next.starts_with(current)
+        && next.last().is_some_and(|record| {
+            record.observed_directory.is_none()
+                && record.path == REQUIRED_SECURITY_DIRECTORIES[current.len()].0
+        })
+    {
+        return true;
+    }
+    if next.len() == current.len() && !current.is_empty() {
+        let last = current.len() - 1;
+        return current[..last] == next[..last]
+            && current[last].path == next[last].path
+            && current[last].uid == next[last].uid
+            && current[last].gid == next[last].gid
+            && current[last].permissions == next[last].permissions
+            && current[last].parent_directory == next[last].parent_directory
+            && current[last].expected_directory == next[last].expected_directory
+            && current[last].preexisted == next[last].preexisted
+            && current[last].observed_directory.is_none()
+            && next[last].observed_directory.is_some();
+    }
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1719,6 +3215,7 @@ pub struct ProvisioningReceiptV1 {
     pub artifact: ArtifactReceipt,
     pub config_patch: ConfigPatchV1,
     pub unit_credential: UnitCredentialReceipt,
+    pub effective_units: EffectiveUnitSetV1,
     pub verifier: VerifierReceipt,
 }
 
@@ -1761,6 +3258,8 @@ impl ProvisioningReceiptV1 {
         }
         self.config_patch.validate()?;
         self.unit_credential.validate()?;
+        self.effective_units
+            .validate_mode1(&self.unit_credential.dropin_sha256)?;
         self.verifier.validate()?;
         let expected_config = match self.state {
             ReceiptState::ProvisionedDisabled => &self.config_patch.disabled_sha256,
@@ -2097,34 +3596,61 @@ pub struct ProvisioningStateInput {
     pub artifact: ExistingProvisioningArtifact,
     pub namespace_nonempty: bool,
     pub new_key_requested: bool,
+    pub adopt_existing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvisioningState {
     Fresh,
+    Adopt,
     Idempotent,
     Unadopted,
     Mismatch,
     Missing,
     Nonempty,
     NewKey,
-    DifferentMode,
+    DifferentMode(DifferentModeArtifactState),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DifferentModeArtifactState {
+    Absent,
+    Receipted,
+    Unadopted,
+    Mismatch,
 }
 
 impl ProvisioningState {
     pub const fn permits_automatic_provisioning(self) -> bool {
-        matches!(self, Self::Fresh | Self::Idempotent)
+        matches!(self, Self::Fresh | Self::Adopt | Self::Idempotent)
     }
 }
 
 pub const fn classify_provisioning_state(input: ProvisioningStateInput) -> ProvisioningState {
-    if input.namespace_nonempty && input.new_key_requested {
+    if input.namespace_nonempty
+        && input.new_key_requested
+        && !matches!(
+            input.config,
+            ExistingProvisioningConfig::Explicit { mode, .. } if mode != 1
+        )
+    {
         return ProvisioningState::NewKey;
     }
     match input.config {
-        ExistingProvisioningConfig::Explicit { mode, .. } if mode != 1 => {
-            ProvisioningState::DifferentMode
-        }
+        ExistingProvisioningConfig::Explicit { mode, .. } if mode != 1 => match input.artifact {
+            ExistingProvisioningArtifact::Absent => {
+                ProvisioningState::DifferentMode(DifferentModeArtifactState::Absent)
+            }
+            ExistingProvisioningArtifact::Verified => {
+                ProvisioningState::DifferentMode(DifferentModeArtifactState::Receipted)
+            }
+            ExistingProvisioningArtifact::Unverified => {
+                ProvisioningState::DifferentMode(DifferentModeArtifactState::Unadopted)
+            }
+            ExistingProvisioningArtifact::Mismatch => {
+                ProvisioningState::DifferentMode(DifferentModeArtifactState::Mismatch)
+            }
+        },
         ExistingProvisioningConfig::Explicit { mode: 1, epoch } if epoch != MODE1_KEY_EPOCH => {
             ProvisioningState::Mismatch
         }
@@ -2132,21 +3658,29 @@ pub const fn classify_provisioning_state(input: ProvisioningStateInput) -> Provi
             ExistingProvisioningArtifact::Absent if !input.namespace_nonempty => {
                 ProvisioningState::Fresh
             }
-            ExistingProvisioningArtifact::Verified
-            | ExistingProvisioningArtifact::Unverified
-            | ExistingProvisioningArtifact::Mismatch => ProvisioningState::Unadopted,
+            ExistingProvisioningArtifact::Verified | ExistingProvisioningArtifact::Unverified => {
+                if input.adopt_existing {
+                    ProvisioningState::Adopt
+                } else {
+                    ProvisioningState::Unadopted
+                }
+            }
+            ExistingProvisioningArtifact::Mismatch => ProvisioningState::Mismatch,
             ExistingProvisioningArtifact::Absent => ProvisioningState::Nonempty,
         },
         ExistingProvisioningConfig::Explicit { mode: 1, epoch: 1 } => match input.artifact {
             ExistingProvisioningArtifact::Verified => ProvisioningState::Idempotent,
             ExistingProvisioningArtifact::Absent => ProvisioningState::Missing,
-            ExistingProvisioningArtifact::Unverified | ExistingProvisioningArtifact::Mismatch => {
-                if input.namespace_nonempty {
+            ExistingProvisioningArtifact::Unverified => {
+                if input.adopt_existing {
+                    ProvisioningState::Adopt
+                } else if input.namespace_nonempty {
                     ProvisioningState::Nonempty
                 } else {
                     ProvisioningState::Mismatch
                 }
             }
+            ExistingProvisioningArtifact::Mismatch => ProvisioningState::Mismatch,
         },
         ExistingProvisioningConfig::Explicit { .. } => ProvisioningState::Mismatch,
     }
@@ -2159,7 +3693,8 @@ pub enum StableRollbackTarget {
     InactiveDead,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnitObservation {
     pub unit_kind: UnitKind,
     pub load_state: UnitLoadState,
@@ -2217,13 +3752,54 @@ pub fn classify_unit_admissibility(unit: UnitObservation) -> UnitAdmissibility {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CleanupReferences {
     pub config: bool,
     pub receipt: bool,
     pub dropin: bool,
     pub journal: bool,
     pub active_transaction: bool,
+    pub effective_unit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupPreAdmissionV1 {
+    pub observed_artifact: CleanupArtifactIdentityV1,
+    pub references: CleanupReferences,
+    pub service: UnitObservation,
+    pub socket: UnitObservation,
+    pub readiness_transient_exists: bool,
+    pub daemon_responded: bool,
+    pub effective_units: EffectiveUnitSetV1,
+}
+
+impl CleanupPreAdmissionV1 {
+    fn validate(
+        &self,
+        expected_artifact: &CleanupArtifactIdentityV1,
+    ) -> Result<(), ProvisioningContractError> {
+        if self.effective_units.service.unit_kind != UnitKind::Service
+            || self.effective_units.socket.unit_kind != UnitKind::Socket
+            || classify_cleanup_admissibility(CleanupStateInput {
+                expected_artifact: ExpectedCleanupArtifactIdentityV1(expected_artifact.clone()),
+                observed_artifact: ObservedCleanupArtifactIdentityV1(
+                    self.observed_artifact.clone(),
+                ),
+                references: self.references,
+                service: self.service,
+                socket: self.socket,
+                readiness_transient_exists: self.readiness_transient_exists,
+                daemon_responded: self.daemon_responded,
+            }) != CleanupAdmissibility::Admissible
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "cleanup pre-admission",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2402,11 +3978,7 @@ impl UnadoptedArtifactV1 {
 
 impl CleanupArtifactIdentityV1 {
     fn validate_expected(&self) -> Result<(), ProvisioningContractError> {
-        validate_safe_name(
-            &self.transaction_id,
-            MAX_TRANSACTION_ID_BYTES,
-            "cleanup transaction id",
-        )?;
+        validate_transaction_id_v1(&self.transaction_id, "cleanup transaction id")?;
         self.descriptor.validate_expected()?;
         self.source.validate_expected()?;
         if self.source.envelope_size > self.descriptor.byte_length {
@@ -2418,11 +3990,7 @@ impl CleanupArtifactIdentityV1 {
     }
 
     fn validate_observed(&self) -> Result<(), ProvisioningContractError> {
-        validate_safe_name(
-            &self.transaction_id,
-            MAX_TRANSACTION_ID_BYTES,
-            "cleanup transaction id",
-        )?;
+        validate_transaction_id_v1(&self.transaction_id, "cleanup transaction id")?;
         self.descriptor.validate_shape()?;
         self.source.validate_shape()?;
         if self.source.envelope_size > self.descriptor.byte_length {
@@ -2448,7 +4016,7 @@ pub struct CleanupStateInput {
     pub service: UnitObservation,
     pub socket: UnitObservation,
     pub readiness_transient_exists: bool,
-    pub daemon_reports_credential: bool,
+    pub daemon_responded: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2471,6 +4039,7 @@ pub enum CleanupRefusal {
     DropinReference,
     JournalReference,
     ActiveTransaction,
+    EffectiveUnitReference,
     UnitNotInactive,
     UnitUnstable,
     UnitTransitional,
@@ -2546,10 +4115,13 @@ pub fn classify_cleanup_admissibility(input: CleanupStateInput) -> CleanupAdmiss
     if input.references.active_transaction {
         return CleanupAdmissibility::Refuse(CleanupRefusal::ActiveTransaction);
     }
+    if input.references.effective_unit {
+        return CleanupAdmissibility::Refuse(CleanupRefusal::EffectiveUnitReference);
+    }
     if input.readiness_transient_exists {
         return CleanupAdmissibility::Refuse(CleanupRefusal::ReadinessTransient);
     }
-    if input.daemon_reports_credential {
+    if input.daemon_responded {
         return CleanupAdmissibility::Refuse(CleanupRefusal::DaemonReference);
     }
     if input.service.unit_kind != UnitKind::Service || input.socket.unit_kind != UnitKind::Socket {
@@ -2653,6 +4225,205 @@ fn validate_safe_name(
     Ok(())
 }
 
+fn validate_transaction_id_v1(
+    value: &str,
+    field: &'static str,
+) -> Result<(), ProvisioningContractError> {
+    let Some(suffix) = value.strip_prefix("txn-") else {
+        return Err(ProvisioningContractError::InvalidSchema(field));
+    };
+    if value.len() > MAX_TRANSACTION_ID_BYTES
+        || suffix.len() != 32
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(ProvisioningContractError::InvalidSchema(field));
+    }
+    Ok(())
+}
+
+fn validate_prior_daemon_invocation(
+    service: &StableUnitState,
+    invocation_id: Option<&str>,
+) -> Result<(), ProvisioningContractError> {
+    let service_was_active = service.rollback_target() == Some(StableRollbackTarget::ActiveRunning);
+    if service_was_active != invocation_id.is_some() {
+        return Err(ProvisioningContractError::InvalidSchema(
+            "prior daemon invocation presence",
+        ));
+    }
+    if let Some(value) = invocation_id
+        && !is_lower_hex(value, 64)
+    {
+        return Err(ProvisioningContractError::InvalidSchema(
+            "prior daemon invocation id",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_journal_guard(
+    transaction_id: &str,
+    required: bool,
+    guard: Option<&TransactionGuardIdentityV1>,
+) -> Result<(), ProvisioningContractError> {
+    if required != guard.is_some() {
+        return Err(ProvisioningContractError::InvalidSchema(
+            "journal guard presence",
+        ));
+    }
+    if let Some(guard) = guard {
+        guard.validate(transaction_id)?;
+    }
+    Ok(())
+}
+
+fn validate_prior_journal_identity(
+    generation: u64,
+    prior: Option<&AtomicFileIdentityV1>,
+) -> Result<(), ProvisioningContractError> {
+    if (generation == 1) != prior.is_none() {
+        return Err(ProvisioningContractError::InvalidSchema(
+            "prior journal identity presence",
+        ));
+    }
+    if let Some(prior) = prior {
+        prior.validate()?;
+        if prior.uid != 0 || prior.gid != 0 || prior.permissions != 0o600 {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "prior journal identity metadata",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_guard_transition(
+    current: &Option<TransactionGuardIdentityV1>,
+    next: &Option<TransactionGuardIdentityV1>,
+    same_phase: bool,
+) -> bool {
+    match (current, next) {
+        (None, None) | (Some(_), None) => current == next,
+        (None, Some(_)) => true,
+        (Some(left), Some(right)) => left == right || same_phase,
+    }
+}
+
+fn validate_atomic_write_records(
+    transaction_id: &str,
+    transaction_owned_paths: &[String],
+    records: &[AtomicWriteRecordV1],
+) -> Result<(), ProvisioningContractError> {
+    if records.len() > MAX_TRANSACTION_OWNED_PATHS {
+        return Err(ProvisioningContractError::LimitExceeded(
+            "atomic write records",
+        ));
+    }
+    for (index, record) in records.iter().enumerate() {
+        record.validate()?;
+        if record.plan.transaction_id != transaction_id {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "atomic write transaction binding",
+            ));
+        }
+        if transaction_owned_paths
+            .binary_search(&record.plan.staging_path)
+            .is_err()
+            || record
+                .plan
+                .backup_path
+                .as_ref()
+                .is_some_and(|backup| transaction_owned_paths.binary_search(backup).is_err())
+        {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "atomic transaction-owned path",
+            ));
+        }
+        if records[index + 1..].iter().any(|later| {
+            later.plan.staging_path == record.plan.staging_path
+                && !matches!(&record.state, AtomicWriteStateV1::BackupCleaned { .. })
+                && !matches!(&record.state, AtomicWriteStateV1::Aborted)
+        }) {
+            return Err(ProvisioningContractError::InvalidSchema(
+                "atomic staging path reuse",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_atomic_owned_paths_transition(
+    current_paths: &[String],
+    next_paths: &[String],
+    current_records: &[AtomicWriteRecordV1],
+    next_records: &[AtomicWriteRecordV1],
+) -> bool {
+    if next_records.len() == current_records.len() + 1
+        && next_records[..current_records.len()] == current_records[..]
+    {
+        let mut expected = current_paths.to_vec();
+        let plan = &next_records.last().expect("length checked").plan;
+        expected.push(plan.staging_path.clone());
+        if let Some(backup) = &plan.backup_path {
+            expected.push(backup.clone());
+        }
+        expected.sort();
+        expected.dedup();
+        expected == next_paths
+    } else {
+        current_paths == next_paths
+    }
+}
+
+fn validate_atomic_write_records_transition(
+    current: &[AtomicWriteRecordV1],
+    next: &[AtomicWriteRecordV1],
+) -> bool {
+    if next.len() == current.len() + 1
+        && next[..current.len()] == *current
+        && matches!(
+            next.last().map(|record| &record.state),
+            Some(AtomicWriteStateV1::Planned)
+        )
+    {
+        return true;
+    }
+    if next.len() != current.len() {
+        return false;
+    }
+    let changed: Vec<_> = current
+        .iter()
+        .zip(next)
+        .enumerate()
+        .filter(|(_, (left, right))| left != right)
+        .collect();
+    if changed.len() != 1 {
+        return false;
+    }
+    let (_, (left, right)) = changed[0];
+    if left.plan != right.plan {
+        return false;
+    }
+    match (&left.state, &right.state) {
+        (AtomicWriteStateV1::Planned, AtomicWriteStateV1::Staged { identity }) => {
+            validate_atomic_staged_identity(&left.plan, identity).is_ok()
+        }
+        (AtomicWriteStateV1::Planned, AtomicWriteStateV1::Aborted) => true,
+        (
+            AtomicWriteStateV1::Staged { identity },
+            AtomicWriteStateV1::Committed { observation },
+        ) => observation.target == *identity && observation.validate_for_plan(&left.plan).is_ok(),
+        (AtomicWriteStateV1::Staged { .. }, AtomicWriteStateV1::Aborted) => true,
+        (
+            AtomicWriteStateV1::Committed { observation: left },
+            AtomicWriteStateV1::BackupCleaned { observation: right },
+        ) => left == right && left.backup.is_some(),
+        _ => false,
+    }
+}
+
 fn validate_bounded_printable(
     value: &str,
     maximum: usize,
@@ -2701,6 +4472,21 @@ fn validate_paths(paths: &[String]) -> Result<(), ProvisioningContractError> {
             ));
         }
         previous = Some(path);
+    }
+    Ok(())
+}
+
+fn validate_owned_journal_staging_path(
+    paths: &[String],
+    journal_staging_path: &str,
+) -> Result<(), ProvisioningContractError> {
+    if paths
+        .binary_search_by(|candidate| candidate.as_str().cmp(journal_staging_path))
+        .is_err()
+    {
+        return Err(ProvisioningContractError::InvalidSchema(
+            "transaction-owned journal staging path",
+        ));
     }
     Ok(())
 }

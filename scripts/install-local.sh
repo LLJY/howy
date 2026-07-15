@@ -10,11 +10,14 @@ TARGET_DIR="${REPO_ROOT}/target/release"
 HOWYD_SRC="${TARGET_DIR}/howyd"
 HOWY_SRC="${TARGET_DIR}/howy"
 PAM_SRC="${TARGET_DIR}/libpam_howy.so"
+BRIDGE_SRC="${TARGET_DIR}/howy-config-bridge"
 SYSUSERS_SRC="${REPO_ROOT}/sysusers.d/howy.conf"
+BOOTSTRAP_SRC="${REPO_ROOT}/packaging/config.bootstrap.toml"
+ALPM_HOOK_SRC="${REPO_ROOT}/packaging/05-howy-config-stash.hook"
 
 HOWYD_DEST="${HOWYD_DEST:-/usr/bin/howyd}"
 HOWY_DEST="${HOWY_DEST:-/usr/bin/howy}"
-PAM_DEST="${PAM_DEST:-/lib/security/pam_howy.so}"
+PAM_DEST="${PAM_DEST:-/usr/lib/security/pam_howy.so}"
 SERVICE_DEST="${SERVICE_DEST:-/etc/systemd/system/howy.service}"
 SOCKET_DEST="${SOCKET_DEST:-/etc/systemd/system/howy.socket}"
 CONFIG_DEST="${CONFIG_DEST:-/etc/howy/config.toml}"
@@ -23,7 +26,19 @@ MODELS_DIR="${MODELS_DIR:-/etc/howy/models}"
 CACHE_DIR="${CACHE_DIR:-/var/cache/howy}"
 LOG_DIR="${LOG_DIR:-/var/log/howy}"
 SYSUSERS_DEST="${SYSUSERS_DEST:-/usr/lib/sysusers.d/howy.conf}"
+BRIDGE_DEST="${BRIDGE_DEST:-/usr/lib/howy/howy-config-bridge}"
+BOOTSTRAP_DEST="${BOOTSTRAP_DEST:-/usr/share/howy/config.bootstrap.toml}"
+ALPM_HOOK_DEST="${ALPM_HOOK_DEST:-/usr/share/libalpm/hooks/05-howy-config-stash.hook}"
+SERVICE_DROPIN_DIR="${SERVICE_DROPIN_DIR:-/etc/systemd/system/howy.service.d}"
+MODE1_MODELS_DIR="${MODE1_MODELS_DIR:-/etc/howy/models/mode1}"
+CREDSTORE_DIR="${CREDSTORE_DIR:-/etc/credstore.encrypted}"
+STATE_DIR="${STATE_DIR:-/var/lib/howy}"
+SECURITY_STATE_DIR="${SECURITY_STATE_DIR:-/var/lib/howy/security-state}"
+UNADOPTED_DIR="${UNADOPTED_DIR:-/var/lib/howy/security-state/unadopted}"
+BRIDGE_STATE_DIR="${BRIDGE_STATE_DIR:-/var/lib/howy/config-bridge}"
 SYSTEMD_SYSUSERS="${SYSTEMD_SYSUSERS:-systemd-sysusers}"
+CONFIG_EXPECTED_UID="${CONFIG_EXPECTED_UID:-0}"
+CONFIG_EXPECTED_GID="${CONFIG_EXPECTED_GID:-0}"
 
 PREWARM_STATUS="not-run"
 PREWARM_MESSAGE="Install-time prewarm was not attempted."
@@ -35,11 +50,28 @@ PRIOR_SERVICE_ENABLED=0
 PRIOR_SOCKET_ENABLED=0
 SERVICE_STOPPED_BY_INSTALLER=0
 SOCKET_STOPPED_BY_INSTALLER=0
+SERVICE_RESTARTED_BY_INSTALLER=0
+SOCKET_RESTARTED_BY_INSTALLER=0
 SYSUSERS_BACKUP_DIR=""
 SYSUSERS_DEST_EXISTED=0
 SYSUSERS_FILE_TOUCHED=0
 SYSUSERS_TEMP=""
 INSTALL_COMMITTED=0
+DAEMON_RELOADED=0
+RECOVERY_RESTART_ALLOWED=1
+MARKER_COMMITTED=0
+PRIOR_SERVICE_MANAGER_POLICY=""
+PRIOR_SOCKET_MANAGER_POLICY=""
+ARTIFACT_BACKUP_DIR=""
+ARTIFACTS_TOUCHED=0
+CONFIG_WAS_PRESENT=0
+CONFIG_CREATED=0
+CONFIG_SNAPSHOT_METADATA=""
+CONFIG_SNAPSHOT_HASH=""
+CONFIG_SNAPSHOT_LINK=""
+CONFIG_SNAPSHOT_KIND="absent"
+declare -a ARTIFACT_DESTINATIONS=()
+declare -a ARTIFACT_BACKUP_PRESENT=()
 
 die() {
     printf 'Error: %s\n' "$*" >&2
@@ -54,6 +86,10 @@ require_root() {
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+run_bridge() {
+    "$@"
 }
 
 confirm_overwrite() {
@@ -81,14 +117,143 @@ confirm_all_overwrites() {
     confirm_overwrite "${PAM_DEST}"
     confirm_overwrite "${SERVICE_DEST}"
     confirm_overwrite "${SOCKET_DEST}"
-    confirm_overwrite "${CONFIG_DEST}"
+}
+
+parse_arguments() {
+    case "$#:$*" in
+        0:)
+            ;;
+        1:--migrate|1:--migrate-security)
+            die "Security migration is intentionally outside the installer artifact transaction. Run exactly: sudo howy security provision --mode 1"
+            ;;
+        *)
+            die "Usage: scripts/install-local.sh"
+            ;;
+    esac
 }
 
 build_release_artifacts() {
     echo "Building release artifacts for this checkout..."
     export ORT_LIB_PATH="${ORT_LIB_PATH:-/usr/lib}"
     export ORT_PREFER_DYNAMIC_LINK="${ORT_PREFER_DYNAMIC_LINK:-1}"
-    cargo build --release -p howy-daemon -p howy-cli -p howy-pam
+    cargo build --release -p howy-config-bridge -p howy-daemon -p howy-cli -p howy-pam
+}
+
+snapshot_existing_config() {
+    local metadata_before
+    local metadata_after
+    local object_type
+    local descriptor
+
+    if [ ! -e "${CONFIG_DEST}" ] && [ ! -L "${CONFIG_DEST}" ]; then
+        CONFIG_WAS_PRESENT=0
+        return 0
+    fi
+
+    CONFIG_WAS_PRESENT=1
+    metadata_before=$(stat -c '%d:%i:%F:%u:%g:%a:%h:%s:%y:%z' -- "${CONFIG_DEST}")
+    object_type=$(stat -c '%F' -- "${CONFIG_DEST}")
+    CONFIG_SNAPSHOT_KIND="${object_type}"
+    case "${object_type}" in
+        "regular file")
+            exec {descriptor}<"${CONFIG_DEST}"
+            metadata_after=$(stat -Lc '%d:%i:%F:%u:%g:%a:%h:%s:%y:%z' -- "/proc/self/fd/${descriptor}")
+            [ "${metadata_before}" = "${metadata_after}" ] \
+                || die "Configuration changed while opening its snapshot descriptor"
+            CONFIG_SNAPSHOT_HASH=$(sha256sum "/proc/self/fd/${descriptor}" | cut -d' ' -f1)
+            CONFIG_SNAPSHOT_METADATA=$(stat -Lc '%d:%i:%F:%u:%g:%a:%h:%s:%y:%z' -- "/proc/self/fd/${descriptor}")
+            metadata_after=$(stat -Lc '%d:%i:%F:%u:%g:%a:%h:%s:%y:%z' -- "/proc/self/fd/${descriptor}")
+            exec {descriptor}<&-
+            [ "${CONFIG_SNAPSHOT_METADATA}" = "${metadata_after}" ] \
+                || die "Configuration changed while hashing its snapshot descriptor"
+            ;;
+        "symbolic link")
+            CONFIG_SNAPSHOT_LINK=$(readlink -- "${CONFIG_DEST}")
+            CONFIG_SNAPSHOT_METADATA="${metadata_before}"
+            ;;
+        *)
+            CONFIG_SNAPSHOT_METADATA="${metadata_before}"
+            ;;
+    esac
+    echo "Recorded existing configuration bytes and metadata before runtime changes."
+}
+
+verify_preserved_config() {
+    local object_type
+    local descriptor
+    local current_metadata
+    local current_hash
+
+    [ "${CONFIG_WAS_PRESENT}" -eq 1 ] || return 0
+    [ -e "${CONFIG_DEST}" ] || [ -L "${CONFIG_DEST}" ] \
+        || die "Preserved configuration object disappeared"
+    object_type=$(stat -c '%F' -- "${CONFIG_DEST}")
+    case "${object_type}" in
+        "regular file")
+            exec {descriptor}<"${CONFIG_DEST}"
+            current_hash=$(sha256sum "/proc/self/fd/${descriptor}" | cut -d' ' -f1)
+            current_metadata=$(stat -Lc '%d:%i:%F:%u:%g:%a:%h:%s:%y:%z' -- "/proc/self/fd/${descriptor}")
+            exec {descriptor}<&-
+            [ "${current_hash}" = "${CONFIG_SNAPSHOT_HASH}" ] \
+                || die "Preserved configuration byte hash changed"
+            [ "${current_metadata}" = "${CONFIG_SNAPSHOT_METADATA}" ] \
+                || die "Preserved configuration metadata changed"
+            ;;
+        "symbolic link")
+            [ "$(readlink -- "${CONFIG_DEST}")" = "${CONFIG_SNAPSHOT_LINK}" ] \
+                || die "Preserved configuration symlink changed"
+            [ "$(stat -c '%d:%i:%F:%u:%g:%a:%h:%s:%y:%z' -- "${CONFIG_DEST}")" = "${CONFIG_SNAPSHOT_METADATA}" ] \
+                || die "Preserved configuration symlink metadata changed"
+            ;;
+        *)
+            [ "$(stat -c '%d:%i:%F:%u:%g:%a:%h:%s:%y:%z' -- "${CONFIG_DEST}")" = "${CONFIG_SNAPSHOT_METADATA}" ] \
+                || die "Preserved configuration object metadata changed"
+            ;;
+    esac
+}
+
+prepare_artifact_backup() {
+    local index
+    local path
+
+    ARTIFACT_DESTINATIONS=(
+        "${HOWYD_DEST}" "${HOWY_DEST}" "${PAM_DEST}" "${SERVICE_DEST}" "${SOCKET_DEST}"
+        "${BRIDGE_DEST}" "${BOOTSTRAP_DEST}" "${ALPM_HOOK_DEST}"
+    )
+    ARTIFACT_BACKUP_DIR=$(mktemp -d)
+    ARTIFACT_BACKUP_PRESENT=()
+    for index in "${!ARTIFACT_DESTINATIONS[@]}"; do
+        path=${ARTIFACT_DESTINATIONS[${index}]}
+        if [ -e "${path}" ] || [ -L "${path}" ]; then
+            cp -a -- "${path}" "${ARTIFACT_BACKUP_DIR}/${index}"
+            ARTIFACT_BACKUP_PRESENT[${index}]=1
+        else
+            ARTIFACT_BACKUP_PRESENT[${index}]=0
+        fi
+    done
+}
+
+rollback_artifacts() {
+    local index
+    local path
+
+    [ "${ARTIFACTS_TOUCHED}" -eq 1 ] || return 0
+    echo "Rolling back installed runtime artifacts without touching configuration or data..." >&2
+    for index in "${!ARTIFACT_DESTINATIONS[@]}"; do
+        path=${ARTIFACT_DESTINATIONS[${index}]}
+        rm -rf -- "${path}"
+        if [ "${ARTIFACT_BACKUP_PRESENT[${index}]}" -eq 1 ]; then
+            cp -a -- "${ARTIFACT_BACKUP_DIR}/${index}" "${path}"
+        fi
+    done
+    ARTIFACTS_TOUCHED=0
+}
+
+cleanup_artifact_backup() {
+    if [ -n "${ARTIFACT_BACKUP_DIR}" ]; then
+        rm -rf -- "${ARTIFACT_BACKUP_DIR}"
+        ARTIFACT_BACKUP_DIR=""
+    fi
 }
 
 capture_active_states() {
@@ -105,6 +270,8 @@ capture_active_states() {
         PRIOR_SOCKET_ENABLED=1
     fi
     STATE_CAPTURED=1
+    PRIOR_SERVICE_MANAGER_POLICY=$(manager_policy_snapshot howy.service)
+    PRIOR_SOCKET_MANAGER_POLICY=$(manager_policy_snapshot howy.socket)
     echo "Recorded unit state: howy.service active=${PRIOR_SERVICE_ACTIVE} enabled=${PRIOR_SERVICE_ENABLED}; howy.socket active=${PRIOR_SOCKET_ACTIVE} enabled=${PRIOR_SOCKET_ENABLED}"
 }
 
@@ -114,10 +281,22 @@ restore_active_states() {
 
     echo "Restoring prior active states without changing enablement..."
     if [ "${PRIOR_SOCKET_ACTIVE}" -eq 1 ] && [ "${SOCKET_STOPPED_BY_INSTALLER}" -eq 1 ]; then
-        systemctl start howy.socket
+        if ! systemctl start howy.socket; then
+            RECOVERY_RESTART_ALLOWED=0
+            return 1
+        fi
+        SOCKET_RESTARTED_BY_INSTALLER=1
     fi
     if [ "${PRIOR_SERVICE_ACTIVE}" -eq 1 ] && [ "${SERVICE_STOPPED_BY_INSTALLER}" -eq 1 ]; then
-        systemctl start howy.service
+        if ! systemctl start howy.service; then
+            if [ "${SOCKET_RESTARTED_BY_INSTALLER}" -eq 1 ]; then
+                systemctl stop howy.socket || true
+                SOCKET_RESTARTED_BY_INSTALLER=0
+            fi
+            RECOVERY_RESTART_ALLOWED=0
+            return 1
+        fi
+        SERVICE_RESTARTED_BY_INSTALLER=1
     fi
     STATE_RESTORED=1
 }
@@ -127,10 +306,31 @@ restore_on_exit() {
     trap - EXIT INT TERM
     set +e
     if [ "${status}" -ne 0 ] && [ "${INSTALL_COMMITTED}" -eq 0 ]; then
+        if [ "${MARKER_COMMITTED}" -eq 1 ] && [ -x "${BRIDGE_DEST}" ]; then
+            if ! run_bridge "${BRIDGE_DEST}" stash-release-n >/dev/null; then
+                printf '%s\n' 'Recovery warning: failed to consume the newly committed package-bootstrap marker; units will remain stopped.' >&2
+                RECOVERY_RESTART_ALLOWED=0
+            fi
+        fi
+        rollback_artifacts
         rollback_sysusers_definition
+        if [ "${DAEMON_RELOADED}" -eq 1 ]; then
+            if ! systemctl daemon-reload; then
+                printf '%s\n' 'Recovery warning: daemon-reload of restored unit definitions failed; units remain stopped.' >&2
+                RECOVERY_RESTART_ALLOWED=0
+            elif ! verify_prior_manager_policies; then
+                printf '%s\n' 'Recovery warning: systemd did not load the exact prior unit policy; units remain stopped.' >&2
+                RECOVERY_RESTART_ALLOWED=0
+            fi
+        fi
     fi
+    cleanup_artifact_backup
     cleanup_sysusers_backup
-    restore_active_states
+    if [ "${RECOVERY_RESTART_ALLOWED}" -eq 1 ]; then
+        restore_active_states
+    else
+        printf '%s\n' 'Manual recovery required: verify restored unit files, run systemctl daemon-reload, then restart only previously active Howy units.' >&2
+    fi
     exit "${status}"
 }
 
@@ -191,7 +391,6 @@ install_sysusers_definition() {
     local temporary
 
     echo "Installing dedicated FFmpeg sysusers definition..."
-    install -d -o root -g root -m 0755 "$(dirname "${SYSUSERS_DEST}")"
     temporary=$(mktemp "${SYSUSERS_DEST}.tmp.XXXXXX")
     SYSUSERS_TEMP="${temporary}"
     if ! install -o root -g root -m 0644 "${SYSUSERS_SRC}" "${temporary}"; then
@@ -224,9 +423,12 @@ verify_sysusers_metadata() {
 }
 
 stop_runtime_units() {
-    echo "Stopping active runtime units before artifact replacement..."
-    stop_runtime_unit howy.service SERVICE_STOPPED_BY_INSTALLER
+    echo "Stopping socket activation before the service and settling both units..."
     stop_runtime_unit howy.socket SOCKET_STOPPED_BY_INSTALLER
+    settle_inactive howy.socket
+    stop_runtime_unit howy.service SERVICE_STOPPED_BY_INSTALLER
+    settle_inactive howy.service
+    settle_inactive howy.socket
 }
 
 stop_runtime_unit() {
@@ -240,10 +442,60 @@ stop_runtime_unit() {
     fi
 
     systemctl stop "${unit}" || true
-    if systemctl is-active --quiet "${unit}"; then
-        die "${unit} remained active after stop"
-    fi
+    settle_inactive "${unit}"
     printf -v "${stopped_variable}" '%s' 1
+}
+
+settle_inactive() {
+    local unit="$1"
+    local attempt
+
+    for attempt in {1..50}; do
+        if ! systemctl is-active --quiet "${unit}"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    die "${unit} remained active after stop/settle"
+}
+
+manager_policy_snapshot() {
+    local unit="$1"
+    systemctl show --all \
+        --property=LoadState \
+        --property=FragmentPath \
+        --property=DropInPaths \
+        --property=Conditions \
+        --property=ExecStart \
+        --property=Listen \
+        -- "${unit}"
+}
+
+verify_prior_manager_policies() {
+    [ "$(manager_policy_snapshot howy.service)" = "${PRIOR_SERVICE_MANAGER_POLICY}" ] \
+        && [ "$(manager_policy_snapshot howy.socket)" = "${PRIOR_SOCKET_MANAGER_POLICY}" ]
+}
+
+verify_manager_loaded_installed_units() {
+    local conditions
+
+    [ "$(systemctl show --property=NeedDaemonReload --value -- howy.service)" = "no" ] \
+        || die "systemd still reports howy.service needs daemon-reload"
+    [ "$(systemctl show --property=NeedDaemonReload --value -- howy.socket)" = "no" ] \
+        || die "systemd still reports howy.socket needs daemon-reload"
+    [ "$(systemctl show --property=FragmentPath --value -- howy.service)" = "${SERVICE_DEST}" ] \
+        || die "systemd did not load the installed service fragment"
+    [ "$(systemctl show --property=FragmentPath --value -- howy.socket)" = "${SOCKET_DEST}" ] \
+        || die "systemd did not load the installed socket fragment"
+    for unit in howy.service howy.socket; do
+        conditions=$(systemctl show --property=Conditions --value -- "${unit}")
+        [[ "${conditions}" == *"/var/lib/howy-security-transaction.guard"* ]] \
+            || die "systemd effective ${unit} policy is missing the transaction guard"
+        [[ "${conditions}" == *"/var/lib/howy-package-bootstrap.complete"* ]] \
+            || die "systemd effective ${unit} policy is missing the package-bootstrap marker"
+        [[ "${conditions}" == *"/var/lib/howy-security-transaction.guard"*"/var/lib/howy-package-bootstrap.complete"* ]] \
+            || die "systemd effective ${unit} condition order differs from policy"
+    done
 }
 
 verify_exact_artifact() {
@@ -263,11 +515,23 @@ verify_installed_artifacts() {
     verify_exact_artifact "${HOWYD_SRC}" "${HOWYD_DEST}"
     verify_exact_artifact "${HOWY_SRC}" "${HOWY_DEST}"
     verify_exact_artifact "${PAM_SRC}" "${PAM_DEST}"
-    verify_exact_artifact "${REPO_ROOT}/howy.config" "${CONFIG_DEST}"
+    verify_exact_artifact "${BRIDGE_SRC}" "${BRIDGE_DEST}"
+    verify_exact_artifact "${BOOTSTRAP_SRC}" "${BOOTSTRAP_DEST}"
+    verify_exact_artifact "${ALPM_HOOK_SRC}" "${ALPM_HOOK_DEST}"
     verify_exact_artifact "${REPO_ROOT}/systemd/howy.service" "${SERVICE_DEST}"
     verify_exact_artifact "${REPO_ROOT}/systemd/howy.socket" "${SOCKET_DEST}"
     verify_exact_artifact "${SYSUSERS_SRC}" "${SYSUSERS_DEST}"
     verify_sysusers_metadata
+    verify_preserved_config
+    if [ "${CONFIG_CREATED}" -eq 1 ]; then
+        verify_exact_artifact "${BOOTSTRAP_SRC}" "${CONFIG_DEST}"
+        [ "$(stat -c '%a' "${CONFIG_DEST}")" = "600" ] || die "${CONFIG_DEST} must be mode 0600"
+        [ "$(stat -c '%u:%g' "${CONFIG_DEST}")" = "${CONFIG_EXPECTED_UID}:${CONFIG_EXPECTED_GID}" ] \
+            || die "${CONFIG_DEST} must have the expected root ownership"
+    fi
+    [ "$(stat -c '%a' "${CONFIG_DIR}")" = "700" ] || die "${CONFIG_DIR} must be mode 0700"
+    [ "$(stat -c '%a' "${MODELS_DIR}")" = "700" ] || die "${MODELS_DIR} must be mode 0700"
+    [ "$(stat -c '%a' "${MODE1_MODELS_DIR}")" = "700" ] || die "${MODE1_MODELS_DIR} must be mode 0700"
     [ "$(stat -c '%a' "${CACHE_DIR}")" = "700" ] || die "${CACHE_DIR} must be mode 0700"
 }
 
@@ -314,10 +578,16 @@ install_files() {
     [ -x "${HOWYD_SRC}" ] || die "Missing artifact: ${HOWYD_SRC}"
     [ -x "${HOWY_SRC}" ] || die "Missing artifact: ${HOWY_SRC}"
     [ -f "${PAM_SRC}" ] || die "Missing artifact: ${PAM_SRC}"
+    [ -x "${BRIDGE_SRC}" ] || die "Missing artifact: ${BRIDGE_SRC}"
+    [ -f "${BOOTSTRAP_SRC}" ] || die "Missing artifact: ${BOOTSTRAP_SRC}"
+    [ -f "${ALPM_HOOK_SRC}" ] || die "Missing artifact: ${ALPM_HOOK_SRC}"
+
+    ARTIFACTS_TOUCHED=1
 
     echo "Installing binaries..."
     install -D -m 0755 "${HOWYD_SRC}" "${HOWYD_DEST}"
     install -D -m 0755 "${HOWY_SRC}" "${HOWY_DEST}"
+    install -D -m 0755 "${BRIDGE_SRC}" "${BRIDGE_DEST}"
 
     echo "Installing PAM module..."
     install -D -m 0644 "${PAM_SRC}" "${PAM_DEST}"
@@ -325,15 +595,49 @@ install_files() {
     echo "Installing systemd units..."
     install -D -m 0644 "${REPO_ROOT}/systemd/howy.service" "${SERVICE_DEST}"
     install -D -m 0644 "${REPO_ROOT}/systemd/howy.socket" "${SOCKET_DEST}"
+    install -D -m 0644 "${BOOTSTRAP_SRC}" "${BOOTSTRAP_DEST}"
+    install -D -m 0644 "${ALPM_HOOK_SRC}" "${ALPM_HOOK_DEST}"
 
-    echo "Preparing local test directories..."
-    install -d -m 0755 "${CONFIG_DIR}"
-    install -d -m 0755 "${MODELS_DIR}"
-    install -d -m 0700 "${CACHE_DIR}"
-    install -d -m 0755 "${LOG_DIR}"
+}
 
-    echo "Installing local test config..."
-    install -m 0644 "${REPO_ROOT}/howy.config" "${CONFIG_DEST}"
+ensure_local_config() {
+    local output
+
+    output=$(run_bridge "${BRIDGE_DEST}" create-if-absent) \
+        || die "Descriptor-safe bootstrap create/occupancy check failed"
+    case "${output}" in
+        HOWY_CONFIG_RESULT=Created)
+            [ "${CONFIG_WAS_PRESENT}" -eq 0 ] \
+                || die "Bridge reported Created for a configuration that was already occupied"
+            CONFIG_CREATED=1
+            ;;
+        HOWY_CONFIG_RESULT=Occupied)
+            if [ "${CONFIG_WAS_PRESENT}" -eq 0 ]; then
+                snapshot_existing_config
+                verify_preserved_config
+                die "Configuration became occupied after the initial snapshot; refusing the race without ownership"
+            fi
+            verify_preserved_config
+            echo "Preserving the descriptor-verified existing configuration without rewrite."
+            ;;
+        *)
+            die "Unexpected create-if-absent result: ${output}"
+            ;;
+    esac
+}
+
+ensure_sensitive_layout() {
+    run_bridge "${BRIDGE_SRC}" ensure-layout
+}
+
+complete_local_marker() {
+    local output
+
+    output=$(run_bridge "${BRIDGE_DEST}" complete-local-install) \
+        || die "Bridge could not verify the final config and create the package-bootstrap marker"
+    [ "${output}" = "HOWY_LOCAL_RESULT=Complete" ] \
+        || die "Unexpected local completion result: ${output}"
+    MARKER_COMMITTED=1
 }
 
 run_install_prewarm() {
@@ -386,20 +690,23 @@ Local howy install complete.
 Install-time prewarm: ${PREWARM_MESSAGE}
 
 Next manual steps:
-  1. Review /etc/howy/config.toml and make sure the model paths and camera device
+  1. Provision and then explicitly enable Mode1:
+       sudo howy security provision --mode 1
+       sudo howy security enable
+  2. Review /etc/howy/config.toml and make sure the model paths and camera device
      match this machine.
-  2. Choose and enable an activation policy manually. Socket-only is the
+  3. Choose and enable an activation policy manually. Socket-only is the
      lower-resource/on-demand option:
        sudo systemctl enable --now howy.socket
      For the lowest first-auth latency, start both units so model/provider
      initialization and detector+recognizer warmups finish before PAM:
        sudo systemctl enable --now howy.socket howy.service
      This installer intentionally enables neither policy automatically.
-  3. Test daemon connectivity:
+   4. Test daemon connectivity:
        sudo howy status
-  4. Enroll a face model for a user:
+   5. Enroll a face model for a user:
        sudo howy --user <username> add
-  5. Update an existing PAM service file manually (for example /etc/pam.d/sudo)
+   6. Update an existing PAM service file manually (for example /etc/pam.d/sudo)
      by inserting:
         auth    sufficient    pam_howy.so
       before the distro's normal auth include.
@@ -435,6 +742,7 @@ EOF
 }
 
 main() {
+    parse_arguments "$@"
     require_root
     require_command cargo
     require_command install
@@ -445,11 +753,15 @@ main() {
     require_command cp
     require_command mktemp
     require_command mv
+    require_command readlink
     require_command "${SYSTEMD_SYSUSERS}"
 
     build_release_artifacts
     preflight_ffmpeg_account
     confirm_all_overwrites
+    snapshot_existing_config
+    ensure_sensitive_layout \
+        || die "Descriptor-safe sensitive layout verification failed before sysusers side effects"
     trap restore_on_exit EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -460,17 +772,34 @@ main() {
     verify_exact_artifact "${SYSUSERS_SRC}" "${SYSUSERS_DEST}"
     verify_sysusers_metadata
 
+    prepare_artifact_backup
+
     capture_active_states
     stop_runtime_units
     install_files
+    ensure_local_config || die "Descriptor-safe bootstrap creation failed; runtime artifacts will be rolled back and configuration remains untouched"
 
     echo "Reloading systemd manager configuration..."
     systemctl daemon-reload
+    DAEMON_RELOADED=1
     verify_installed_artifacts
-    run_install_prewarm
+    verify_manager_loaded_installed_units
+    if [ "${CONFIG_CREATED}" -eq 1 ]; then
+        PREWARM_STATUS="skipped"
+        PREWARM_MESSAGE="Skipped install-time prewarm because the fresh disabled Mode1 bootstrap is not provisioned yet."
+    elif [ "${CONFIG_SNAPSHOT_KIND}" != "regular file" ]; then
+        PREWARM_STATUS="skipped"
+        PREWARM_MESSAGE="Skipped install-time prewarm because the preserved configuration object is not a regular file."
+    else
+        run_install_prewarm
+    fi
+    verify_preserved_config
+    complete_local_marker
     restore_active_states
     INSTALL_COMMITTED=1
+    ARTIFACTS_TOUCHED=0
     cleanup_sysusers_backup
+    cleanup_artifact_backup
 
     print_next_steps
 }

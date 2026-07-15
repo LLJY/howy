@@ -1,0 +1,34 @@
+post_install() {
+  if ! /usr/lib/howy/howy-config-bridge bootstrap-release-n; then
+    printf '%s\n' 'Howy refused to replace /etc/howy/config.toml; the existing object was left untouched.' >&2
+    return 1
+  fi
+
+  printf '%s\n' 'sudo howy security provision --mode 1'
+  printf '%s\n' 'sudo howy security enable'
+}
+
+post_upgrade() {
+  if ! /usr/lib/howy/howy-config-bridge complete-release-n; then
+    printf '%s\n' 'Howy could not verify/restore the release-N configuration; the positive service start marker remains absent.' >&2
+    return 1
+  fi
+
+  printf '%s\n' 'Howy preserved /etc/howy/config.toml during this upgrade.'
+  printf '%s\n' 'Run `sudo howy doctor` to inspect migration or recovery status.'
+  printf '%s\n' 'If a bridge journal is reported, run `sudo /usr/lib/howy/howy-config-bridge recover`.'
+  printf '%s\n' 'The release-N stash hook cannot protect an upgrade path that skipped release N.'
+}
+
+pre_remove() {
+  if ! /usr/lib/howy/howy-config-bridge stash-release-n; then
+    printf '%s\n' 'Howy could not create the exact release-N removal/variant stash; no package script modified the configuration.' >&2
+    return 1
+  fi
+}
+
+post_remove() {
+  printf '%s\n' 'Howy package scripts deleted no configuration, models, encrypted records, credentials, receipts, accounts, or groups.'
+  printf '%s\n' 'The exact pre-remove config state remains under /var/lib/howy/config-bridge; pacman backup policy may also retain /etc/howy/config.toml.pacsave.'
+  printf '%s\n' 'The package bootstrap marker was consumed by the abortable PreTransaction stash; retained configuration and model data were not deleted.'
+}

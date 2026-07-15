@@ -1,0 +1,13 @@
+[Trigger]
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = howy-cpu-git
+Target = howy-rocm-git
+Target = howy-cuda-git
+
+[Action]
+Description = Stashing the exact Howy configuration before removal or upgrade
+When = PreTransaction
+Exec = /usr/lib/howy/howy-config-bridge stash-release-n
+AbortOnFail
