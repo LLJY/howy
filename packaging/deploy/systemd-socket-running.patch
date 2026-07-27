@@ -1,0 +1,279 @@
+diff --git a/crates/howy-cli/src/security/engine.rs b/crates/howy-cli/src/security/engine.rs
+index a862adfef8a457ea5f1f27236a34323ec8a380af..62ef836455db6dfd353bee8f6610aa6da071b964 100644
+--- a/crates/howy-cli/src/security/engine.rs
++++ b/crates/howy-cli/src/security/engine.rs
+@@ -3975,9 +3975,14 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+                     return Err(SecurityError::Refused("required unit is failed".into()));
+                 }
+                 UnitAdmissibility::RefuseUnstable => {
+-                    return Err(SecurityError::Refused(
+-                        "required unit state is unsupported".into(),
+-                    ));
++                    return Err(SecurityError::Refused(format!(
++                        "required {unit:?} unit state is unsupported: load={:?}, active={:?}, sub={:?}, file={:?}, queued={}",
++                        observation.load_state,
++                        observation.active_state,
++                        observation.sub_state,
++                        observation.unit_file_state,
++                        observation.has_queued_job,
++                    )));
+                 }
+             }
+         }
+@@ -4018,9 +4023,15 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+                         return Err(SecurityError::Refused("required unit is failed".into()));
+                     }
+                     UnitAdmissibility::RefuseUnstable => {
+-                        return Err(SecurityError::Refused(
+-                            "required unit state is unsupported".into(),
+-                        ));
++                        return Err(SecurityError::Refused(format!(
++                            "required {:?} unit state is unsupported: load={:?}, active={:?}, sub={:?}, file={:?}, queued={}",
++                            observation.unit_kind,
++                            observation.load_state,
++                            observation.active_state,
++                            observation.sub_state,
++                            observation.unit_file_state,
++                            observation.has_queued_job,
++                        )));
+                     }
+                 }
+             }
+diff --git a/crates/howy-cli/src/security/tests.rs b/crates/howy-cli/src/security/tests.rs
+index 3df4048171440a6947ccba3c7e65dac932e41af8..75b93420424e4b136c813418b9baab260cd1a730 100644
+--- a/crates/howy-cli/src/security/tests.rs
++++ b/crates/howy-cli/src/security/tests.rs
+@@ -99,6 +99,7 @@ struct FakeRuntime {
+     status_available: bool,
+     invocation_counter: u8,
+     preserve_invocation_on_start: bool,
++    socket_running_on_start: bool,
+     artifact_read_count: usize,
+     swap_artifact_on_read: Option<usize>,
+     monotonic_millis: u64,
+@@ -147,6 +148,7 @@ impl FakeRuntime {
+             status_available: false,
+             invocation_counter: 1,
+             preserve_invocation_on_start: false,
++            socket_running_on_start: false,
+             artifact_read_count: 0,
+             swap_artifact_on_read: None,
+             monotonic_millis: 0,
+@@ -1005,6 +1007,7 @@ impl SecurityRuntime for FakeRuntime {
+         state.active_state = UnitActiveState::Active;
+         state.sub_state = match unit {
+             UnitKind::Service => UnitSubState::Running,
++            UnitKind::Socket if self.socket_running_on_start => UnitSubState::Running,
+             UnitKind::Socket => UnitSubState::Listening,
+         };
+         if self.service.active_state == UnitActiveState::Active
+@@ -2078,6 +2081,51 @@ fn provision_then_enable_reruns_readiness_patches_one_token_and_validates_status
+     assert!(!runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
+ }
+ 
++#[test]
++fn enable_and_recovery_accept_socket_active_running_through_status_validation() {
++    let mut runtime = FakeRuntime::fresh();
++    provision(&mut runtime).unwrap();
++    runtime.socket_running_on_start = true;
++    runtime.fail_after = Some("status");
++
++    assert!(matches!(
++        SecurityEngine::new(&mut runtime).enable(),
++        Err(SecurityError::Uncertain(_))
++    ));
++    let first_service_start = runtime
++        .events
++        .iter()
++        .rposition(|event| event == "start:Service")
++        .unwrap();
++    let first_status = runtime
++        .events
++        .iter()
++        .rposition(|event| event == "security-info")
++        .unwrap();
++    assert!(first_service_start < first_status);
++    assert!(runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
++    assert!(runtime.files.contains_key(SECURITY_JOURNAL_PATH));
++
++    runtime.events.clear();
++    SecurityEngine::new(&mut runtime).recover().unwrap();
++
++    assert_eq!(runtime.socket.active_state, UnitActiveState::Active);
++    assert_eq!(runtime.socket.sub_state, UnitSubState::Running);
++    let recovered_service_start = runtime
++        .events
++        .iter()
++        .rposition(|event| event == "start:Service")
++        .unwrap();
++    let recovered_status = runtime
++        .events
++        .iter()
++        .rposition(|event| event == "security-info")
++        .unwrap();
++    assert!(recovered_service_start < recovered_status);
++    assert!(!runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
++    assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
++}
++
+ #[test]
+ fn activation_rejects_every_malformed_or_mismatched_public_status() {
+     let mut prepared = FakeRuntime::fresh();
+@@ -3638,6 +3686,26 @@ fn missing_host_secret_refuses_only_after_durable_guard_and_before_rng_or_creds(
+     assert!(runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+ }
+ 
++#[test]
++fn unsupported_unit_refusal_reports_complete_nonsecret_state() {
++    let mut runtime = FakeRuntime::fresh();
++    runtime.socket.load_state = UnitLoadState::NotFound;
++    runtime.socket.active_state = UnitActiveState::Active;
++    runtime.socket.sub_state = UnitSubState::Other;
++    runtime.socket.unit_file_state = UnitFileState::Disabled;
++    runtime.socket.has_queued_job = false;
++
++    let message = match provision(&mut runtime) {
++        Err(SecurityError::Refused(message)) => message,
++        other => panic!("expected unsupported-unit refusal, got {other:?}"),
++    };
++    assert_eq!(
++        message,
++        "required Socket unit state is unsupported: load=NotFound, active=Active, sub=Other, file=Disabled, queued=false"
++    );
++    assert!(!message.contains('/'));
++}
++
+ #[test]
+ fn malformed_readiness_rolls_back_and_masked_units_refuse_without_mutation() {
+     let mut malformed = FakeRuntime::fresh();
+diff --git a/crates/howy-common/src/provisioning/mod.rs b/crates/howy-common/src/provisioning/mod.rs
+index d24474610f1e37835cc061d61dcbdb88b599c07b..8a4bfb5d0c1af65830a7614ad41a9190d9393a4c 100644
+--- a/crates/howy-common/src/provisioning/mod.rs
++++ b/crates/howy-common/src/provisioning/mod.rs
+@@ -677,9 +677,11 @@ impl StableUnitState {
+             (UnitKind::Service, UnitActiveState::Active, UnitSubState::Running) => {
+                 Some(StableRollbackTarget::ActiveRunning)
+             }
+-            (UnitKind::Socket, UnitActiveState::Active, UnitSubState::Listening) => {
+-                Some(StableRollbackTarget::ActiveListening)
+-            }
++            (
++                UnitKind::Socket,
++                UnitActiveState::Active,
++                UnitSubState::Listening | UnitSubState::Running,
++            ) => Some(StableRollbackTarget::ActiveListening),
+             (_, UnitActiveState::Inactive, UnitSubState::Dead) => {
+                 Some(StableRollbackTarget::InactiveDead)
+             }
+@@ -3740,9 +3742,11 @@ pub fn classify_unit_admissibility(unit: UnitObservation) -> UnitAdmissibility {
+         (UnitKind::Service, UnitActiveState::Active, UnitSubState::Running) => {
+             StableRollbackTarget::ActiveRunning
+         }
+-        (UnitKind::Socket, UnitActiveState::Active, UnitSubState::Listening) => {
+-            StableRollbackTarget::ActiveListening
+-        }
++        (
++            UnitKind::Socket,
++            UnitActiveState::Active,
++            UnitSubState::Listening | UnitSubState::Running,
++        ) => StableRollbackTarget::ActiveListening,
+         (_, UnitActiveState::Inactive, UnitSubState::Dead) => StableRollbackTarget::InactiveDead,
+         _ => return UnitAdmissibility::RefuseUnstable,
+     };
+diff --git a/crates/howy-common/src/provisioning/tests.rs b/crates/howy-common/src/provisioning/tests.rs
+index 6e5bcdb941f8d791fac43d5d857206336c3f215d..35301c4a33082beb7ccbb59ae5cd31505ed38418 100644
+--- a/crates/howy-common/src/provisioning/tests.rs
++++ b/crates/howy-common/src/provisioning/tests.rs
+@@ -1920,6 +1920,92 @@ fn unit_admissibility_settles_refuses_and_never_changes_enablement() {
+             mutate_enablement: false,
+         }
+     );
++    let mut running_socket = socket;
++    running_socket.sub_state = UnitSubState::Running;
++    assert_eq!(
++        classify_unit_admissibility(running_socket),
++        UnitAdmissibility::Admissible {
++            rollback_target: StableRollbackTarget::ActiveListening,
++            mutate_enablement: false,
++        }
++    );
++    let stable_running_socket = StableUnitState {
++        unit_kind: UnitKind::Socket,
++        load_state: UnitLoadState::Loaded,
++        active_state: UnitActiveState::Active,
++        sub_state: UnitSubState::Running,
++        unit_file_state: UnitFileState::Enabled,
++    };
++    assert_eq!(
++        stable_running_socket.rollback_target(),
++        Some(StableRollbackTarget::ActiveListening)
++    );
++    let stable_inactive_service = StableUnitState {
++        unit_kind: UnitKind::Service,
++        load_state: UnitLoadState::Loaded,
++        active_state: UnitActiveState::Inactive,
++        sub_state: UnitSubState::Dead,
++        unit_file_state: UnitFileState::Enabled,
++    };
++    let (_, retained_socket) =
++        disabled_post_provision_unit_targets(&stable_inactive_service, &stable_running_socket)
++            .unwrap();
++    assert_eq!(retained_socket, stable_running_socket);
++    assert_eq!(retained_socket.sub_state, UnitSubState::Running);
++    assert_eq!(
++        serde_json::to_value(&retained_socket).unwrap()["sub_state"],
++        "running"
++    );
++
++    let mut listening_service = socket;
++    listening_service.unit_kind = UnitKind::Service;
++    assert_eq!(
++        classify_unit_admissibility(listening_service),
++        UnitAdmissibility::RefuseUnstable
++    );
++    let stable_listening_service = StableUnitState {
++        unit_kind: UnitKind::Service,
++        load_state: UnitLoadState::Loaded,
++        active_state: UnitActiveState::Active,
++        sub_state: UnitSubState::Listening,
++        unit_file_state: UnitFileState::Enabled,
++    };
++    assert_eq!(stable_listening_service.rollback_target(), None);
++
++    let mut unsupported_socket = socket;
++    unsupported_socket.sub_state = UnitSubState::Other;
++    assert_eq!(
++        classify_unit_admissibility(unsupported_socket),
++        UnitAdmissibility::RefuseUnstable
++    );
++    let stable_unsupported_socket = StableUnitState {
++        unit_kind: UnitKind::Socket,
++        load_state: UnitLoadState::Loaded,
++        active_state: UnitActiveState::Active,
++        sub_state: UnitSubState::Other,
++        unit_file_state: UnitFileState::Enabled,
++    };
++    assert_eq!(stable_unsupported_socket.rollback_target(), None);
++    let mut transitioning_socket = socket;
++    transitioning_socket.active_state = UnitActiveState::Activating;
++    transitioning_socket.sub_state = UnitSubState::Start;
++    assert_eq!(
++        classify_unit_admissibility(transitioning_socket),
++        UnitAdmissibility::Settle
++    );
++    let stable_transitioning_socket = StableUnitState {
++        unit_kind: UnitKind::Socket,
++        load_state: UnitLoadState::Loaded,
++        active_state: UnitActiveState::Activating,
++        sub_state: UnitSubState::Start,
++        unit_file_state: UnitFileState::Enabled,
++    };
++    assert_eq!(stable_transitioning_socket.rollback_target(), None);
++    transitioning_socket.active_state = UnitActiveState::Active;
++    assert_eq!(
++        classify_unit_admissibility(transitioning_socket),
++        UnitAdmissibility::RefuseUnstable
++    );
+     assert_eq!(
+         classify_unit_admissibility(observation(
+             UnitActiveState::Activating,

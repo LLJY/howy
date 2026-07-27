@@ -1,0 +1,43 @@
+[Unit]
+Description=Howy Face Authentication Daemon (A/B benchmark fixture)
+Documentation=https://github.com/LLJY/howy
+After=network.target
+Requires=howy.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/howyd
+Restart=on-failure
+RestartSec=5
+
+Environment="RUST_LOG=info"
+Environment="HSA_OVERRIDE_GFX_VERSION=11.0.2"
+Environment="ORT_MIGRAPHX_MODEL_CACHE_PATH=/var/cache/howy"
+Environment="ORT_MIGRAPHX_CACHE_PATH=/var/cache/howy"
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/cache/howy /run/howy /etc/howy/models /var/log/howy
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX
+MemoryDenyWriteExecute=no
+LockPersonality=yes
+UMask=0077
+CacheDirectory=howy
+CacheDirectoryMode=0700
+
+SupplementaryGroups=video render
+DeviceAllow=/dev/video2 rw
+DeviceAllow=/dev/kfd rw
+DeviceAllow=/dev/dri/renderD128 rw
+
+KeyringMode=shared
+
+[Install]
+WantedBy=multi-user.target

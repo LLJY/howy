@@ -1,0 +1,5 @@
+readonly _ab_label='hardened'
+readonly _ab_revision='0b76fa23ad3883ccfa8edd38210766f97cdbb71a'
+readonly _ab_version='0.1.0.r27.g0b76fa2.hardened'
+
+source ./PKGBUILD.shared
