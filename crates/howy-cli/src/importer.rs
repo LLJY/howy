@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -27,6 +27,7 @@ const IMPORT_WALL_TIMEOUT: Duration = Duration::from_secs(45);
 const IMPORT_CPU_SECONDS: libc::rlim_t = 30;
 const IMPORT_ADDRESS_SPACE_BYTES: libc::rlim_t = 512 * 1024 * 1024;
 const IMPORT_NOFILE: libc::rlim_t = 96;
+const STAGING_ROOT: &str = "/run/howy";
 
 pub(crate) struct StagedBatch {
     path: PathBuf,
@@ -152,42 +153,89 @@ impl Drop for StagingGuard {
 }
 
 fn create_staging_directory() -> Result<StagingGuard> {
-    create_staging_directory_with(|path| {
+    create_staging_directory_in_with(Path::new(STAGING_ROOT), 0, 0, |path| {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
     })
 }
 
-fn create_staging_directory_with(
+fn create_staging_directory_in_with(
+    staging_root: &Path,
+    expected_uid: libc::uid_t,
+    expected_gid: libc::gid_t,
     set_private_permissions: impl Fn(&Path) -> std::io::Result<()>,
 ) -> Result<StagingGuard> {
+    if !staging_root.is_absolute() {
+        bail!("staging root must be an absolute path");
+    }
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(staging_root)
+        .with_context(|| {
+            format!(
+                "staging root {} is unavailable or unsafe",
+                staging_root.display()
+            )
+        })?;
+    let metadata = root
+        .metadata()
+        .context("failed to inspect staging root metadata")?;
+    let root_mode = metadata.mode() & 0o7777;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != expected_uid
+        || metadata.gid() != expected_gid
+        || !matches!(root_mode, 0o700 | 0o755)
+    {
+        bail!(
+            "staging root must be a non-symlink directory owned by uid={expected_uid} gid={expected_gid} with mode 0700 or 0755"
+        );
+    }
     for attempt in 0..64u32 {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = PathBuf::from(format!(
-            "/tmp/howy-import-{}-{nonce}-{attempt}",
-            std::process::id()
-        ));
-        match std::fs::create_dir(&path) {
-            Ok(()) => {
-                // Establish cleanup ownership before any fallible permission or
-                // verification step can leave a root-owned directory behind.
-                let guard = StagingGuard {
-                    path,
-                    committed: false,
-                };
-                set_private_permissions(&guard.path)
-                    .context("failed to make staging directory private")?;
-                return Ok(guard);
+        let path = staging_directory_path(staging_root, nonce, attempt);
+        let name = CString::new(
+            path.file_name()
+                .context("staging directory name is unavailable")?
+                .as_bytes(),
+        )?;
+        let created = unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o700) };
+        if created == 0 {
+            // Establish cleanup ownership before any fallible permission or
+            // verification step can leave a root-owned directory behind.
+            let guard = StagingGuard {
+                path,
+                committed: false,
+            };
+            set_private_permissions(&guard.path)
+                .context("failed to make staging directory private")?;
+            let metadata = std::fs::symlink_metadata(&guard.path)
+                .context("failed to verify staging directory metadata")?;
+            if !metadata.file_type().is_dir()
+                || metadata.uid() != expected_uid
+                || metadata.gid() != expected_gid
+                || metadata.mode() & 0o7777 != 0o700
+            {
+                bail!("created staging directory metadata is unsafe");
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error).context("failed to create root-owned staging directory");
-            }
+            return Ok(guard);
         }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            continue;
+        }
+        return Err(error).context("failed to create root-owned staging directory");
     }
     bail!("failed to create a unique staging directory")
+}
+
+fn staging_directory_path(staging_root: &Path, nonce: u128, attempt: u32) -> PathBuf {
+    staging_root.join(format!(
+        "howy-import-{}-{nonce}-{attempt}",
+        std::process::id()
+    ))
 }
 
 fn import_via_child(
@@ -621,6 +669,7 @@ fn open_absolute_directory_nofollow(path: &Path) -> Result<File> {
     }
     let mut directory = unsafe { File::from_raw_fd(fd) };
     for component in path.as_os_str().as_bytes()[1..].split(|byte| *byte == b'/') {
+        let component_display = OsStr::from_bytes(component).to_string_lossy().into_owned();
         let component = CString::new(component)?;
         let fd = unsafe {
             libc::openat(
@@ -630,7 +679,14 @@ fn open_absolute_directory_nofollow(path: &Path) -> Result<File> {
             )
         };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error()).context("unsafe session path component");
+            let error = std::io::Error::last_os_error();
+            return Err(error).with_context(|| {
+                format!(
+                    "unsafe session path component {component_display:?} for importer uid={} gid={}",
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                )
+            });
         }
         directory = unsafe { File::from_raw_fd(fd) };
     }
@@ -824,6 +880,23 @@ mod tests {
         path
     }
 
+    fn private_temp_dir(label: &str) -> PathBuf {
+        let path = temp_dir(label);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    fn current_identity() -> (libc::uid_t, libc::gid_t) {
+        (unsafe { libc::geteuid() }, unsafe { libc::getegid() })
+    }
+
+    fn create_test_staging(staging_root: &Path) -> Result<StagingGuard> {
+        let (uid, gid) = current_identity();
+        create_staging_directory_in_with(staging_root, uid, gid, |path| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        })
+    }
+
     fn encoded(format: ImageFormat) -> Vec<u8> {
         let pixels = [10, 20, 30, 40, 50, 60];
         let mut bytes = Vec::new();
@@ -940,8 +1013,10 @@ mod tests {
         let original = source.join("frame.jpg");
         let bytes = encoded(ImageFormat::Jpeg);
         std::fs::write(&original, &bytes).unwrap();
-        let staging = create_staging_directory().unwrap();
+        let staging_root = private_temp_dir("staging-root");
+        let staging = create_test_staging(&staging_root).unwrap();
         let staging_path = staging.path.clone();
+        assert_eq!(staging_path.parent(), Some(staging_root.as_path()));
         assert_eq!(
             std::fs::metadata(&staging_path)
                 .unwrap()
@@ -953,15 +1028,20 @@ mod tests {
         std::fs::write(staging_path.join(".partial"), b"partial").unwrap();
         drop(staging);
         assert!(!staging_path.exists());
+        assert!(staging_root.exists());
+        assert_eq!(std::fs::read_dir(&staging_root).unwrap().count(), 0);
         assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        std::fs::remove_dir(staging_root).unwrap();
         std::fs::remove_dir_all(source).unwrap();
     }
 
     #[test]
     fn staging_guard_exists_before_permission_failure() {
+        let staging_root = private_temp_dir("permission-failure-root");
+        let (uid, gid) = current_identity();
         let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
         let observed_by_setter = std::sync::Arc::clone(&observed);
-        let result = create_staging_directory_with(move |path| {
+        let result = create_staging_directory_in_with(&staging_root, uid, gid, move |path| {
             *observed_by_setter.lock().unwrap() = Some(path.to_path_buf());
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -974,6 +1054,91 @@ mod tests {
         assert!(error.to_string().contains("private"));
         let path = observed.lock().unwrap().clone().unwrap();
         assert!(!path.exists(), "failed staging directory survived cleanup");
+        assert_eq!(std::fs::read_dir(&staging_root).unwrap().count(), 0);
+        std::fs::remove_dir(staging_root).unwrap();
+    }
+
+    #[test]
+    fn production_staging_path_is_below_shared_runtime_root() {
+        let path = staging_directory_path(Path::new(STAGING_ROOT), 123, 4);
+        assert_eq!(Path::new(STAGING_ROOT), Path::new("/run/howy"));
+        assert_eq!(path.parent(), Some(Path::new("/run/howy")));
+        assert!(path.starts_with("/run/howy"));
+        assert!(!path.starts_with("/tmp"));
+        assert_eq!(
+            path.file_name().unwrap(),
+            OsString::from(format!("howy-import-{}-123-4", std::process::id()))
+        );
+    }
+
+    #[test]
+    fn root_owned_nonwritable_shared_parent_is_admissible() {
+        let staging_root = temp_dir("shared-staging-parent");
+        std::fs::set_permissions(&staging_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let staging = create_test_staging(&staging_root).unwrap();
+        assert_eq!(staging.path.parent(), Some(staging_root.as_path()));
+        assert_eq!(
+            std::fs::symlink_metadata(&staging.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        drop(staging);
+        assert_eq!(std::fs::read_dir(&staging_root).unwrap().count(), 0);
+        std::fs::remove_dir(staging_root).unwrap();
+    }
+
+    #[test]
+    fn unsafe_staging_parents_fail_before_child_creation() {
+        use std::os::unix::fs::symlink;
+
+        fn different_id(id: u32) -> u32 {
+            if id == u32::MAX { id - 1 } else { id + 1 }
+        }
+
+        let (uid, gid) = current_identity();
+        let container = temp_dir("unsafe-staging-parents");
+
+        let absent = container.join("absent");
+        assert!(create_test_staging(&absent).is_err());
+        assert!(!absent.exists());
+
+        let symlink_target = private_temp_dir("staging-symlink-target");
+        let symlink_parent = container.join("symlink");
+        symlink(&symlink_target, &symlink_parent).unwrap();
+        assert!(create_test_staging(&symlink_parent).is_err());
+        assert_eq!(std::fs::read_dir(&symlink_target).unwrap().count(), 0);
+
+        let wrong_type = container.join("file");
+        std::fs::write(&wrong_type, b"not a directory").unwrap();
+        std::fs::set_permissions(&wrong_type, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(create_test_staging(&wrong_type).is_err());
+        assert!(wrong_type.is_file());
+
+        let wrong_mode = temp_dir("staging-wrong-mode");
+        std::fs::set_permissions(&wrong_mode, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(create_test_staging(&wrong_mode).is_err());
+        assert_eq!(std::fs::read_dir(&wrong_mode).unwrap().count(), 0);
+
+        let wrong_owner = private_temp_dir("staging-wrong-owner");
+        assert!(
+            create_staging_directory_in_with(&wrong_owner, different_id(uid), gid, |_| Ok(()))
+                .is_err()
+        );
+        assert!(
+            create_staging_directory_in_with(&wrong_owner, uid, different_id(gid), |_| Ok(()))
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(&wrong_owner).unwrap().count(), 0);
+
+        std::fs::remove_file(symlink_parent).unwrap();
+        std::fs::remove_dir(symlink_target).unwrap();
+        std::fs::remove_file(wrong_type).unwrap();
+        std::fs::remove_dir(wrong_mode).unwrap();
+        std::fs::remove_dir(wrong_owner).unwrap();
+        std::fs::remove_dir(container).unwrap();
     }
 
     #[test]
