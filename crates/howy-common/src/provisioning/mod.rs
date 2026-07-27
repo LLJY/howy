@@ -677,9 +677,11 @@ impl StableUnitState {
             (UnitKind::Service, UnitActiveState::Active, UnitSubState::Running) => {
                 Some(StableRollbackTarget::ActiveRunning)
             }
-            (UnitKind::Socket, UnitActiveState::Active, UnitSubState::Listening) => {
-                Some(StableRollbackTarget::ActiveListening)
-            }
+            (
+                UnitKind::Socket,
+                UnitActiveState::Active,
+                UnitSubState::Listening | UnitSubState::Running,
+            ) => Some(StableRollbackTarget::ActiveListening),
             (_, UnitActiveState::Inactive, UnitSubState::Dead) => {
                 Some(StableRollbackTarget::InactiveDead)
             }
@@ -3740,9 +3742,11 @@ pub fn classify_unit_admissibility(unit: UnitObservation) -> UnitAdmissibility {
         (UnitKind::Service, UnitActiveState::Active, UnitSubState::Running) => {
             StableRollbackTarget::ActiveRunning
         }
-        (UnitKind::Socket, UnitActiveState::Active, UnitSubState::Listening) => {
-            StableRollbackTarget::ActiveListening
-        }
+        (
+            UnitKind::Socket,
+            UnitActiveState::Active,
+            UnitSubState::Listening | UnitSubState::Running,
+        ) => StableRollbackTarget::ActiveListening,
         (_, UnitActiveState::Inactive, UnitSubState::Dead) => StableRollbackTarget::InactiveDead,
         _ => return UnitAdmissibility::RefuseUnstable,
     };

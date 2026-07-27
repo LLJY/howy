@@ -40,6 +40,21 @@ impl From<CliKeySelection> for security::KeySelection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliProvisionPresence {
+    Off,
+    Confirm,
+}
+
+impl From<CliProvisionPresence> for security::ProvisionPresence {
+    fn from(value: CliProvisionPresence) -> Self {
+        match value {
+            CliProvisionPresence::Off => Self::Off,
+            CliProvisionPresence::Confirm => Self::Confirm,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum SecurityCommands {
     /// Provision an explicit storage security mode transactionally.
@@ -48,6 +63,8 @@ enum SecurityCommands {
         mode: u8,
         #[arg(long, value_enum, default_value = "auto")]
         with_key: CliKeySelection,
+        #[arg(long, value_enum)]
+        presence: Option<CliProvisionPresence>,
         #[arg(long)]
         adopt_existing: bool,
     },
@@ -210,6 +227,7 @@ fn cmd_security(command: SecurityCommands, assume_yes: bool) -> Result<()> {
         SecurityCommands::Provision {
             mode,
             with_key,
+            presence,
             adopt_existing,
         } => {
             let mode = match mode {
@@ -218,6 +236,7 @@ fn cmd_security(command: SecurityCommands, assume_yes: bool) -> Result<()> {
                 2 => security::ProvisionMode::EphemeralAead,
                 _ => unreachable!("clap restricts security mode"),
             };
+            let presence = resolve_provision_presence(mode, presence.map(Into::into));
             let confirmed = if assume_yes {
                 true
             } else {
@@ -230,6 +249,7 @@ fn cmd_security(command: SecurityCommands, assume_yes: bool) -> Result<()> {
             };
             engine.provision(security::ProvisionRequest {
                 mode,
+                presence,
                 with_key: with_key.into(),
                 adopt_existing,
                 confirmed,
@@ -257,6 +277,18 @@ fn cmd_security(command: SecurityCommands, assume_yes: bool) -> Result<()> {
         println!("Safe cleanup command: {command}");
     }
     Ok(())
+}
+
+fn resolve_provision_presence(
+    mode: security::ProvisionMode,
+    requested: Option<security::ProvisionPresence>,
+) -> security::ProvisionPresence {
+    requested.unwrap_or(match mode {
+        security::ProvisionMode::Plaintext | security::ProvisionMode::EphemeralAead => {
+            security::ProvisionPresence::Off
+        }
+        security::ProvisionMode::CachedAead => security::ProvisionPresence::Confirm,
+    })
 }
 
 fn prompt_yes(prompt: &str) -> Result<bool> {
@@ -747,8 +779,9 @@ fn configure_private_umask(command: &mut Command) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, SecurityCommands, configure_private_umask, select_enrollment,
-        test_auth_request, validate_batch_enrollment_result, validate_live_enrollment_result,
+        Cli, CliProvisionPresence, Commands, SecurityCommands, configure_private_umask,
+        resolve_provision_presence, select_enrollment, test_auth_request,
+        validate_batch_enrollment_result, validate_live_enrollment_result,
     };
     use clap::Parser;
     use howy_common::protocol::{
@@ -829,6 +862,79 @@ mod tests {
             Cli::try_parse_from(["howy", "security", "provision", "--mode", "1", "--new-key",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn security_provision_presence_parses_and_resolves_mode_defaults() {
+        fn parse_presence(arguments: &[&str]) -> Option<CliProvisionPresence> {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let Commands::Security {
+                command: SecurityCommands::Provision { presence, .. },
+            } = cli.command
+            else {
+                panic!("expected security provision")
+            };
+            presence
+        }
+
+        assert_eq!(
+            parse_presence(&["howy", "security", "provision", "--mode", "1"]),
+            None
+        );
+        assert_eq!(
+            parse_presence(&[
+                "howy",
+                "security",
+                "provision",
+                "--mode",
+                "1",
+                "--presence",
+                "off",
+            ]),
+            Some(CliProvisionPresence::Off)
+        );
+        assert_eq!(
+            parse_presence(&[
+                "howy",
+                "security",
+                "provision",
+                "--mode",
+                "1",
+                "--presence",
+                "confirm",
+            ]),
+            Some(CliProvisionPresence::Confirm)
+        );
+        assert!(
+            Cli::try_parse_from([
+                "howy",
+                "security",
+                "provision",
+                "--mode",
+                "1",
+                "--presence",
+                "prompt",
+            ])
+            .is_err()
+        );
+
+        use super::security::{ProvisionMode, ProvisionPresence};
+        assert_eq!(
+            resolve_provision_presence(ProvisionMode::Plaintext, None),
+            ProvisionPresence::Off
+        );
+        assert_eq!(
+            resolve_provision_presence(ProvisionMode::CachedAead, None),
+            ProvisionPresence::Confirm
+        );
+        for (mode, presence) in [
+            (ProvisionMode::Plaintext, ProvisionPresence::Off),
+            (ProvisionMode::Plaintext, ProvisionPresence::Confirm),
+            (ProvisionMode::CachedAead, ProvisionPresence::Off),
+            (ProvisionMode::CachedAead, ProvisionPresence::Confirm),
+        ] {
+            assert_eq!(resolve_provision_presence(mode, Some(presence)), presence);
+        }
     }
 
     #[test]

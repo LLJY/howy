@@ -65,6 +65,12 @@ enum ParsedJournal {
     Supervisor(SupervisorJournalV1),
 }
 
+#[derive(Clone, Copy)]
+enum SecurityDirectoryRecordScope {
+    Full,
+    RecordedPrefix,
+}
+
 impl ParsedJournal {
     fn transaction_id(&self) -> &str {
         match self {
@@ -1574,6 +1580,116 @@ impl RealSecurityRuntime {
         })?;
         Ok(observed)
     }
+
+    fn validate_security_directory_records(
+        directories: &[SecurityDirectoryRecordV1],
+        scope: SecurityDirectoryRecordScope,
+    ) -> SecurityResult<()> {
+        match scope {
+            SecurityDirectoryRecordScope::Full => {
+                howy_common::provisioning::validate_security_directory_records(directories)
+            }
+            SecurityDirectoryRecordScope::RecordedPrefix => {
+                howy_common::provisioning::validate_security_directory_record_prefix(directories)
+            }
+        }
+        .map_err(|error| SecurityError::operation(error.to_string()))?;
+        if directories
+            .iter()
+            .any(|record| record.observed_directory.is_none())
+        {
+            return Err(SecurityError::Uncertain(
+                "recorded security directory observation is missing".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_security_directory_records(
+        &self,
+        directories: &[SecurityDirectoryRecordV1],
+        scope: SecurityDirectoryRecordScope,
+    ) -> SecurityResult<()> {
+        Self::validate_security_directory_records(directories, scope)?;
+        for expected in directories {
+            let resolved = self.paths.resolve(&expected.path)?;
+            let directory =
+                open_directory_path(&self.paths.root, &resolved, false, expected.permissions)?
+                    .ok_or_else(|| {
+                        SecurityError::Uncertain("required directory disappeared".into())
+                    })?;
+            let stat = fstat(directory.as_raw_fd())?;
+            let observed = directory_identity(Path::new(&expected.path), &stat)?;
+            let journaled = expected.observed_directory.as_ref().ok_or_else(|| {
+                SecurityError::Uncertain("required directory observation is missing".into())
+            })?;
+            if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
+                || stat.st_uid != expected.uid
+                || stat.st_gid != expected.gid
+                || stat.st_mode & 0o7777 != expected.permissions
+                || observed.device_id != journaled.device_id
+                || observed.inode != journaled.inode
+            {
+                return Err(SecurityError::Uncertain(
+                    "required directory differs from the journaled identity".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback_security_directory_records(
+        &mut self,
+        directories: &[SecurityDirectoryRecordV1],
+        scope: SecurityDirectoryRecordScope,
+    ) -> SecurityResult<()> {
+        Self::validate_security_directory_records(directories, scope)?;
+        for record in directories.iter().rev().filter(|record| !record.preexisted) {
+            let observed = record.observed_directory.as_ref().ok_or_else(|| {
+                SecurityError::Uncertain("created directory observation is missing".into())
+            })?;
+            let resolved = self.paths.resolve(&record.path)?;
+            let resolved_text = resolved
+                .to_str()
+                .ok_or_else(|| SecurityError::operation("rooted path is not UTF-8"))?;
+            let (parent, name) = split_absolute(resolved_text)?;
+            let Some(parent_fd) = open_directory_path(&self.paths.root, parent, false, 0o755)?
+            else {
+                continue;
+            };
+            let name = cstring(name.as_bytes())?;
+            let Some(stat) = fstatat_nofollow(parent_fd.as_raw_fd(), &name)? else {
+                continue;
+            };
+            if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
+                || stat.st_dev != observed.device_id
+                || stat.st_ino != observed.inode
+                || stat.st_uid != record.uid
+                || stat.st_gid != record.gid
+                || stat.st_mode & 0o7777 != record.permissions
+            {
+                return Err(SecurityError::Uncertain(
+                    "transaction-created directory identity changed before rollback".into(),
+                ));
+            }
+            if unsafe { libc::unlinkat(parent_fd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }
+                != 0
+            {
+                let error = std::io::Error::last_os_error();
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+                ) {
+                    continue;
+                }
+                return Err(SecurityError::operation(
+                    "transaction-created directory rollback failed",
+                ));
+            }
+            fsync_directory(parent_fd.as_raw_fd())?;
+        }
+        Ok(())
+    }
 }
 
 fn directory_identity_matches(
@@ -1989,86 +2105,38 @@ impl SecurityRuntime for RealSecurityRuntime {
         &mut self,
         directories: &[SecurityDirectoryRecordV1],
     ) -> SecurityResult<()> {
-        howy_common::provisioning::validate_security_directory_records(directories)
-            .map_err(|error| SecurityError::operation(error.to_string()))?;
-        for expected in directories {
-            let resolved = self.paths.resolve(&expected.path)?;
-            let directory =
-                open_directory_path(&self.paths.root, &resolved, false, expected.permissions)?
-                    .ok_or_else(|| {
-                        SecurityError::Uncertain("required directory disappeared".into())
-                    })?;
-            let stat = fstat(directory.as_raw_fd())?;
-            let observed = directory_identity(Path::new(&expected.path), &stat)?;
-            let journaled = expected.observed_directory.as_ref().ok_or_else(|| {
-                SecurityError::Uncertain("required directory observation is missing".into())
-            })?;
-            if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
-                || stat.st_uid != expected.uid
-                || stat.st_gid != expected.gid
-                || stat.st_mode & 0o7777 != expected.permissions
-                || observed.device_id != journaled.device_id
-                || observed.inode != journaled.inode
-            {
-                return Err(SecurityError::Uncertain(
-                    "required directory differs from the journaled identity".into(),
-                ));
-            }
-        }
-        Ok(())
+        self.verify_security_directory_records(directories, SecurityDirectoryRecordScope::Full)
+    }
+
+    fn verify_recorded_security_directory_prefix(
+        &mut self,
+        directories: &[SecurityDirectoryRecordV1],
+    ) -> SecurityResult<()> {
+        self.verify_security_directory_records(
+            directories,
+            SecurityDirectoryRecordScope::RecordedPrefix,
+        )
     }
 
     fn rollback_security_directories(
         &mut self,
         directories: &[SecurityDirectoryRecordV1],
     ) -> SecurityResult<()> {
-        howy_common::provisioning::validate_security_directory_records(directories)
-            .map_err(|error| SecurityError::operation(error.to_string()))?;
-        for record in directories.iter().rev().filter(|record| !record.preexisted) {
-            let observed = record.observed_directory.as_ref().ok_or_else(|| {
-                SecurityError::Uncertain("created directory observation is missing".into())
-            })?;
-            let resolved = self.paths.resolve(&record.path)?;
-            let resolved_text = resolved
-                .to_str()
-                .ok_or_else(|| SecurityError::operation("rooted path is not UTF-8"))?;
-            let (parent, name) = split_absolute(resolved_text)?;
-            let Some(parent_fd) = open_directory_path(&self.paths.root, parent, false, 0o755)?
-            else {
-                continue;
-            };
-            let name = cstring(name.as_bytes())?;
-            let Some(stat) = fstatat_nofollow(parent_fd.as_raw_fd(), &name)? else {
-                continue;
-            };
-            if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
-                || stat.st_dev != observed.device_id
-                || stat.st_ino != observed.inode
-                || stat.st_uid != record.uid
-                || stat.st_gid != record.gid
-                || stat.st_mode & 0o7777 != record.permissions
-            {
-                return Err(SecurityError::Uncertain(
-                    "transaction-created directory identity changed before rollback".into(),
-                ));
-            }
-            if unsafe { libc::unlinkat(parent_fd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }
-                != 0
-            {
-                let error = std::io::Error::last_os_error();
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
-                ) {
-                    continue;
-                }
-                return Err(SecurityError::operation(
-                    "transaction-created directory rollback failed",
-                ));
-            }
-            fsync_directory(parent_fd.as_raw_fd())?;
-        }
-        Ok(())
+        self.rollback_security_directory_records(directories, SecurityDirectoryRecordScope::Full)
+    }
+
+    fn rollback_recorded_security_directory_prefix(
+        &mut self,
+        directories: &[SecurityDirectoryRecordV1],
+    ) -> SecurityResult<()> {
+        self.verify_security_directory_records(
+            directories,
+            SecurityDirectoryRecordScope::RecordedPrefix,
+        )?;
+        self.rollback_security_directory_records(
+            directories,
+            SecurityDirectoryRecordScope::RecordedPrefix,
+        )
     }
 
     fn create_guard(
