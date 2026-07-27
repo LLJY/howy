@@ -1,0 +1,89 @@
+pkgname=howy-ab-rocm
+pkgver="${_ab_version}"
+pkgrel=1
+pkgdesc="Build-only Howy ${_ab_label} A/B benchmark payload"
+arch=('x86_64')
+url='https://github.com/LLJY/howy'
+license=('GPL-2.0-only')
+depends=(
+  'onnxruntime-opt-rocm'
+  'pam'
+  'systemd'
+)
+makedepends=(
+  'cargo'
+  'clang'
+  'git'
+  'onnxruntime-opt-rocm'
+  'protobuf'
+)
+options=('!ccache' '!distcc' '!debug')
+provides=("howy=${pkgver}")
+conflicts=('howy' 'howy-cpu-git' 'howy-rocm-git' 'howy-cuda-git')
+source=(
+  "${pkgname}-${_ab_label}::git+https://github.com/LLJY/howy.git#commit=${_ab_revision}"
+  'howy.service'
+  'howy.socket'
+)
+sha256sums=(
+  'SKIP'
+  '94c8f857458ba638d7833f101e21d7aa0f3c7249bd1a4ad3d737481a35118a34'
+  '12a10177a243bed15d8889f887219fb80cefdd119f263be62957bab5d5f3cecc'
+)
+
+prepare() {
+  cd "${srcdir}/${pkgname}-${_ab_label}"
+
+  local actual_revision
+  actual_revision=$(git rev-parse HEAD)
+  if [[ "${actual_revision}" != "${_ab_revision}" ]]; then
+    printf 'source revision mismatch: expected %s, got %s\n' \
+      "${_ab_revision}" "${actual_revision}" >&2
+    return 1
+  fi
+
+  export CARGO_HOME="${srcdir}/cargo-home"
+  export CARGO_TARGET_DIR="${srcdir}/cargo-target"
+  export CARGO_BUILD_RUSTFLAGS='-C target-cpu=x86-64'
+  export CARGO_INCREMENTAL=0
+  export ORT_LIB_PATH=/usr/lib
+  export ORT_PREFER_DYNAMIC_LINK=1
+
+  cargo fetch --locked
+}
+
+build() {
+  cd "${srcdir}/${pkgname}-${_ab_label}"
+
+  export CARGO_HOME="${srcdir}/cargo-home"
+  export CARGO_TARGET_DIR="${srcdir}/cargo-target"
+  export CARGO_BUILD_RUSTFLAGS='-C target-cpu=x86-64'
+  export CARGO_INCREMENTAL=0
+  export ORT_LIB_PATH=/usr/lib
+  export ORT_PREFER_DYNAMIC_LINK=1
+
+  cargo build --frozen --release \
+    -p howy-daemon \
+    --bin howyd \
+    --bin smoke_test \
+    --bin capture_bench
+  cargo build --frozen --release \
+    -p howy-cli \
+    -p howy-pam
+}
+
+package() {
+  local target="${srcdir}/cargo-target/release"
+
+  install -Dm755 "${target}/howyd" "${pkgdir}/usr/bin/howyd"
+  install -Dm755 "${target}/howy" "${pkgdir}/usr/bin/howy"
+  install -Dm644 "${target}/libpam_howy.so" "${pkgdir}/usr/lib/security/pam_howy.so"
+  install -Dm755 "${target}/smoke_test" \
+    "${pkgdir}/usr/lib/howy-ab/bench/smoke_test"
+  install -Dm755 "${target}/capture_bench" \
+    "${pkgdir}/usr/lib/howy-ab/bench/capture_bench"
+  install -Dm644 "${srcdir}/howy.service" \
+    "${pkgdir}/usr/lib/systemd/system/howy.service"
+  install -Dm644 "${srcdir}/howy.socket" \
+    "${pkgdir}/usr/lib/systemd/system/howy.socket"
+}

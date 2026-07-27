@@ -1,0 +1,5 @@
+readonly _ab_label='master'
+readonly _ab_revision='a7d187d723185742fb7cb9ef24e8af50d1e3890e'
+readonly _ab_version='0.1.0.r25.ga7d187d.master'
+
+source ./PKGBUILD.shared
