@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 use crate::security::engine::{
-    CleanupRequest, ProvisionMode, ProvisionRequest, SecretKeyMaterial, SecurityEngine,
-    SecurityRuntime,
+    CleanupRequest, ProvisionMode, ProvisionPresence, ProvisionRequest, SecretKeyMaterial,
+    SecurityEngine, SecurityRuntime,
 };
 use howy_common::config::EmbeddingSecurityMode;
 use howy_common::provisioning::{JournalPhase, SECURITY_RECEIPT_PATH};
@@ -1399,6 +1399,106 @@ fn rooted_real_directory_lifecycle_uses_production_no_follow_methods() {
     assert!(bad.plan_security_directory("/etc/howy", 0o700).is_err());
 }
 
+#[test]
+fn rooted_recorded_directory_prefix_accepts_empty_and_rolls_back_created_partial() {
+    if !run_root_owned_branch(
+        "security::real::tests::rooted_recorded_directory_prefix_accepts_empty_and_rolls_back_created_partial",
+    ) {
+        return;
+    }
+    let root = AtomicTempDir::new();
+    prepare_rooted_production_parents(&root.0);
+    let mut runtime = RealSecurityRuntime::rooted(&root.0).unwrap();
+    runtime.acquire_lock().unwrap();
+
+    runtime
+        .verify_recorded_security_directory_prefix(&[])
+        .unwrap();
+    runtime
+        .rollback_recorded_security_directory_prefix(&[])
+        .unwrap();
+    assert!(runtime.verify_security_directories(&[]).is_err());
+    assert!(runtime.rollback_security_directories(&[]).is_err());
+
+    let mut records = Vec::new();
+    for (path, permissions) in &howy_common::provisioning::REQUIRED_SECURITY_DIRECTORIES[..2] {
+        let mut record = runtime.plan_security_directory(path, *permissions).unwrap();
+        record.observed_directory = Some(runtime.ensure_security_directory(&record).unwrap());
+        records.push(record);
+    }
+    runtime
+        .verify_recorded_security_directory_prefix(&records)
+        .unwrap();
+    assert!(runtime.verify_security_directories(&records).is_err());
+    assert!(runtime.rollback_security_directories(&records).is_err());
+    runtime
+        .rollback_recorded_security_directory_prefix(&records)
+        .unwrap();
+    for (path, _) in &howy_common::provisioning::REQUIRED_SECURITY_DIRECTORIES[..2] {
+        assert!(!runtime.paths.resolve(path).unwrap().exists());
+    }
+}
+
+#[test]
+fn rooted_recorded_directory_prefix_rejects_malformed_and_changed_state() {
+    if !run_root_owned_branch(
+        "security::real::tests::rooted_recorded_directory_prefix_rejects_malformed_and_changed_state",
+    ) {
+        return;
+    }
+
+    fn assert_prefix_rejected(
+        runtime: &mut RealSecurityRuntime,
+        records: &[SecurityDirectoryRecordV1],
+    ) {
+        assert!(
+            runtime
+                .verify_recorded_security_directory_prefix(records)
+                .is_err()
+        );
+        assert!(
+            runtime
+                .rollback_recorded_security_directory_prefix(records)
+                .is_err()
+        );
+    }
+
+    let root = AtomicTempDir::new();
+    prepare_rooted_production_parents(&root.0);
+    let mut runtime = RealSecurityRuntime::rooted(&root.0).unwrap();
+    runtime.acquire_lock().unwrap();
+    let (first_path, first_permissions) =
+        howy_common::provisioning::REQUIRED_SECURITY_DIRECTORIES[0];
+    let mut first = runtime
+        .plan_security_directory(first_path, first_permissions)
+        .unwrap();
+    assert_prefix_rejected(&mut runtime, &[first.clone()]);
+
+    first.observed_directory = Some(runtime.ensure_security_directory(&first).unwrap());
+    let rooted_first = runtime.paths.resolve(first_path).unwrap();
+    fs::set_permissions(&rooted_first, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_prefix_rejected(&mut runtime, &[first.clone()]);
+    fs::set_permissions(&rooted_first, fs::Permissions::from_mode(first_permissions)).unwrap();
+
+    let replacement = runtime.paths.resolve("/etc/howy-replacement").unwrap();
+    fs::create_dir(&replacement).unwrap();
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(first_permissions)).unwrap();
+    fs::remove_dir(&rooted_first).unwrap();
+    fs::rename(&replacement, &rooted_first).unwrap();
+    assert_prefix_rejected(&mut runtime, &[first.clone()]);
+
+    let (second_path, second_permissions) =
+        howy_common::provisioning::REQUIRED_SECURITY_DIRECTORIES[1];
+    let mut second = runtime
+        .plan_security_directory(second_path, second_permissions)
+        .unwrap();
+    second.observed_directory = Some(runtime.ensure_security_directory(&second).unwrap());
+    assert_prefix_rejected(&mut runtime, &[second]);
+
+    let too_long = vec![first; howy_common::provisioning::REQUIRED_SECURITY_DIRECTORIES.len() + 1];
+    assert_prefix_rejected(&mut runtime, &too_long);
+}
+
 struct RootedTestKey([u8; 32]);
 
 impl SecretKeyMaterial for RootedTestKey {
@@ -1681,11 +1781,27 @@ impl SecurityRuntime for RootedEngineRuntime {
         self.fs.verify_security_directories(directories)
     }
 
+    fn verify_recorded_security_directory_prefix(
+        &mut self,
+        directories: &[SecurityDirectoryRecordV1],
+    ) -> SecurityResult<()> {
+        self.fs
+            .verify_recorded_security_directory_prefix(directories)
+    }
+
     fn rollback_security_directories(
         &mut self,
         directories: &[SecurityDirectoryRecordV1],
     ) -> SecurityResult<()> {
         self.fs.rollback_security_directories(directories)
+    }
+
+    fn rollback_recorded_security_directory_prefix(
+        &mut self,
+        directories: &[SecurityDirectoryRecordV1],
+    ) -> SecurityResult<()> {
+        self.fs
+            .rollback_recorded_security_directory_prefix(directories)
     }
 
     fn create_guard(
@@ -2013,6 +2129,7 @@ fn prepare_rooted_unadopted(root: &Path) -> (RootedEngineRuntime, Sha256Digest) 
         SecurityEngine::new(&mut runtime)
             .provision(ProvisionRequest {
                 mode: ProvisionMode::CachedAead,
+                presence: ProvisionPresence::Confirm,
                 with_key: KeySelection::Host,
                 adopt_existing: false,
                 confirmed: true,
@@ -2053,6 +2170,7 @@ fn rooted_activation_failures_recreate_and_rejournal_the_exact_guard_before_reco
         SecurityEngine::new(&mut runtime)
             .provision(ProvisionRequest {
                 mode: ProvisionMode::CachedAead,
+                presence: ProvisionPresence::Confirm,
                 with_key: KeySelection::Host,
                 adopt_existing: false,
                 confirmed: true,
@@ -2117,6 +2235,7 @@ fn rooted_activation_failures_recreate_and_rejournal_the_exact_guard_before_reco
     SecurityEngine::new(&mut blocked)
         .provision(ProvisionRequest {
             mode: ProvisionMode::CachedAead,
+            presence: ProvisionPresence::Confirm,
             with_key: KeySelection::Host,
             adopt_existing: false,
             confirmed: true,
@@ -2250,6 +2369,81 @@ fn rooted_cleanup_pre_admission_has_zero_control_mutation_and_guards_a_late_race
 }
 
 #[test]
+fn rooted_failed_empty_directory_prefix_recovery_matches_live_supervisor_journal() {
+    if !run_root_owned_branch(
+        "security::real::tests::rooted_failed_empty_directory_prefix_recovery_matches_live_supervisor_journal",
+    ) {
+        return;
+    }
+    let root = AtomicTempDir::new();
+    let mut runtime = prepare_rooted_engine(&root.0);
+    let service_before = runtime.service.clone();
+    let socket_before = runtime.socket.clone();
+    let unsafe_howy = runtime
+        .fs
+        .paths
+        .resolve(howy_common::provisioning::HOWY_CONFIG_DIRECTORY)
+        .unwrap();
+    fs::create_dir(&unsafe_howy).unwrap();
+    fs::set_permissions(&unsafe_howy, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(matches!(
+        SecurityEngine::new(&mut runtime).provision(ProvisionRequest {
+            mode: ProvisionMode::CachedAead,
+            presence: ProvisionPresence::Confirm,
+            with_key: KeySelection::Host,
+            adopt_existing: false,
+            confirmed: true,
+        }),
+        Err(SecurityError::Uncertain(_))
+    ));
+    let journal_file = runtime
+        .fs
+        .read_file(SECURITY_JOURNAL_PATH, MAX_JOURNAL_BYTES)
+        .unwrap()
+        .unwrap();
+    let journal = SupervisorJournalV1::parse(&journal_file.bytes).unwrap();
+    assert_eq!(journal.phase, SupervisorPhaseV1::UnitsStopped);
+    assert!(journal.supervisor_failed);
+    assert!(journal.security_directories.is_empty());
+    assert!(journal.atomic_writes.is_empty());
+    for path in [
+        howy_common::paths::CONFIG_FILE,
+        MODE1_CREDENTIAL_PATH,
+        MODE1_DROPIN_PATH,
+        SECURITY_RECEIPT_PATH,
+    ] {
+        assert!(
+            runtime
+                .fs
+                .read_file(path, MAX_JOURNAL_BYTES)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    SecurityEngine::new(&mut runtime).recover().unwrap();
+
+    assert_eq!(runtime.service, service_before);
+    assert_eq!(runtime.socket, socket_before);
+    assert_eq!(fs::metadata(&unsafe_howy).unwrap().mode() & 0o7777, 0o755);
+    assert!(
+        runtime
+            .fs
+            .read_file(SECURITY_TRANSACTION_GUARD_PATH, 256)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        runtime
+            .fs
+            .read_file(SECURITY_JOURNAL_PATH, MAX_JOURNAL_BYTES)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn full_engine_uses_rooted_real_filesystem_with_fake_transport() {
     if !run_root_owned_branch(
         "security::real::tests::full_engine_uses_rooted_real_filesystem_with_fake_transport",
@@ -2261,6 +2455,7 @@ fn full_engine_uses_rooted_real_filesystem_with_fake_transport() {
     SecurityEngine::new(&mut runtime)
         .provision(ProvisionRequest {
             mode: ProvisionMode::CachedAead,
+            presence: ProvisionPresence::Confirm,
             with_key: KeySelection::Host,
             adopt_existing: false,
             confirmed: true,
@@ -2310,6 +2505,7 @@ fn full_engine_uses_rooted_real_filesystem_with_fake_transport() {
             SecurityEngine::new(&mut crash)
                 .provision(ProvisionRequest {
                     mode: ProvisionMode::CachedAead,
+                    presence: ProvisionPresence::Confirm,
                     with_key: KeySelection::Host,
                     adopt_existing: false,
                     confirmed: true,
@@ -2328,6 +2524,7 @@ fn full_engine_uses_rooted_real_filesystem_with_fake_transport() {
         SecurityEngine::new(&mut cleanup)
             .provision(ProvisionRequest {
                 mode: ProvisionMode::CachedAead,
+                presence: ProvisionPresence::Confirm,
                 with_key: KeySelection::Host,
                 adopt_existing: false,
                 confirmed: true,
@@ -2365,6 +2562,7 @@ fn full_engine_uses_rooted_real_filesystem_with_fake_transport() {
         SecurityEngine::new(&mut replacement)
             .provision(ProvisionRequest {
                 mode: ProvisionMode::CachedAead,
+                presence: ProvisionPresence::Confirm,
                 with_key: KeySelection::Host,
                 adopt_existing: false,
                 confirmed: true,

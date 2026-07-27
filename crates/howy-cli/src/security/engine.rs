@@ -66,8 +66,15 @@ pub enum ProvisionMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisionPresence {
+    Off,
+    Confirm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProvisionRequest {
     pub mode: ProvisionMode,
+    pub presence: ProvisionPresence,
     pub with_key: KeySelection,
     pub adopt_existing: bool,
     pub confirmed: bool,
@@ -270,7 +277,15 @@ pub trait SecurityRuntime {
         &mut self,
         directories: &[SecurityDirectoryRecordV1],
     ) -> SecurityResult<()>;
+    fn verify_recorded_security_directory_prefix(
+        &mut self,
+        directories: &[SecurityDirectoryRecordV1],
+    ) -> SecurityResult<()>;
     fn rollback_security_directories(
+        &mut self,
+        directories: &[SecurityDirectoryRecordV1],
+    ) -> SecurityResult<()>;
+    fn rollback_recorded_security_directory_prefix(
         &mut self,
         directories: &[SecurityDirectoryRecordV1],
     ) -> SecurityResult<()>;
@@ -360,6 +375,13 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
         if request.mode == ProvisionMode::EphemeralAead {
             return Err(SecurityError::Refused(
                 "security mode 2 is unavailable until its feasibility gate passes".into(),
+            ));
+        }
+        if request.mode == ProvisionMode::Plaintext
+            && request.presence == ProvisionPresence::Confirm
+        {
+            return Err(SecurityError::Refused(
+                "presence confirmation is unavailable for security mode 0".into(),
             ));
         }
         if !request.confirmed {
@@ -868,7 +890,37 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
         self.runtime.boundary("supervisor-directories-ready")
     }
 
+    fn reconcile_recorded_security_directories(
+        &mut self,
+        journal: &mut SupervisorJournalV1,
+    ) -> SecurityResult<()> {
+        if let Some(intent) = journal.security_directories.last()
+            && intent.observed_directory.is_none()
+        {
+            let observed = self.runtime.ensure_security_directory(intent)?;
+            self.runtime
+                .boundary("directory-created-before-observation")?;
+            self.persist_directory_observation(journal, observed)?;
+        }
+        self.runtime
+            .verify_recorded_security_directory_prefix(&journal.security_directories)
+    }
+
+    fn rollback_supervisor_security_directories(
+        &mut self,
+        journal: &SupervisorJournalV1,
+    ) -> SecurityResult<()> {
+        if journal.supervisor_failed {
+            self.runtime
+                .rollback_recorded_security_directory_prefix(&journal.security_directories)
+        } else {
+            self.runtime
+                .rollback_security_directories(&journal.security_directories)
+        }
+    }
+
     fn provision_mode1(&mut self, request: ProvisionRequest) -> SecurityResult<SecurityOutcome> {
+        self.refuse_receipted_presence_mismatch(request.presence)?;
         let supervisor =
             self.begin_supervised_transaction(SupervisorOperationV1::ProvisionMode1, None)?;
         let namespace_nonempty = self.runtime.namespace_nonempty()?;
@@ -898,6 +950,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             (&config, existing_receipt, &existing_artifact)
             && receipt_matches_live(receipt, config, artifact, self.runtime)?
         {
+            require_requested_presence(&config.bytes, request.presence)?;
             return match receipt.state {
                 ReceiptState::ProvisionedDisabled => self.verify_disabled_idempotent(
                     config,
@@ -1057,7 +1110,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
         };
         self.runtime.boundary("credential-ready")?;
 
-        let disabled_config = build_disabled_mode1_config(config.as_ref())?;
+        let disabled_config = build_disabled_mode1_config(config.as_ref(), request.presence)?;
         let config_patch = prepare_config_enable_patch(&disabled_config)
             .map_err(|error| SecurityError::operation(error.to_string()))?;
         let expected_verifier = self.runtime.preview_verifier(&disabled_config)?;
@@ -1192,6 +1245,28 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             }),
             Err(error) => Err(error),
         }
+    }
+
+    fn refuse_receipted_presence_mismatch(
+        &mut self,
+        requested: ProvisionPresence,
+    ) -> SecurityResult<()> {
+        let config = self
+            .runtime
+            .read_file(howy_common::paths::CONFIG_FILE, MAX_CONFIG_BYTES)?;
+        let receipt = self.read_receipt()?;
+        let (Some(config), Some(receipt)) = (config, receipt) else {
+            return Ok(());
+        };
+        config.validate_regular(0, 0, 0o600)?;
+        let expected_config = match receipt.state {
+            ReceiptState::ProvisionedDisabled => &receipt.config_patch.disabled_sha256,
+            ReceiptState::Enabled => &receipt.config_patch.enabled_sha256,
+        };
+        if config.sha256() == *expected_config {
+            require_requested_presence(&config.bytes, requested)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1377,6 +1452,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             receipt,
             supervisor.prior_daemon_invocation_id.as_deref(),
             &receipt.config_patch.enabled_sha256,
+            &config.bytes,
         )?;
         self.require_public_status(&status)?;
         self.revalidate_receipted_live(receipt, &config.bytes, &receipt_file.sha256(), &readiness)?;
@@ -1390,6 +1466,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             receipt,
             supervisor.prior_daemon_invocation_id.as_deref(),
             &receipt.config_patch.enabled_sha256,
+            &config.bytes,
         )?;
         self.require_public_status(&final_status)?;
         if final_status.daemon_invocation_id != status.daemon_invocation_id {
@@ -1782,6 +1859,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             enabled_receipt,
             prior_invocation,
             &journal.planned_hashes.enabled_config_sha256,
+            enabled_config,
         )?;
         self.require_public_status(&status)?;
         self.advance_mode1(journal, JournalPhase::UnitsStarted)?;
@@ -1813,6 +1891,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             enabled_receipt,
             None,
             &journal.planned_hashes.enabled_config_sha256,
+            enabled_config,
         )?;
         self.require_public_status(&final_status)?;
         if final_status.daemon_invocation_id != status.daemon_invocation_id {
@@ -2295,8 +2374,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             .socket_unit_state
             .clone()
             .ok_or_else(|| SecurityError::Uncertain("cleanup socket target missing".into()))?;
-        self.runtime
-            .rollback_security_directories(&journal.security_directories)?;
+        self.rollback_supervisor_security_directories(journal)?;
         self.remove_active_guard()?;
         restore_unit_target(self.runtime, &socket)?;
         restore_unit_target(self.runtime, &service)?;
@@ -2553,11 +2631,15 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
         if journal.phase == SupervisorPhaseV1::Guarded {
             self.advance_supervisor(&mut journal, SupervisorPhaseV1::UnitsStopped)?;
         }
-        if journal.phase == SupervisorPhaseV1::UnitsStopped {
+        if journal.phase == SupervisorPhaseV1::UnitsStopped && !journal.supervisor_failed {
             self.prepare_security_directories(&mut journal)?;
         }
-        self.runtime
-            .verify_security_directories(&journal.security_directories)?;
+        if journal.supervisor_failed {
+            self.reconcile_recorded_security_directories(&mut journal)?;
+        } else {
+            self.runtime
+                .verify_security_directories(&journal.security_directories)?;
+        }
         if journal.operation == SupervisorOperationV1::CleanupUnadopted {
             return self.recover_cleanup_supervisor(journal);
         }
@@ -2569,13 +2651,15 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             .socket_unit_state
             .as_ref()
             .ok_or_else(|| SecurityError::Uncertain("socket target missing".into()))?;
-        self.runtime
-            .rollback_security_directories(&journal.security_directories)?;
+        self.rollback_supervisor_security_directories(&journal)?;
         self.remove_active_guard()?;
         restore_unit_target(self.runtime, socket)?;
         restore_unit_target(self.runtime, service)?;
         self.verify_restored_targets(service, socket)?;
-        if journal.phase != SupervisorPhaseV1::UnitsRestored {
+        // A failed UnitsStopped journal may contain only a valid directory
+        // prefix, which cannot be serialized as UnitsRestored. Keep that exact
+        // journal until rollback and unit restoration succeed, then remove it.
+        if journal.phase != SupervisorPhaseV1::UnitsRestored && !journal.supervisor_failed {
             self.advance_supervisor(&mut journal, SupervisorPhaseV1::UnitsRestored)?;
         }
         self.remove_current_journal()?;
@@ -2709,13 +2793,12 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             .socket_unit_state
             .clone()
             .ok_or_else(|| SecurityError::Uncertain("socket target missing".into()))?;
-        self.runtime
-            .rollback_security_directories(&journal.security_directories)?;
+        self.rollback_supervisor_security_directories(journal)?;
         self.remove_active_guard()?;
         restore_unit_target(self.runtime, &socket)?;
         restore_unit_target(self.runtime, &service)?;
         self.verify_restored_targets(&service, &socket)?;
-        if journal.phase != SupervisorPhaseV1::UnitsRestored {
+        if journal.phase != SupervisorPhaseV1::UnitsRestored && !journal.supervisor_failed {
             self.advance_supervisor(journal, SupervisorPhaseV1::UnitsRestored)?;
         }
         self.remove_current_journal()?;
@@ -2975,6 +3058,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
                     &enabled_receipt,
                     journal.prior_daemon_invocation_id.as_deref(),
                     &journal.planned_hashes.enabled_config_sha256,
+                    &enabled,
                 )?;
                 self.require_public_status(&started_status)?;
                 self.require_effective_mode1(&enabled_receipt.effective_units)?;
@@ -3008,6 +3092,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
                     &enabled_receipt,
                     journal.prior_daemon_invocation_id.as_deref(),
                     &journal.planned_hashes.enabled_config_sha256,
+                    &enabled,
                 )?;
                 self.require_public_status(&final_status)?;
                 if final_status.daemon_invocation_id != started_status.daemon_invocation_id {
@@ -3272,7 +3357,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
                 "disabled daemon unexpectedly returned root status".into(),
             ));
         }
-        self.require_disabled_public_status()
+        self.require_disabled_public_status(&config.bytes)
     }
 
     fn validate_disabled_live(&mut self, journal: &ProvisioningJournalV1) -> SecurityResult<()> {
@@ -3476,13 +3561,13 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
         .map_err(|error| SecurityError::operation(error.to_string()))
     }
 
-    fn require_disabled_public_status(&mut self) -> SecurityResult<()> {
+    fn require_disabled_public_status(&mut self, config: &[u8]) -> SecurityResult<()> {
         let public = self.runtime.daemon_info()?;
         validate_daemon_info_for_activation(
             public.as_ref(),
             DaemonInfoExpectation {
                 active_security_mode: EmbeddingSecurityMode::AeadCached as u32,
-                prompt_required: true,
+                prompt_required: config_prompt_required(config)?,
                 storage_ready: false,
                 disabled: true,
             },
@@ -3890,9 +3975,14 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
                     return Err(SecurityError::Refused("required unit is failed".into()));
                 }
                 UnitAdmissibility::RefuseUnstable => {
-                    return Err(SecurityError::Refused(
-                        "required unit state is unsupported".into(),
-                    ));
+                    return Err(SecurityError::Refused(format!(
+                        "required {unit:?} unit state is unsupported: load={:?}, active={:?}, sub={:?}, file={:?}, queued={}",
+                        observation.load_state,
+                        observation.active_state,
+                        observation.sub_state,
+                        observation.unit_file_state,
+                        observation.has_queued_job,
+                    )));
                 }
             }
         }
@@ -3933,9 +4023,15 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
                         return Err(SecurityError::Refused("required unit is failed".into()));
                     }
                     UnitAdmissibility::RefuseUnstable => {
-                        return Err(SecurityError::Refused(
-                            "required unit state is unsupported".into(),
-                        ));
+                        return Err(SecurityError::Refused(format!(
+                            "required {:?} unit state is unsupported: load={:?}, active={:?}, sub={:?}, file={:?}, queued={}",
+                            observation.unit_kind,
+                            observation.load_state,
+                            observation.active_state,
+                            observation.sub_state,
+                            observation.unit_file_state,
+                            observation.has_queued_job,
+                        )));
                     }
                 }
             }
@@ -4577,7 +4673,10 @@ fn stable_cleanup_unit(observation: UnitObservation) -> SecurityResult<StableUni
     })
 }
 
-fn build_disabled_mode1_config(config: Option<&ObservedFile>) -> SecurityResult<Vec<u8>> {
+fn build_disabled_mode1_config(
+    config: Option<&ObservedFile>,
+    presence: ProvisionPresence,
+) -> SecurityResult<Vec<u8>> {
     let mut parsed = match config {
         Some(file) => toml::from_str::<HowyConfig>(
             std::str::from_utf8(&file.bytes)
@@ -4590,8 +4689,11 @@ fn build_disabled_mode1_config(config: Option<&ObservedFile>) -> SecurityResult<
     parsed.security.embedding_mode = EmbeddingSecurityMode::AeadCached;
     parsed.security.key_epoch = MODE1_KEY_EPOCH;
     parsed.security.cached.credential_name = MODE1_CREDENTIAL_NAME.into();
-    parsed.presence.mode = PresenceMode::Confirm;
-    if parsed.presence.allowed_pam_services.is_empty() {
+    parsed.presence.mode = match presence {
+        ProvisionPresence::Off => PresenceMode::Off,
+        ProvisionPresence::Confirm => PresenceMode::Confirm,
+    };
+    if presence == ProvisionPresence::Confirm && parsed.presence.allowed_pam_services.is_empty() {
         parsed.presence.allowed_pam_services = vec!["sudo".into()];
     }
     parsed.validate().map_err(SecurityError::operation)?;
@@ -4617,6 +4719,7 @@ fn build_enabled_mode0_config(config: Option<&ObservedFile>) -> SecurityResult<V
     };
     parsed.core.disabled = false;
     parsed.security.embedding_mode = EmbeddingSecurityMode::Plaintext;
+    parsed.presence.mode = PresenceMode::Off;
     parsed.validate().map_err(SecurityError::operation)?;
     let bytes = toml::to_string_pretty(&parsed)
         .map_err(|_| SecurityError::operation("Mode 0 configuration serialization failed"))?
@@ -4636,6 +4739,16 @@ fn config_prompt_required(bytes: &[u8]) -> SecurityResult<bool> {
         toml::from_str(source).map_err(|_| SecurityError::operation("configuration is invalid"))?;
     config.validate().map_err(SecurityError::operation)?;
     Ok(config.presence.mode == PresenceMode::Confirm)
+}
+
+fn require_requested_presence(bytes: &[u8], requested: ProvisionPresence) -> SecurityResult<()> {
+    if config_prompt_required(bytes)? != (requested == ProvisionPresence::Confirm) {
+        return Err(SecurityError::Refused(
+            "receipted Mode 1 presence differs from the requested provision-time presence; runtime toggles are unsupported"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn bump_generation(generation: &mut u64) -> SecurityResult<()> {
@@ -4815,16 +4928,21 @@ fn validate_enabled_status(
     receipt: &ProvisioningReceiptV1,
     prior_invocation: Option<&str>,
     config_sha256: &Sha256Digest,
+    config: &[u8],
 ) -> SecurityResult<()> {
+    let config_bytes_sha256 = Sha256Digest::from_bytes(config);
+    let prompt_required = config_prompt_required(config)?;
     let states = status
         .validate_strict()
         .map_err(|error| SecurityError::operation(error.to_string()))?;
-    if status.active_security_mode != 1
+    if config_bytes_sha256 != *config_sha256
+        || config_bytes_sha256 != receipt.config_patch.enabled_sha256
+        || status.active_security_mode != 1
         || status.key_epoch != 1
         || status.config_sha256 != config_sha256.as_str()
         || status.credential_name != MODE1_CREDENTIAL_NAME
         || status.configured_credential_source != MODE1_CREDENTIAL_PATH
-        || !status.prompt_required
+        || status.prompt_required != prompt_required
         || states.backend != SecurityBackendStateV1::Ready
         || states.readiness != SecurityReadinessStateV1::Ready
         || states.poison != SecurityPoisonStateV1::NotPoisoned

@@ -26,8 +26,9 @@ use howy_common::provisioning::{
 use super::command::{CommandSpec, KeySelection};
 use super::engine::{
     AtomicTargetObservation, AtomicWriteReconciliation, CleanupRequest, MODE0_DROPIN_BYTES,
-    MODE1_DROPIN_BYTES, ObservedFile, ProvisionMode, ProvisionRequest, SecretKeyMaterial,
-    SecurityEngine, SecurityError, SecurityOutcome, SecurityResult, SecurityRuntime,
+    MODE1_DROPIN_BYTES, ObservedFile, ProvisionMode, ProvisionPresence, ProvisionRequest,
+    SecretKeyMaterial, SecurityEngine, SecurityError, SecurityOutcome, SecurityResult,
+    SecurityRuntime,
 };
 
 #[derive(Clone)]
@@ -98,6 +99,7 @@ struct FakeRuntime {
     status_available: bool,
     invocation_counter: u8,
     preserve_invocation_on_start: bool,
+    socket_running_on_start: bool,
     artifact_read_count: usize,
     swap_artifact_on_read: Option<usize>,
     monotonic_millis: u64,
@@ -113,6 +115,7 @@ struct FakeRuntime {
     cleanup_mutation: Option<&'static str>,
     cleanup_pre_guard_mutation: Option<&'static str>,
     public_status_mutation: Option<&'static str>,
+    root_prompt_override: Option<bool>,
 }
 
 impl FakeRuntime {
@@ -145,6 +148,7 @@ impl FakeRuntime {
             status_available: false,
             invocation_counter: 1,
             preserve_invocation_on_start: false,
+            socket_running_on_start: false,
             artifact_read_count: 0,
             swap_artifact_on_read: None,
             monotonic_millis: 0,
@@ -160,6 +164,7 @@ impl FakeRuntime {
             cleanup_mutation: None,
             cleanup_pre_guard_mutation: None,
             public_status_mutation: None,
+            root_prompt_override: None,
         };
         runtime.put(
             BASE_SERVICE_UNIT_PATH,
@@ -284,6 +289,70 @@ impl FakeRuntime {
             binary_absolute_path: "/usr/bin/howyd".into(),
             binary_sha256: Sha256Digest::from_bytes(b"fake-howyd").as_str().into(),
         })
+    }
+
+    fn validate_security_directory_records(
+        directories: &[SecurityDirectoryRecordV1],
+        recorded_prefix: bool,
+    ) -> SecurityResult<()> {
+        if recorded_prefix {
+            howy_common::provisioning::validate_security_directory_record_prefix(directories)
+        } else {
+            howy_common::provisioning::validate_security_directory_records(directories)
+        }
+        .map_err(|error| SecurityError::operation(error.to_string()))?;
+        if directories
+            .iter()
+            .any(|record| record.observed_directory.is_none())
+        {
+            return Err(SecurityError::Uncertain(
+                "fake directory observation missing".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_security_directory_records(
+        &mut self,
+        directories: &[SecurityDirectoryRecordV1],
+    ) -> SecurityResult<()> {
+        self.events.push("directories:verify".into());
+        for expected in directories {
+            let Some((inode, permissions)) = self.directories.get(&expected.path) else {
+                return Err(SecurityError::Uncertain(
+                    "fake directory disappeared".into(),
+                ));
+            };
+            let observed = expected.observed_directory.as_ref().ok_or_else(|| {
+                SecurityError::Uncertain("fake directory observation missing".into())
+            })?;
+            if *inode != observed.inode || *permissions != expected.permissions {
+                return Err(SecurityError::Uncertain(
+                    "fake directory identity changed".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback_security_directory_records(
+        &mut self,
+        directories: &[SecurityDirectoryRecordV1],
+    ) -> SecurityResult<()> {
+        self.events.push("directories:rollback".into());
+        for record in directories.iter().rev().filter(|record| !record.preexisted) {
+            let prefix = format!("{}/", record.path);
+            let has_files = self.files.keys().any(|path| path.starts_with(&prefix));
+            let has_directories = self
+                .directories
+                .keys()
+                .any(|path| path != &record.path && path.starts_with(&prefix));
+            if !has_files && !has_directories {
+                self.directories.remove(&record.path);
+                self.transaction_created_directories.remove(&record.path);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -669,42 +738,33 @@ impl SecurityRuntime for FakeRuntime {
         &mut self,
         directories: &[SecurityDirectoryRecordV1],
     ) -> SecurityResult<()> {
-        for expected in directories {
-            let Some((inode, permissions)) = self.directories.get(&expected.path) else {
-                return Err(SecurityError::Uncertain(
-                    "fake directory disappeared".into(),
-                ));
-            };
-            let observed = expected.observed_directory.as_ref().ok_or_else(|| {
-                SecurityError::Uncertain("fake directory observation missing".into())
-            })?;
-            if *inode != observed.inode || *permissions != expected.permissions {
-                return Err(SecurityError::Uncertain(
-                    "fake directory identity changed".into(),
-                ));
-            }
-        }
-        Ok(())
+        Self::validate_security_directory_records(directories, false)?;
+        self.verify_security_directory_records(directories)
+    }
+
+    fn verify_recorded_security_directory_prefix(
+        &mut self,
+        directories: &[SecurityDirectoryRecordV1],
+    ) -> SecurityResult<()> {
+        Self::validate_security_directory_records(directories, true)?;
+        self.verify_security_directory_records(directories)
     }
 
     fn rollback_security_directories(
         &mut self,
         directories: &[SecurityDirectoryRecordV1],
     ) -> SecurityResult<()> {
-        self.events.push("directories:rollback".into());
-        for record in directories.iter().rev().filter(|record| !record.preexisted) {
-            let prefix = format!("{}/", record.path);
-            let has_files = self.files.keys().any(|path| path.starts_with(&prefix));
-            let has_directories = self
-                .directories
-                .keys()
-                .any(|path| path != &record.path && path.starts_with(&prefix));
-            if !has_files && !has_directories {
-                self.directories.remove(&record.path);
-                self.transaction_created_directories.remove(&record.path);
-            }
-        }
-        Ok(())
+        Self::validate_security_directory_records(directories, false)?;
+        self.rollback_security_directory_records(directories)
+    }
+
+    fn rollback_recorded_security_directory_prefix(
+        &mut self,
+        directories: &[SecurityDirectoryRecordV1],
+    ) -> SecurityResult<()> {
+        Self::validate_security_directory_records(directories, true)?;
+        self.verify_security_directory_records(directories)?;
+        self.rollback_security_directory_records(directories)
     }
 
     fn create_guard(
@@ -947,6 +1007,7 @@ impl SecurityRuntime for FakeRuntime {
         state.active_state = UnitActiveState::Active;
         state.sub_state = match unit {
             UnitKind::Service => UnitSubState::Running,
+            UnitKind::Socket if self.socket_running_on_start => UnitSubState::Running,
             UnitKind::Socket => UnitSubState::Listening,
         };
         if self.service.active_state == UnitActiveState::Active
@@ -1048,7 +1109,10 @@ impl SecurityRuntime for FakeRuntime {
 
     fn security_info(&mut self) -> SecurityResult<Option<SecurityInfoResult>> {
         self.events.push("security-info".into());
-        let status = self.status();
+        let mut status = self.status();
+        if let (Some(status), Some(prompt_required)) = (&mut status, self.root_prompt_override) {
+            status.prompt_required = prompt_required;
+        }
         self.fail_after("status")?;
         Ok(status)
     }
@@ -1219,6 +1283,7 @@ impl SecurityRuntime for FakeRuntime {
                 _ => unreachable!(),
             }
         }
+        self.fail_after(name)?;
         if self.crash_at == Some(self.boundary_count) || self.crash_name == Some(name) {
             Err(SecurityError::InjectedCrash(format!(
                 "injected crash at {name}"
@@ -1411,8 +1476,16 @@ fn host_envelope_text() -> Vec<u8> {
 }
 
 fn provision(runtime: &mut FakeRuntime) -> SecurityResult<SecurityOutcome> {
+    provision_with_presence(runtime, ProvisionPresence::Confirm)
+}
+
+fn provision_with_presence(
+    runtime: &mut FakeRuntime,
+    presence: ProvisionPresence,
+) -> SecurityResult<SecurityOutcome> {
     SecurityEngine::new(runtime).provision(ProvisionRequest {
         mode: ProvisionMode::CachedAead,
+        presence,
         with_key: KeySelection::Host,
         adopt_existing: false,
         confirmed: true,
@@ -1424,6 +1497,7 @@ fn mode2_refuses_before_lock_or_any_persistent_side_effect() {
     let mut runtime = FakeRuntime::fresh();
     let result = SecurityEngine::new(&mut runtime).provision(ProvisionRequest {
         mode: ProvisionMode::EphemeralAead,
+        presence: ProvisionPresence::Off,
         with_key: KeySelection::Auto,
         adopt_existing: false,
         confirmed: true,
@@ -1432,6 +1506,27 @@ fn mode2_refuses_before_lock_or_any_persistent_side_effect() {
     assert_eq!(runtime.events, ["require-root"]);
     assert!(!runtime.locked);
     assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+}
+
+#[test]
+fn mode0_confirm_refuses_before_any_durable_or_key_mutation() {
+    let mut runtime = FakeRuntime::fresh();
+    let result = SecurityEngine::new(&mut runtime).provision(ProvisionRequest {
+        mode: ProvisionMode::Plaintext,
+        presence: ProvisionPresence::Confirm,
+        with_key: KeySelection::Auto,
+        adopt_existing: false,
+        confirmed: true,
+    });
+
+    assert!(matches!(result, Err(SecurityError::Refused(_))));
+    assert_eq!(runtime.events, ["require-root"]);
+    assert!(!runtime.locked);
+    assert_eq!(runtime.transaction_id_counter, 0);
+    assert!(runtime.directories.is_empty());
+    assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+    assert!(!runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
+    assert!(!runtime.files.contains_key(MODE1_CREDENTIAL_PATH));
 }
 
 #[test]
@@ -1508,6 +1603,65 @@ fn fresh_mode1_provisions_exact_disabled_objects_without_secret_records() {
             && !event.starts_with("mask:")
             && !event.starts_with("unmask:")
     }));
+}
+
+#[test]
+fn mode1_presence_controls_allowlist_and_receipts_disabled_and_enabled_configs() {
+    let mut runtime = FakeRuntime::fresh();
+    let mut prior = HowyConfig::legacy_defaults();
+    prior.presence.allowed_pam_services.clear();
+    let prior = toml::to_string_pretty(&prior).unwrap();
+    runtime.put(howy_common::paths::CONFIG_FILE, prior.as_bytes(), 0o600);
+
+    provision_with_presence(&mut runtime, ProvisionPresence::Off).unwrap();
+    let disabled_bytes = runtime.files[howy_common::paths::CONFIG_FILE].bytes.clone();
+    let disabled: HowyConfig =
+        toml::from_str(std::str::from_utf8(&disabled_bytes).unwrap()).unwrap();
+    assert!(disabled.core.disabled);
+    assert_eq!(
+        disabled.presence.mode,
+        howy_common::config::PresenceMode::Off
+    );
+    assert!(disabled.presence.allowed_pam_services.is_empty());
+    let disabled_receipt = runtime.receipt();
+    assert_eq!(disabled_receipt.state, ReceiptState::ProvisionedDisabled);
+    assert_eq!(
+        disabled_receipt.config_patch.disabled_sha256,
+        Sha256Digest::from_bytes(&disabled_bytes)
+    );
+
+    SecurityEngine::new(&mut runtime).enable().unwrap();
+    let enabled_bytes = runtime.files[howy_common::paths::CONFIG_FILE].bytes.clone();
+    let enabled: HowyConfig = toml::from_str(std::str::from_utf8(&enabled_bytes).unwrap()).unwrap();
+    assert!(!enabled.core.disabled);
+    assert_eq!(
+        enabled.presence.mode,
+        howy_common::config::PresenceMode::Off
+    );
+    assert!(enabled.presence.allowed_pam_services.is_empty());
+    let enabled_receipt = runtime.receipt();
+    assert_eq!(enabled_receipt.state, ReceiptState::Enabled);
+    assert_eq!(
+        enabled_receipt.config_patch.enabled_sha256,
+        Sha256Digest::from_bytes(&enabled_bytes)
+    );
+    assert!(!runtime.status().unwrap().prompt_required);
+
+    let mut confirm = FakeRuntime::fresh();
+    let mut prior = HowyConfig::legacy_defaults();
+    prior.presence.allowed_pam_services.clear();
+    let prior = toml::to_string_pretty(&prior).unwrap();
+    confirm.put(howy_common::paths::CONFIG_FILE, prior.as_bytes(), 0o600);
+    provision_with_presence(&mut confirm, ProvisionPresence::Confirm).unwrap();
+    let config: HowyConfig = toml::from_str(
+        std::str::from_utf8(&confirm.files[howy_common::paths::CONFIG_FILE].bytes).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        config.presence.mode,
+        howy_common::config::PresenceMode::Confirm
+    );
+    assert_eq!(config.presence.allowed_pam_services, ["sudo"]);
 }
 
 #[test]
@@ -1624,6 +1778,7 @@ fn fresh_directory_metadata_is_exact_and_rollback_removes_only_created_empty_pat
         SecurityEngine::new(&mut rollback)
             .provision(ProvisionRequest {
                 mode: ProvisionMode::Plaintext,
+                presence: ProvisionPresence::Off,
                 with_key: KeySelection::Auto,
                 adopt_existing: false,
                 confirmed: true,
@@ -1645,6 +1800,7 @@ fn fresh_directory_metadata_is_exact_and_rollback_removes_only_created_empty_pat
         SecurityEngine::new(&mut preserve)
             .provision(ProvisionRequest {
                 mode: ProvisionMode::Plaintext,
+                presence: ProvisionPresence::Off,
                 with_key: KeySelection::Auto,
                 adopt_existing: false,
                 confirmed: true,
@@ -1670,6 +1826,7 @@ fn crash_after_mkdir_before_observation_recovers_from_durable_absence_intent() {
 
     let journal = SupervisorJournalV1::parse(&runtime.files[SECURITY_JOURNAL_PATH].bytes).unwrap();
     assert_eq!(journal.phase, SupervisorPhaseV1::UnitsStopped);
+    assert!(!journal.supervisor_failed);
     assert_eq!(journal.security_directories.len(), 1);
     let intent = &journal.security_directories[0];
     assert!(!intent.preexisted);
@@ -1679,10 +1836,175 @@ fn crash_after_mkdir_before_observation_recovers_from_durable_absence_intent() {
     assert!(runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
 
     runtime.crash_name = None;
+    runtime.events.clear();
     SecurityEngine::new(&mut runtime).recover().unwrap();
+    assert_eq!(
+        runtime
+            .events
+            .iter()
+            .filter(|event| event.starts_with("directory:plan:"))
+            .count(),
+        howy_common::provisioning::REQUIRED_SECURITY_DIRECTORIES.len() - 1
+    );
+    assert_eq!(
+        runtime
+            .events
+            .iter()
+            .filter(|event| event.starts_with("directory:ensure:"))
+            .count(),
+        howy_common::provisioning::REQUIRED_SECURITY_DIRECTORIES.len()
+    );
+    assert!(
+        runtime
+            .events
+            .iter()
+            .any(|event| event == "directories:verify")
+    );
+    assert!(
+        runtime
+            .events
+            .iter()
+            .any(|event| event == "directories:rollback")
+    );
     assert!(runtime.directories.is_empty());
     assert!(!runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
     assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+}
+
+#[test]
+fn failed_first_directory_admission_recovers_without_retrying_unrecorded_directory() {
+    let mut runtime = FakeRuntime::fresh();
+    runtime.service.unit_file_state = UnitFileState::Disabled;
+    runtime.socket.unit_file_state = UnitFileState::Static;
+    let service_before = runtime.service.clone();
+    let socket_before = runtime.socket.clone();
+    runtime.next_inode += 1;
+    runtime.directories.insert(
+        howy_common::provisioning::HOWY_CONFIG_DIRECTORY.into(),
+        (runtime.next_inode, 0o755),
+    );
+
+    assert!(matches!(
+        provision(&mut runtime),
+        Err(SecurityError::Uncertain(_))
+    ));
+    let journal = SupervisorJournalV1::parse(&runtime.files[SECURITY_JOURNAL_PATH].bytes).unwrap();
+    assert_eq!(journal.phase, SupervisorPhaseV1::UnitsStopped);
+    assert!(journal.supervisor_failed);
+    assert!(journal.security_directories.is_empty());
+    assert!(journal.atomic_writes.is_empty());
+    assert!(runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
+
+    runtime.events.clear();
+    SecurityEngine::new(&mut runtime).recover().unwrap();
+
+    assert!(runtime.events.iter().all(|event| {
+        !event.starts_with("directory:plan:") && !event.starts_with("directory:ensure:")
+    }));
+    assert!(
+        runtime
+            .events
+            .iter()
+            .any(|event| event == "directories:verify")
+    );
+    assert!(
+        runtime
+            .events
+            .iter()
+            .any(|event| event == "directories:rollback")
+    );
+    assert_eq!(runtime.service, service_before);
+    assert_eq!(runtime.socket, socket_before);
+    assert_eq!(
+        runtime.directories[howy_common::provisioning::HOWY_CONFIG_DIRECTORY].1,
+        0o755
+    );
+    assert!(!runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
+    assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+}
+
+#[test]
+fn failed_supervisor_rolls_back_only_recorded_created_directories() {
+    let mut runtime = FakeRuntime::fresh();
+    runtime.fail_after = Some("directory-observation-synced");
+
+    assert!(matches!(
+        provision(&mut runtime),
+        Err(SecurityError::Uncertain(_))
+    ));
+    let journal = SupervisorJournalV1::parse(&runtime.files[SECURITY_JOURNAL_PATH].bytes).unwrap();
+    assert_eq!(journal.phase, SupervisorPhaseV1::UnitsStopped);
+    assert!(journal.supervisor_failed);
+    assert_eq!(journal.security_directories.len(), 1);
+    assert!(journal.security_directories[0].observed_directory.is_some());
+    let recorded_path = journal.security_directories[0].path.clone();
+    assert!(runtime.directories.contains_key(&recorded_path));
+
+    runtime.events.clear();
+    SecurityEngine::new(&mut runtime).recover().unwrap();
+
+    assert!(runtime.events.iter().all(|event| {
+        !event.starts_with("directory:plan:") && !event.starts_with("directory:ensure:")
+    }));
+    let verified = runtime
+        .events
+        .iter()
+        .position(|event| event == "directories:verify")
+        .unwrap();
+    let rolled_back = runtime
+        .events
+        .iter()
+        .position(|event| event == "directories:rollback")
+        .unwrap();
+    assert!(verified < rolled_back);
+    assert!(!runtime.directories.contains_key(&recorded_path));
+    assert!(runtime.directories.is_empty());
+    assert!(!runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
+    assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+}
+
+#[test]
+fn inconsistent_failed_recorded_directory_remains_uncertain_and_guarded() {
+    let mut runtime = FakeRuntime::fresh();
+    runtime.fail_after = Some("directory-created-before-observation");
+
+    assert!(matches!(
+        provision(&mut runtime),
+        Err(SecurityError::Uncertain(_))
+    ));
+    let journal = SupervisorJournalV1::parse(&runtime.files[SECURITY_JOURNAL_PATH].bytes).unwrap();
+    assert!(journal.supervisor_failed);
+    assert_eq!(journal.security_directories.len(), 1);
+    assert!(journal.security_directories[0].observed_directory.is_none());
+    let recorded_path = journal.security_directories[0].path.clone();
+    runtime.directories.get_mut(&recorded_path).unwrap().1 = 0o755;
+
+    runtime.events.clear();
+    assert!(matches!(
+        SecurityEngine::new(&mut runtime).recover(),
+        Err(SecurityError::Uncertain(_))
+    ));
+    assert!(
+        runtime
+            .events
+            .iter()
+            .all(|event| !event.starts_with("directory:plan:"))
+    );
+    assert!(
+        runtime
+            .events
+            .iter()
+            .any(|event| event == &format!("directory:ensure:{recorded_path}"))
+    );
+    assert!(runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
+    assert!(runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+    let retained = SupervisorJournalV1::parse(&runtime.files[SECURITY_JOURNAL_PATH].bytes).unwrap();
+    assert!(retained.supervisor_failed);
+    assert!(
+        retained.security_directories[0]
+            .observed_directory
+            .is_none()
+    );
 }
 
 #[test]
@@ -1723,7 +2045,12 @@ fn provision_then_enable_reruns_readiness_patches_one_token_and_validates_status
     assert_eq!(enabled.len(), disabled.len() + 1);
     let config: HowyConfig = toml::from_str(std::str::from_utf8(enabled).unwrap()).unwrap();
     assert!(!config.core.disabled);
+    assert_eq!(
+        config.presence.mode,
+        howy_common::config::PresenceMode::Confirm
+    );
     assert_eq!(runtime.receipt().state, ReceiptState::Enabled);
+    assert!(runtime.status().unwrap().prompt_required);
     assert_eq!(
         runtime
             .events
@@ -1755,6 +2082,51 @@ fn provision_then_enable_reruns_readiness_patches_one_token_and_validates_status
 }
 
 #[test]
+fn enable_and_recovery_accept_socket_active_running_through_status_validation() {
+    let mut runtime = FakeRuntime::fresh();
+    provision(&mut runtime).unwrap();
+    runtime.socket_running_on_start = true;
+    runtime.fail_after = Some("status");
+
+    assert!(matches!(
+        SecurityEngine::new(&mut runtime).enable(),
+        Err(SecurityError::Uncertain(_))
+    ));
+    let first_service_start = runtime
+        .events
+        .iter()
+        .rposition(|event| event == "start:Service")
+        .unwrap();
+    let first_status = runtime
+        .events
+        .iter()
+        .rposition(|event| event == "security-info")
+        .unwrap();
+    assert!(first_service_start < first_status);
+    assert!(runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
+    assert!(runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+
+    runtime.events.clear();
+    SecurityEngine::new(&mut runtime).recover().unwrap();
+
+    assert_eq!(runtime.socket.active_state, UnitActiveState::Active);
+    assert_eq!(runtime.socket.sub_state, UnitSubState::Running);
+    let recovered_service_start = runtime
+        .events
+        .iter()
+        .rposition(|event| event == "start:Service")
+        .unwrap();
+    let recovered_status = runtime
+        .events
+        .iter()
+        .rposition(|event| event == "security-info")
+        .unwrap();
+    assert!(recovered_service_start < recovered_status);
+    assert!(!runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
+    assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+}
+
+#[test]
 fn activation_rejects_every_malformed_or_mismatched_public_status() {
     let mut prepared = FakeRuntime::fresh();
     provision(&mut prepared).unwrap();
@@ -1775,6 +2147,7 @@ fn activation_rejects_every_malformed_or_mismatched_public_status() {
     assert!(matches!(
         SecurityEngine::new(&mut mode0).provision(ProvisionRequest {
             mode: ProvisionMode::Plaintext,
+            presence: ProvisionPresence::Off,
             with_key: KeySelection::Auto,
             adopt_existing: false,
             confirmed: true,
@@ -1825,6 +2198,61 @@ fn disabled_reprovision_is_idempotent_strong_reverification_without_replacement(
             .count(),
         readiness_before + 2
     );
+}
+
+#[test]
+fn mode1_reprovision_requires_the_exact_receipted_presence_before_mutation() {
+    fn assert_mismatch_refused_without_mutation(runtime: &mut FakeRuntime) {
+        let files_before: BTreeMap<_, _> = runtime
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.bytes.clone()))
+            .collect();
+        let directories_before = runtime.directories.clone();
+        let transactions_before = runtime.transaction_id_counter;
+        runtime.events.clear();
+
+        let result = provision_with_presence(runtime, ProvisionPresence::Confirm);
+
+        assert!(matches!(result, Err(SecurityError::Refused(_))));
+        assert_eq!(runtime.transaction_id_counter, transactions_before);
+        assert_eq!(runtime.directories, directories_before);
+        assert_eq!(
+            runtime
+                .files
+                .iter()
+                .map(|(path, file)| (path.clone(), file.bytes.clone()))
+                .collect::<BTreeMap<_, _>>(),
+            files_before
+        );
+        assert!(runtime.events.iter().all(|event| {
+            event != "guard:create"
+                && event != "journal:sync"
+                && event != "rng-mlock"
+                && event != "systemd-creds"
+                && !event.starts_with("directory:ensure:")
+        }));
+    }
+
+    let mut runtime = FakeRuntime::fresh();
+    provision_with_presence(&mut runtime, ProvisionPresence::Off).unwrap();
+    assert!(
+        provision_with_presence(&mut runtime, ProvisionPresence::Off)
+            .unwrap()
+            .messages[0]
+            .contains("reverified")
+    );
+    let mut disabled_mismatch = runtime.clone();
+    assert_mismatch_refused_without_mutation(&mut disabled_mismatch);
+
+    SecurityEngine::new(&mut runtime).enable().unwrap();
+    assert!(
+        provision_with_presence(&mut runtime, ProvisionPresence::Off)
+            .unwrap()
+            .messages[0]
+            .contains("strongly reverified")
+    );
+    assert_mismatch_refused_without_mutation(&mut runtime);
 }
 
 #[test]
@@ -1917,12 +2345,17 @@ fn cleanup_refuses_path_replacement_between_admission_and_unlink() {
 #[test]
 fn explicit_mode0_is_transactional_keyless_and_preserves_encrypted_artifact() {
     let mut runtime = FakeRuntime::fresh();
+    let mut prior = HowyConfig::legacy_defaults();
+    prior.presence.mode = howy_common::config::PresenceMode::Confirm;
+    let prior = toml::to_string_pretty(&prior).unwrap();
+    runtime.put(howy_common::paths::CONFIG_FILE, prior.as_bytes(), 0o600);
     runtime.put(MODE1_CREDENTIAL_PATH, &host_envelope_text(), 0o600);
     runtime.put(MODE1_DROPIN_PATH, MODE1_DROPIN_BYTES, 0o600);
     let artifact_before = runtime.files[MODE1_CREDENTIAL_PATH].bytes.clone();
     let outcome = SecurityEngine::new(&mut runtime)
         .provision(ProvisionRequest {
             mode: ProvisionMode::Plaintext,
+            presence: ProvisionPresence::Off,
             with_key: KeySelection::Auto,
             adopt_existing: false,
             confirmed: true,
@@ -1940,6 +2373,7 @@ fn explicit_mode0_is_transactional_keyless_and_preserves_encrypted_artifact() {
         EmbeddingSecurityMode::Plaintext
     );
     assert!(!config.core.disabled);
+    assert_eq!(config.presence.mode, howy_common::config::PresenceMode::Off);
     assert!(runtime.commands.is_empty());
 }
 
@@ -1951,6 +2385,7 @@ fn explicit_mode0_refuses_unsafe_config_metadata_before_journaling() {
 
     let result = SecurityEngine::new(&mut runtime).provision(ProvisionRequest {
         mode: ProvisionMode::Plaintext,
+        presence: ProvisionPresence::Off,
         with_key: KeySelection::Auto,
         adopt_existing: false,
         confirmed: true,
@@ -2113,6 +2548,7 @@ fn recovery_rejects_invocation_presence_mismatches_for_every_journal_schema() {
         SecurityEngine::new(&mut mode0_runtime)
             .provision(ProvisionRequest {
                 mode: ProvisionMode::Plaintext,
+                presence: ProvisionPresence::Off,
                 with_key: KeySelection::Auto,
                 adopt_existing: false,
                 confirmed: true,
@@ -2155,6 +2591,7 @@ fn existing_artifact_requires_explicit_adoption() {
 
     let result = SecurityEngine::new(&mut runtime).provision(ProvisionRequest {
         mode: ProvisionMode::CachedAead,
+        presence: ProvisionPresence::Confirm,
         with_key: KeySelection::Host,
         adopt_existing: true,
         confirmed: true,
@@ -2182,6 +2619,7 @@ fn different_mode_artifact_never_bypasses_explicit_adoption_and_readiness() {
     SecurityEngine::new(&mut runtime)
         .provision(ProvisionRequest {
             mode: ProvisionMode::CachedAead,
+            presence: ProvisionPresence::Confirm,
             with_key: KeySelection::Host,
             adopt_existing: true,
             confirmed: true,
@@ -2225,6 +2663,7 @@ fn different_mode_receipt_alone_is_not_live_binding_or_implicit_adoption() {
     SecurityEngine::new(&mut runtime)
         .provision(ProvisionRequest {
             mode: ProvisionMode::CachedAead,
+            presence: ProvisionPresence::Confirm,
             with_key: KeySelection::Host,
             adopt_existing: true,
             confirmed: true,
@@ -2356,6 +2795,7 @@ fn every_mode0_boundary_crash_recovers_without_deleting_encrypted_data() {
     SecurityEngine::new(&mut baseline)
         .provision(ProvisionRequest {
             mode: ProvisionMode::Plaintext,
+            presence: ProvisionPresence::Off,
             with_key: KeySelection::Auto,
             adopt_existing: false,
             confirmed: true,
@@ -2368,6 +2808,7 @@ fn every_mode0_boundary_crash_recovers_without_deleting_encrypted_data() {
         runtime.crash_at = Some(crash_at);
         let result = SecurityEngine::new(&mut runtime).provision(ProvisionRequest {
             mode: ProvisionMode::Plaintext,
+            presence: ProvisionPresence::Off,
             with_key: KeySelection::Auto,
             adopt_existing: false,
             confirmed: true,
@@ -2536,6 +2977,7 @@ fn activation_and_restore_failures_always_reguard_stop_and_retain_the_journal() 
     assert!(matches!(
         SecurityEngine::new(&mut mode0).provision(ProvisionRequest {
             mode: ProvisionMode::Plaintext,
+            presence: ProvisionPresence::Off,
             with_key: KeySelection::Auto,
             adopt_existing: false,
             confirmed: true,
@@ -2585,6 +3027,7 @@ fn terminal_unit_restore_journals_recover_idempotently_before_removal() {
     assert!(matches!(
         SecurityEngine::new(&mut mode0).provision(ProvisionRequest {
             mode: ProvisionMode::Plaintext,
+            presence: ProvisionPresence::Off,
             with_key: KeySelection::Auto,
             adopt_existing: false,
             confirmed: true,
@@ -2805,6 +3248,7 @@ fn active_reverification_and_mode0_reject_an_old_daemon_invocation() {
     assert!(matches!(
         SecurityEngine::new(&mut mode0).provision(ProvisionRequest {
             mode: ProvisionMode::Plaintext,
+            presence: ProvisionPresence::Off,
             with_key: KeySelection::Auto,
             adopt_existing: false,
             confirmed: true,
@@ -2912,6 +3356,52 @@ fn recovery_revalidates_disabled_artifacts_after_rerunning_readiness() {
     );
     assert!(runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
     assert!(runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+}
+
+#[test]
+fn mode1_off_disabled_and_enabled_recovery_revalidate_exact_prompt_status() {
+    let mut disabled = FakeRuntime::fresh();
+    disabled.fail_after = Some("disabled-units-restored");
+    assert!(matches!(
+        provision_with_presence(&mut disabled, ProvisionPresence::Off),
+        Err(SecurityError::Uncertain(_))
+    ));
+    SecurityEngine::new(&mut disabled).recover().unwrap();
+    let disabled_config: HowyConfig = toml::from_str(
+        std::str::from_utf8(&disabled.files[howy_common::paths::CONFIG_FILE].bytes).unwrap(),
+    )
+    .unwrap();
+    assert!(disabled_config.core.disabled);
+    assert_eq!(
+        disabled_config.presence.mode,
+        howy_common::config::PresenceMode::Off
+    );
+    assert_eq!(disabled.receipt().state, ReceiptState::ProvisionedDisabled);
+
+    let mut activation = FakeRuntime::fresh();
+    provision_with_presence(&mut activation, ProvisionPresence::Off).unwrap();
+    activation.fail_after = Some("status");
+    assert!(matches!(
+        SecurityEngine::new(&mut activation).enable(),
+        Err(SecurityError::Uncertain(_))
+    ));
+    let mut mismatched = activation.clone();
+
+    SecurityEngine::new(&mut activation).recover().unwrap();
+    assert_eq!(activation.receipt().state, ReceiptState::Enabled);
+    assert!(!activation.status().unwrap().prompt_required);
+
+    mismatched.root_prompt_override = Some(true);
+    assert!(matches!(
+        SecurityEngine::new(&mut mismatched).recover(),
+        Err(SecurityError::Uncertain(_))
+    ));
+    assert!(mismatched.files.contains_key(SECURITY_JOURNAL_PATH));
+    assert!(
+        mismatched
+            .files
+            .contains_key(SECURITY_TRANSACTION_GUARD_PATH)
+    );
 }
 
 #[test]
@@ -3157,6 +3647,7 @@ fn mode0_clears_credentials_without_parsing_or_deleting_a_corrupt_mode1_artifact
     SecurityEngine::new(&mut runtime)
         .provision(ProvisionRequest {
             mode: ProvisionMode::Plaintext,
+            presence: ProvisionPresence::Off,
             with_key: KeySelection::Auto,
             adopt_existing: false,
             confirmed: true,
@@ -3193,6 +3684,26 @@ fn missing_host_secret_refuses_only_after_durable_guard_and_before_rng_or_creds(
     assert!(!runtime.events.iter().any(|event| event == "systemd-creds"));
     assert!(runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
     assert!(runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+}
+
+#[test]
+fn unsupported_unit_refusal_reports_complete_nonsecret_state() {
+    let mut runtime = FakeRuntime::fresh();
+    runtime.socket.load_state = UnitLoadState::NotFound;
+    runtime.socket.active_state = UnitActiveState::Active;
+    runtime.socket.sub_state = UnitSubState::Other;
+    runtime.socket.unit_file_state = UnitFileState::Disabled;
+    runtime.socket.has_queued_job = false;
+
+    let message = match provision(&mut runtime) {
+        Err(SecurityError::Refused(message)) => message,
+        other => panic!("expected unsupported-unit refusal, got {other:?}"),
+    };
+    assert_eq!(
+        message,
+        "required Socket unit state is unsupported: load=NotFound, active=Active, sub=Other, file=Disabled, queued=false"
+    );
+    assert!(!message.contains('/'));
 }
 
 #[test]

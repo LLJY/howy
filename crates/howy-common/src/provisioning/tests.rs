@@ -1920,6 +1920,92 @@ fn unit_admissibility_settles_refuses_and_never_changes_enablement() {
             mutate_enablement: false,
         }
     );
+    let mut running_socket = socket;
+    running_socket.sub_state = UnitSubState::Running;
+    assert_eq!(
+        classify_unit_admissibility(running_socket),
+        UnitAdmissibility::Admissible {
+            rollback_target: StableRollbackTarget::ActiveListening,
+            mutate_enablement: false,
+        }
+    );
+    let stable_running_socket = StableUnitState {
+        unit_kind: UnitKind::Socket,
+        load_state: UnitLoadState::Loaded,
+        active_state: UnitActiveState::Active,
+        sub_state: UnitSubState::Running,
+        unit_file_state: UnitFileState::Enabled,
+    };
+    assert_eq!(
+        stable_running_socket.rollback_target(),
+        Some(StableRollbackTarget::ActiveListening)
+    );
+    let stable_inactive_service = StableUnitState {
+        unit_kind: UnitKind::Service,
+        load_state: UnitLoadState::Loaded,
+        active_state: UnitActiveState::Inactive,
+        sub_state: UnitSubState::Dead,
+        unit_file_state: UnitFileState::Enabled,
+    };
+    let (_, retained_socket) =
+        disabled_post_provision_unit_targets(&stable_inactive_service, &stable_running_socket)
+            .unwrap();
+    assert_eq!(retained_socket, stable_running_socket);
+    assert_eq!(retained_socket.sub_state, UnitSubState::Running);
+    assert_eq!(
+        serde_json::to_value(&retained_socket).unwrap()["sub_state"],
+        "running"
+    );
+
+    let mut listening_service = socket;
+    listening_service.unit_kind = UnitKind::Service;
+    assert_eq!(
+        classify_unit_admissibility(listening_service),
+        UnitAdmissibility::RefuseUnstable
+    );
+    let stable_listening_service = StableUnitState {
+        unit_kind: UnitKind::Service,
+        load_state: UnitLoadState::Loaded,
+        active_state: UnitActiveState::Active,
+        sub_state: UnitSubState::Listening,
+        unit_file_state: UnitFileState::Enabled,
+    };
+    assert_eq!(stable_listening_service.rollback_target(), None);
+
+    let mut unsupported_socket = socket;
+    unsupported_socket.sub_state = UnitSubState::Other;
+    assert_eq!(
+        classify_unit_admissibility(unsupported_socket),
+        UnitAdmissibility::RefuseUnstable
+    );
+    let stable_unsupported_socket = StableUnitState {
+        unit_kind: UnitKind::Socket,
+        load_state: UnitLoadState::Loaded,
+        active_state: UnitActiveState::Active,
+        sub_state: UnitSubState::Other,
+        unit_file_state: UnitFileState::Enabled,
+    };
+    assert_eq!(stable_unsupported_socket.rollback_target(), None);
+    let mut transitioning_socket = socket;
+    transitioning_socket.active_state = UnitActiveState::Activating;
+    transitioning_socket.sub_state = UnitSubState::Start;
+    assert_eq!(
+        classify_unit_admissibility(transitioning_socket),
+        UnitAdmissibility::Settle
+    );
+    let stable_transitioning_socket = StableUnitState {
+        unit_kind: UnitKind::Socket,
+        load_state: UnitLoadState::Loaded,
+        active_state: UnitActiveState::Activating,
+        sub_state: UnitSubState::Start,
+        unit_file_state: UnitFileState::Enabled,
+    };
+    assert_eq!(stable_transitioning_socket.rollback_target(), None);
+    transitioning_socket.active_state = UnitActiveState::Active;
+    assert_eq!(
+        classify_unit_admissibility(transitioning_socket),
+        UnitAdmissibility::RefuseUnstable
+    );
     assert_eq!(
         classify_unit_admissibility(observation(
             UnitActiveState::Activating,
