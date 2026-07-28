@@ -14,6 +14,7 @@ PACMAN=/usr/bin/pacman
 UNSHARE=/usr/bin/unshare
 CHROOT=/usr/bin/chroot
 BSDTAR=/usr/bin/bsdtar
+EXPECTED_RELEASE_N_HOOK_HASH=80046b620f1af8b465327a97e44fd1de6ef707c385feaee66a04d65753a505fc
 
 fail() {
     printf 'ALPM FAIL: %s\n' "$*" >&2
@@ -40,6 +41,33 @@ cleanup() {
 trap cleanup EXIT INT TERM
 PACKAGES="${WORK}/packages"
 mkdir -p "${PACKAGES}"
+RELEASE_N_HOOK_FIXTURE="${WORK}/05-howy-config-stash.release-n.hook"
+
+write_release_n_hook_fixture() {
+    local destination="$1"
+
+    cat > "${destination}" <<'EOF'
+[Trigger]
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = howy-cpu-git
+Target = howy-rocm-git
+Target = howy-cuda-git
+
+[Action]
+Description = Stashing the exact Howy configuration before removal or upgrade
+When = PreTransaction
+Exec = /usr/lib/howy/howy-config-bridge stash-release-n
+AbortOnFail
+EOF
+    chmod 0644 "${destination}"
+}
+
+write_release_n_hook_fixture "${RELEASE_N_HOOK_FIXTURE}"
+[ "$(sha256sum "${RELEASE_N_HOOK_FIXTURE}" | cut -d' ' -f1)" \
+    = "${EXPECTED_RELEASE_N_HOOK_HASH}" ] \
+    || fail "generated release-N hook differs from the pinned historical fixture"
 
 copy_runtime_file() {
     local source="$1"
@@ -140,8 +168,11 @@ build_release_n() {
     install -m 0644 packaging/config-release-n-legacy.toml "${tree}/etc/howy/config.toml"
     install -m 0644 packaging/config.bootstrap.toml "${tree}/usr/share/howy/config.bootstrap.toml"
     install -m 0755 "${BRIDGE_BINARY}" "${tree}/usr/lib/howy/howy-config-bridge"
-    install -m 0644 packaging/05-howy-config-stash.hook \
+    install -m 0644 "${RELEASE_N_HOOK_FIXTURE}" \
         "${tree}/usr/share/libalpm/hooks/05-howy-config-stash.hook"
+    cmp -s "${RELEASE_N_HOOK_FIXTURE}" \
+        "${tree}/usr/share/libalpm/hooks/05-howy-config-stash.hook" \
+        || fail "${name}: release-N hook fixture changed while building"
     install -m 0644 systemd/howy.service "${tree}/usr/lib/systemd/system/howy.service"
     install -m 0644 systemd/howy.socket "${tree}/usr/lib/systemd/system/howy.socket"
     install -m 0644 howy.install "${tree}/.INSTALL"
@@ -160,6 +191,9 @@ build_nplus1() {
     install -m 0755 "${BRIDGE_BINARY}" "${tree}/usr/lib/howy/howy-config-bridge"
     install -m 0644 packaging/05-howy-config-stash.hook \
         "${tree}/usr/share/libalpm/hooks/05-howy-config-stash.hook"
+    cmp -s packaging/05-howy-config-stash.hook \
+        "${tree}/usr/share/libalpm/hooks/05-howy-config-stash.hook" \
+        || fail "${name}: current hook fixture changed while building"
     install -m 0644 systemd/howy.service "${tree}/usr/lib/systemd/system/howy.service"
     install -m 0644 systemd/howy.socket "${tree}/usr/lib/systemd/system/howy.socket"
     cat > "${tree}/.INSTALL" <<'EOF'
@@ -234,13 +268,12 @@ EOF
 sync_hookdir() {
     local case_dir="$1"
     local root="${case_dir}/root"
+    # Each generation is compared with its own source fixture before archiving;
+    # transactions consume the exact hook bytes installed by that package.
     rm -f -- "${case_dir}/hooks/05-howy-config-stash.hook"
     if [ -f "${root}/usr/share/libalpm/hooks/05-howy-config-stash.hook" ]; then
         cp -- "${root}/usr/share/libalpm/hooks/05-howy-config-stash.hook" \
             "${case_dir}/hooks/05-howy-config-stash.hook"
-        cmp -s packaging/05-howy-config-stash.hook \
-            "${case_dir}/hooks/05-howy-config-stash.hook" \
-            || fail "${case_dir}: hookdir copy is not the exact installed release-N hook"
     fi
 }
 
@@ -544,8 +577,9 @@ for state in modified unmodified absent; do
     assert_marker "${case_dir}"
 done
 
-# 10. N-1→N+1 has no release-N hook/manifest. The simulated N+1 scriptlet
-# explicitly refuses assurance and cannot consume a nonexistent generation.
+# 10. N-1→N+1 has no release-N hook/manifest. A scriptlet nonzero does not
+# abort pacman, so the simulated N+1 may install while marker/manifest assurance
+# remains absent and no nonexistent generation can be consumed.
 case_dir=$(new_root skipped-n)
 transaction "${case_dir}" predecessor -U "${CPU_OLD}"
 assert_success skipped-predecessor
@@ -553,6 +587,7 @@ printf 'administrator=skipped\n' > "${case_dir}/expected-config"
 cp "${case_dir}/expected-config" "${case_dir}/root/etc/howy/config.toml"
 chmod 0640 "${case_dir}/root/etc/howy/config.toml"
 transaction "${case_dir}" skipped-upgrade -U "${CPU_N1}"
+assert_success skipped-upgrade
 [ "$(package_version "${case_dir}" howy-cpu-git)" = 0.2.0-1 ] \
     || fail "skipped-N simulated package was not extracted"
 grep -q 'explicitly refuses skipped-N assurance' "${case_dir}/skipped-upgrade.log" \

@@ -1,6 +1,6 @@
-pkgbase = howy-git
+pkgbase = howy
 	pkgdesc = Linux face authentication daemon — a howdy replacement
-	pkgver = 0.1.0.r26.g2dfe39e
+	pkgver = 2.0.0
 	pkgrel = 1
 	url = https://github.com/LLJY/howy
 	arch = x86_64
@@ -11,10 +11,10 @@ pkgbase = howy-git
 	makedepends = onnxruntime-cpu
 	makedepends = protobuf
 	makedepends = systemd>=261
-	source = howy-git::git+https://github.com/LLJY/howy.git
+	source = howy::git+https://github.com/LLJY/howy.git#commit=0a431e42d9dc166341a063c1642bf82520722c3b
 	sha256sums = SKIP
 
-pkgname = howy-cpu-git
+pkgname = howy-cpu
 	pkgdesc = Linux face authentication daemon using ONNX Runtime CPU backend
 	install = howy.install
 	depends = onnxruntime-cpu
@@ -26,13 +26,21 @@ pkgname = howy-cpu-git
 	optdepends = uv: run the bundled howy-enroll helper
 	optdepends = v4l-utils: inspect and tune camera controls
 	optdepends = tpm2-tss: TPM-backed systemd credential provisioning
-	provides = howy=0.1.0.r26.g2dfe39e
+	provides = howy=2.0.0
+	provides = howdy=2.0.0
 	conflicts = howy
+	conflicts = howy-git
+	conflicts = howy-cpu-git
 	conflicts = howy-rocm-git
 	conflicts = howy-cuda-git
+	conflicts = howy-rocm-mode0
+	conflicts = howdy
+	conflicts = howdy-git
+	conflicts = howy-rocm
+	conflicts = howy-cuda
 	backup = etc/howy/config.toml
 
-pkgname = howy-rocm-git
+pkgname = howy-rocm
 	pkgdesc = Linux face authentication daemon using ONNX Runtime ROCm backend
 	install = howy.install
 	depends = onnxruntime-rocm
@@ -44,13 +52,21 @@ pkgname = howy-rocm-git
 	optdepends = uv: run the bundled howy-enroll helper
 	optdepends = v4l-utils: inspect and tune camera controls
 	optdepends = tpm2-tss: TPM-backed systemd credential provisioning
-	provides = howy=0.1.0.r26.g2dfe39e
+	provides = howy=2.0.0
+	provides = howdy=2.0.0
 	conflicts = howy
+	conflicts = howy-git
 	conflicts = howy-cpu-git
+	conflicts = howy-rocm-git
 	conflicts = howy-cuda-git
+	conflicts = howy-rocm-mode0
+	conflicts = howdy
+	conflicts = howdy-git
+	conflicts = howy-cpu
+	conflicts = howy-cuda
 	backup = etc/howy/config.toml
 
-pkgname = howy-cuda-git
+pkgname = howy-cuda
 	pkgdesc = Linux face authentication daemon using ONNX Runtime CUDA backend
 	install = howy.install
 	depends = onnxruntime-cuda
@@ -62,8 +78,16 @@ pkgname = howy-cuda-git
 	optdepends = uv: run the bundled howy-enroll helper
 	optdepends = v4l-utils: inspect and tune camera controls
 	optdepends = tpm2-tss: TPM-backed systemd credential provisioning
-	provides = howy=0.1.0.r26.g2dfe39e
+	provides = howy=2.0.0
+	provides = howdy=2.0.0
 	conflicts = howy
+	conflicts = howy-git
 	conflicts = howy-cpu-git
 	conflicts = howy-rocm-git
+	conflicts = howy-cuda-git
+	conflicts = howy-rocm-mode0
+	conflicts = howdy
+	conflicts = howdy-git
+	conflicts = howy-cpu
+	conflicts = howy-rocm
 	backup = etc/howy/config.toml

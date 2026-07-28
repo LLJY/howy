@@ -1,0 +1,12 @@
+[Trigger]
+Operation = Remove
+Type = Package
+Target = howy-cpu
+Target = howy-rocm
+Target = howy-cuda
+
+[Action]
+Description = Stopping and disabling Howy before package removal
+When = PreTransaction
+Exec = /usr/lib/howy/howy-v2-remove-prepare
+AbortOnFail

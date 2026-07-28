@@ -1,0 +1,886 @@
+#!/bin/bash
+
+set -euo pipefail
+umask 077
+export LC_ALL=C
+
+readonly UPDATE_FORMAT='howy-v2-update-v1'
+readonly TARGET_VERSION='2.0.0-1'
+readonly RELEASE_N_VERSION='0.1.0.r26.g2dfe39e-1'
+readonly CANDIDATE_MARKER_SHA256='a64bd401c902bff59ef60e5364b16ab148a1642fdd5bde60824586a9520ca246'
+readonly MAX_ARCHIVE_BYTES=4294967296
+readonly MAX_CONTROL_BYTES=1048576
+readonly CONFIG_PATH='/etc/howy/config.toml'
+readonly RECEIPT_PATH='/var/lib/howy/security-state/receipt-v1.json'
+readonly MARKER_PATH='/var/lib/howy-package-bootstrap.complete'
+readonly BACKUP_PATH='/var/lib/howy/v2-update-backup-v1'
+readonly SENTINEL_PATH='/run/howy-v2-update-v1.prepared'
+
+ARCHIVE_PKGNAME=''
+ARCHIVE_PKGBASE=''
+ARCHIVE_PKGVER=''
+ARCHIVE_ARCH=''
+TRANSITION_KIND=''
+SOURCE_PACKAGE=''
+SOURCE_VERSION=''
+ARCHIVE_PATH=''
+ARCHIVE_SHA256=''
+ARCHIVE_SIZE=''
+SERVICE_ENABLED=''
+SERVICE_ACTIVE=''
+SOCKET_ENABLED=''
+SOCKET_ACTIVE=''
+RECEIPT_EXISTED=0
+MARKER_EXISTED=0
+SENTINEL_CREATED=0
+
+refuse() {
+    printf 'howy-v2-update: refusal: %s\n' "$*" >&2
+    return 1
+}
+
+parse_pkginfo_text() {
+    local text="$1"
+    local line value
+    local pkgname_count=0 pkgbase_count=0 pkgver_count=0 arch_count=0
+
+    ARCHIVE_PKGNAME=''
+    ARCHIVE_PKGBASE=''
+    ARCHIVE_PKGVER=''
+    ARCHIVE_ARCH=''
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        case "${line}" in
+            'pkgname = '*)
+                value=${line#pkgname = }
+                pkgname_count=$((pkgname_count + 1))
+                ARCHIVE_PKGNAME=${value}
+                ;;
+            'pkgbase = '*)
+                value=${line#pkgbase = }
+                pkgbase_count=$((pkgbase_count + 1))
+                ARCHIVE_PKGBASE=${value}
+                ;;
+            'pkgver = '*)
+                value=${line#pkgver = }
+                pkgver_count=$((pkgver_count + 1))
+                ARCHIVE_PKGVER=${value}
+                ;;
+            'arch = '*)
+                value=${line#arch = }
+                arch_count=$((arch_count + 1))
+                ARCHIVE_ARCH=${value}
+                ;;
+        esac
+    done <<< "${text}"
+
+    [[ "${pkgname_count}:${pkgbase_count}:${pkgver_count}:${arch_count}" == '1:1:1:1' ]] \
+        || return 1
+    case "${ARCHIVE_PKGNAME}" in
+        howy-cpu|howy-rocm|howy-cuda) ;;
+        *) return 1 ;;
+    esac
+    [[ "${ARCHIVE_PKGBASE}" == howy ]] || return 1
+    [[ "${ARCHIVE_PKGVER}" == "${TARGET_VERSION}" ]] || return 1
+    [[ "${ARCHIVE_ARCH}" == x86_64 ]] || return 1
+}
+
+transition_allowed() {
+    local source_package="$1"
+    local source_version="$2"
+    local target_package="$3"
+
+    TRANSITION_KIND=''
+    case "${source_package}" in
+        howy-cpu-git)
+            [[ "${source_version}" == "${RELEASE_N_VERSION}" \
+                && "${target_package}" == howy-cpu ]] || return 1
+            TRANSITION_KIND=release-n
+            ;;
+        howy-rocm-git)
+            [[ "${source_version}" == "${RELEASE_N_VERSION}" \
+                && "${target_package}" == howy-rocm ]] || return 1
+            TRANSITION_KIND=release-n
+            ;;
+        howy-cuda-git)
+            [[ "${source_version}" == "${RELEASE_N_VERSION}" \
+                && "${target_package}" == howy-cuda ]] || return 1
+            TRANSITION_KIND=release-n
+            ;;
+        howy-rocm-mode0)
+            case "${source_version}" in
+                0.1.0.r27.g0b76fa2-4|0.1.0.r27.g0b76fa2-5|0.1.0.r27.g0b76fa2-6|0.1.0.r27.g0b76fa2-7) ;;
+                *) return 1 ;;
+            esac
+            [[ "${target_package}" == howy-rocm ]] || return 1
+            TRANSITION_KIND=candidate
+            ;;
+        howy-cpu|howy-rocm|howy-cuda)
+            [[ "${source_package}" == "${target_package}" \
+                && "${source_version}" == "${TARGET_VERSION}" ]] \
+                || return 1
+            TRANSITION_KIND=stable
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+candidate_marker_bytes_and_hash_are_exact() {
+    local path="$1"
+    local digest_output digest
+
+    [[ -f "${path}" && ! -L "${path}" ]] || return 1
+    /usr/bin/cmp -s -- "${path}" <(
+        printf '%s\n' \
+            'schema=howy-package-capability-v1' \
+            'package=howy-rocm-mode0' \
+            'source_commit=0b76fa23ad3883ccfa8edd38210766f97cdbb71a' \
+            'supported_modes=0,1'
+    ) || return 1
+    digest_output=$(/usr/bin/sha256sum -- "${path}") || return 1
+    digest=${digest_output%% *}
+    [[ "${digest}" == "${CANDIDATE_MARKER_SHA256}" ]]
+}
+
+candidate_marker_is_exact() {
+    local path="$1"
+    local metadata
+
+    [[ -f "${path}" && ! -L "${path}" ]] || return 1
+    metadata=$(/usr/bin/stat -c '%u:%g:%a:%h:%s' -- "${path}") || return 1
+    [[ "${metadata}" == '0:0:600:1:133' ]] || return 1
+    candidate_marker_bytes_and_hash_are_exact "${path}"
+}
+
+backup_path_available() {
+    local path="$1"
+    [[ ! -e "${path}" && ! -L "${path}" ]]
+}
+
+path_is_absent() {
+    local path="$1"
+    [[ ! -e "${path}" && ! -L "${path}" ]]
+}
+
+require_snapshot_file() {
+    local path="$1"
+    local label="$2"
+    local max_size="$3"
+    local metadata uid gid links size
+
+    if [[ ! -f "${path}" || -L "${path}" ]]; then
+        refuse "${label} is not a non-symlink regular file"
+        return 1
+    fi
+    if ! metadata=$(/usr/bin/stat -c '%u:%g:%h:%s' -- "${path}"); then
+        refuse "could not inspect ${label}"
+        return 1
+    fi
+    IFS=: read -r uid gid links size <<< "${metadata}"
+    if [[ "${uid}:${gid}:${links}" != '0:0:1' ]]; then
+        refuse "${label} is not a root-owned single-link file"
+        return 1
+    fi
+    if [[ ! "${size}" =~ ^[0-9]+$ || "${size}" -gt "${max_size}" ]]; then
+        refuse "${label} exceeds its supported size"
+        return 1
+    fi
+}
+
+require_package_marker() {
+    local mode
+
+    if ! require_snapshot_file "${MARKER_PATH}" 'package marker' "${MAX_CONTROL_BYTES}"; then
+        return 1
+    fi
+    if ! mode=$(/usr/bin/stat -c '%a' -- "${MARKER_PATH}"); then
+        refuse 'the package marker mode could not be read'
+        return 1
+    fi
+    if [[ "${mode}" != 600 ]]; then
+        refuse 'the package marker mode is not root-only 0600'
+        return 1
+    fi
+}
+
+RELEASE_N_MARKER_TEXT=''
+
+read_release_n_marker_text() {
+    local path="$1"
+    local size text
+
+    RELEASE_N_MARKER_TEXT=''
+    if ! size=$(/usr/bin/stat -c '%s' -- "${path}"); then
+        return 1
+    fi
+    if [[ ! "${size}" =~ ^[0-9]+$ || "${size}" -le 1 \
+        || "${size}" -gt "${MAX_CONTROL_BYTES}" ]]; then
+        return 1
+    fi
+    if ! text=$(<"${path}"); then
+        return 1
+    fi
+    if [[ "$(( ${#text} + 1 ))" -ne "${size}" ]]; then
+        return 1
+    fi
+    if [[ "${text}" == *[$' \t\n\r']* || "${text}" != *'}' ]]; then
+        return 1
+    fi
+    RELEASE_N_MARKER_TEXT=${text}
+}
+
+release_n_marker_is_schema1_generation_null() {
+    local path="$1"
+    local prefix='{"schema_version":1,"release_id":'
+    local transaction_field=',"transaction_id":'
+    local generation_field=',"generation":null,"config":'
+    local generation_key='"generation":'
+    local remainder
+    local generation_count=0
+
+    if ! read_release_n_marker_text "${path}"; then
+        return 1
+    fi
+    if [[ "${RELEASE_N_MARKER_TEXT}" != \
+        "${prefix}"*"${transaction_field}"*"${generation_field}"*'}' ]]; then
+        return 1
+    fi
+    remainder=${RELEASE_N_MARKER_TEXT}
+    while [[ "${remainder}" == *"${generation_key}"* ]]; do
+        generation_count=$((generation_count + 1))
+        remainder=${remainder#*"${generation_key}"}
+    done
+    [[ "${generation_count}" -eq 1 ]]
+}
+
+release_n_marker_has_nonnull_generation() {
+    local path="$1"
+    local prefix='{"schema_version":1,"release_id":'
+    local transaction_field=',"transaction_id":'
+    local generation_prefix=',"generation":'
+    local null_generation=',"generation":null,"config":'
+
+    if ! read_release_n_marker_text "${path}"; then
+        return 1
+    fi
+    [[ "${RELEASE_N_MARKER_TEXT}" == \
+        "${prefix}"*"${transaction_field}"*"${generation_prefix}"*',"config":'*'}' \
+        && "${RELEASE_N_MARKER_TEXT}" != *"${null_generation}"* ]]
+}
+
+validate_archive() {
+    local argument="$1"
+    local canonical metadata listing pkginfo pkginfo_size digest_output
+
+    if [[ ! -e "${argument}" || ! -f "${argument}" || -L "${argument}" ]]; then
+        refuse 'the archive must be one existing non-symlink regular file'
+        return 1
+    fi
+    if ! canonical=$(/usr/bin/realpath --canonicalize-existing -- "${argument}"); then
+        refuse 'the archive could not be canonicalized'
+        return 1
+    fi
+    if [[ ! -f "${canonical}" || -L "${canonical}" ]]; then
+        refuse 'the canonical archive is not a non-symlink regular file'
+        return 1
+    fi
+    if [[ "${canonical}" == *$'\n'* || "${canonical}" == *$'\r'* ]]; then
+        refuse 'the canonical archive path contains a line break'
+        return 1
+    fi
+    if ! metadata=$(/usr/bin/stat -c '%s' -- "${canonical}"); then
+        refuse 'the archive size could not be read'
+        return 1
+    fi
+    if [[ ! "${metadata}" =~ ^[0-9]+$ || "${metadata}" -gt "${MAX_ARCHIVE_BYTES}" ]]; then
+        refuse 'the archive exceeds the 4 GiB limit'
+        return 1
+    fi
+    if ! listing=$(/usr/bin/bsdtar -tf "${canonical}" .PKGINFO); then
+        refuse 'the archive .PKGINFO could not be listed'
+        return 1
+    fi
+    if [[ "${listing}" != '.PKGINFO' ]]; then
+        refuse 'the archive must contain exactly one canonical .PKGINFO entry'
+        return 1
+    fi
+    if ! pkginfo_size=$(/usr/bin/bsdtar -xOf "${canonical}" .PKGINFO | /usr/bin/wc -c); then
+        refuse 'the archive .PKGINFO size could not be read'
+        return 1
+    fi
+    if [[ ! "${pkginfo_size}" =~ ^[0-9]+$ \
+        || "${pkginfo_size}" -le 1 \
+        || "${pkginfo_size}" -gt "${MAX_CONTROL_BYTES}" ]]; then
+        refuse 'the archive .PKGINFO is empty or oversized'
+        return 1
+    fi
+    if ! pkginfo=$(/usr/bin/bsdtar -xOf "${canonical}" .PKGINFO); then
+        refuse 'the archive .PKGINFO could not be extracted'
+        return 1
+    fi
+    if [[ "${#pkginfo}" -ne "$((pkginfo_size - 1))" ]]; then
+        refuse 'the archive .PKGINFO must be NUL-free text ending in exactly one newline'
+        return 1
+    fi
+    if ! parse_pkginfo_text "${pkginfo}"; then
+        refuse 'the archive metadata is not an exact stable Howy 2.0.0-1 x86_64 package'
+        return 1
+    fi
+    if ! digest_output=$(/usr/bin/sha256sum -- "${canonical}"); then
+        refuse 'the archive SHA-256 could not be computed'
+        return 1
+    fi
+
+    ARCHIVE_PATH=${canonical}
+    ARCHIVE_SIZE=${metadata}
+    ARCHIVE_SHA256=${digest_output%% *}
+    if [[ ! "${ARCHIVE_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+        refuse 'the archive SHA-256 output was malformed'
+        return 1
+    fi
+}
+
+query_package_version() {
+    local package="$1"
+    local output
+
+    output=$(/usr/bin/pacman -Q -- "${package}") || return 1
+    [[ "${output}" == "${package} "* && "${output}" != *$'\n'* ]] || return 1
+    printf '%s\n' "${output#"${package} "}"
+}
+
+query_single_provider() {
+    local installed owner package
+    local -a providers=()
+
+    if ! installed=$(/usr/bin/pacman -Qq); then
+        refuse 'pacman could not enumerate installed packages'
+        return 1
+    fi
+    while IFS= read -r package; do
+        case "${package}" in
+            howy-cpu|howy-rocm|howy-cuda|howy-cpu-git|howy-rocm-git|howy-cuda-git|howy-rocm-mode0|howy|howy-git|howdy|howdy-git)
+                providers+=("${package}")
+                ;;
+        esac
+    done <<< "${installed}"
+    if [[ "${#providers[@]}" -ne 1 ]]; then
+        refuse "expected exactly one installed Howy provider, found ${#providers[@]}"
+        return 1
+    fi
+
+    if ! owner=$(/usr/bin/pacman -Qqo -- /usr/bin/howy); then
+        refuse 'pacman could not identify the installed /usr/bin/howy owner'
+        return 1
+    fi
+    if [[ "${owner}" != "${providers[0]}" ]]; then
+        refuse 'the installed /usr/bin/howy owner differs from the Howy provider'
+        return 1
+    fi
+    SOURCE_PACKAGE=${providers[0]}
+    if ! SOURCE_VERSION=$(query_package_version "${SOURCE_PACKAGE}"); then
+        refuse 'pacman could not report the installed Howy provider version'
+        return 1
+    fi
+}
+
+preflight_transition_state() {
+    local marker_before marker_after digest_output marker_hash_before marker_hash_after
+
+    case "${TRANSITION_KIND}" in
+        release-n)
+            if ! require_package_marker; then
+                return 1
+            fi
+            if ! release_n_marker_is_schema1_generation_null "${MARKER_PATH}"; then
+                if release_n_marker_has_nonnull_generation "${MARKER_PATH}"; then
+                    refuse 'generated release-N package markers are unsupported by the v2 updater; review the bridge generation and use explicit recovery'
+                else
+                    refuse 'the release-N package marker is not canonical schema-1 JSON with exactly generation null'
+                fi
+                return 1
+            fi
+            if ! marker_before=$(/usr/bin/stat -c '%d:%i:%s:%a:%h' -- "${MARKER_PATH}"); then
+                refuse 'the release-N package marker identity could not be captured'
+                return 1
+            fi
+            if ! digest_output=$(/usr/bin/sha256sum -- "${MARKER_PATH}"); then
+                refuse 'the release-N package marker SHA-256 could not be captured'
+                return 1
+            fi
+            marker_hash_before=${digest_output%% *}
+            if [[ ! "${marker_hash_before}" =~ ^[0-9a-f]{64}$ ]]; then
+                refuse 'the release-N package marker SHA-256 output was malformed'
+                return 1
+            fi
+            if ! /usr/lib/howy/howy-config-bridge complete-release-n; then
+                refuse 'the installed config bridge could not validate the predecessor marker and configuration'
+                return 1
+            fi
+            if ! require_package_marker; then
+                refuse 'the predecessor bridge changed or removed the package marker during completion; review its normalization before rerunning'
+                return 1
+            fi
+            if ! release_n_marker_is_schema1_generation_null "${MARKER_PATH}"; then
+                refuse 'the predecessor bridge changed the generation-null marker bytes during completion; review its normalization before rerunning'
+                return 1
+            fi
+            if ! marker_after=$(/usr/bin/stat -c '%d:%i:%s:%a:%h' -- "${MARKER_PATH}"); then
+                refuse 'the release-N package marker identity could not be recaptured'
+                return 1
+            fi
+            if ! digest_output=$(/usr/bin/sha256sum -- "${MARKER_PATH}"); then
+                refuse 'the release-N package marker SHA-256 could not be recomputed'
+                return 1
+            fi
+            marker_hash_after=${digest_output%% *}
+            if [[ "${marker_after}" != "${marker_before}" \
+                || "${marker_hash_after}" != "${marker_hash_before}" ]]; then
+                refuse 'the predecessor bridge normalized or refreshed the package marker; review the resulting marker and configuration, then rerun the updater'
+                return 1
+            fi
+            if ! /usr/lib/howy/howy-config-bridge stash-release-n; then
+                refuse 'the installed config bridge could not stash the predecessor state'
+                return 1
+            fi
+            if ! path_is_absent "${MARKER_PATH}"; then
+                refuse 'the config bridge did not consume the predecessor marker'
+                return 1
+            fi
+            ;;
+        stable)
+            if ! /usr/lib/howy/howy-config-bridge validate-current-marker; then
+                refuse 'the installed stable config bridge could not validate the current marker, configuration, and generation binding'
+                return 1
+            fi
+            if ! /usr/lib/howy/howy-config-bridge stash-release-n; then
+                refuse 'the installed config bridge could not stash the predecessor state'
+                return 1
+            fi
+            if ! path_is_absent "${MARKER_PATH}"; then
+                refuse 'the config bridge did not consume the predecessor marker'
+                return 1
+            fi
+            ;;
+        candidate)
+            if ! candidate_marker_is_exact "${MARKER_PATH}"; then
+                refuse 'the candidate package marker bytes or SHA-256 are not exact'
+                return 1
+            fi
+            ;;
+        *)
+            refuse 'internal transition classification failed'
+            return 1
+            ;;
+    esac
+}
+
+require_archive_unchanged() {
+    local size digest_output digest
+
+    [[ -f "${ARCHIVE_PATH}" && ! -L "${ARCHIVE_PATH}" ]] || return 1
+    size=$(/usr/bin/stat -c '%s' -- "${ARCHIVE_PATH}") || return 1
+    [[ "${size}" == "${ARCHIVE_SIZE}" ]] || return 1
+    digest_output=$(/usr/bin/sha256sum -- "${ARCHIVE_PATH}") || return 1
+    digest=${digest_output%% *}
+    [[ "${digest}" == "${ARCHIVE_SHA256}" ]]
+}
+
+unit_property() {
+    local unit="$1"
+    local property="$2"
+    local value
+
+    value=$(/usr/bin/systemctl show --property="${property}" --value "${unit}") \
+        || return 1
+    [[ "${value}" != *$'\n'* && -n "${value}" ]] || return 1
+    printf '%s\n' "${value}"
+}
+
+capture_unit_intent() {
+    SOCKET_ENABLED=$(unit_property howy.socket UnitFileState) || return 1
+    SOCKET_ACTIVE=$(unit_property howy.socket ActiveState) || return 1
+    SERVICE_ENABLED=$(unit_property howy.service UnitFileState) || return 1
+    SERVICE_ACTIVE=$(unit_property howy.service ActiveState) || return 1
+    case "${SOCKET_ENABLED}:${SERVICE_ENABLED}" in
+        enabled:enabled|enabled:disabled|disabled:enabled|disabled:disabled) ;;
+        *) return 1 ;;
+    esac
+    case "${SOCKET_ACTIVE}:${SERVICE_ACTIVE}" in
+        active:active|active:inactive|inactive:active|inactive:inactive) ;;
+        *) return 1 ;;
+    esac
+}
+
+copy_snapshot() {
+    local source="$1"
+    local destination="$2"
+
+    /usr/bin/cp --preserve=mode -- "${source}" "${destination}" || return 1
+    /usr/bin/cmp -s -- "${source}" "${destination}" || return 1
+}
+
+create_backup() {
+    /usr/bin/install -d -o root -g root -m 0700 -- "${BACKUP_PATH}" || return 1
+    copy_snapshot "${CONFIG_PATH}" "${BACKUP_PATH}/config.toml" || return 1
+    if ! path_is_absent "${RECEIPT_PATH}"; then
+        require_snapshot_file "${RECEIPT_PATH}" 'security receipt' "${MAX_CONTROL_BYTES}" \
+            || return 1
+        [[ "$(/usr/bin/stat -c '%a' -- "${RECEIPT_PATH}")" == 600 ]] || return 1
+        copy_snapshot "${RECEIPT_PATH}" "${BACKUP_PATH}/receipt-v1.json" || return 1
+        RECEIPT_EXISTED=1
+    fi
+    if ! path_is_absent "${MARKER_PATH}"; then
+        require_snapshot_file "${MARKER_PATH}" 'package marker' "${MAX_CONTROL_BYTES}" \
+            || return 1
+        copy_snapshot "${MARKER_PATH}" "${BACKUP_PATH}/package-bootstrap.marker" || return 1
+        MARKER_EXISTED=1
+    fi
+    {
+        printf 'format=%s\n' "${UPDATE_FORMAT}"
+        printf 'archive=%s\n' "${ARCHIVE_PATH}"
+        printf 'archive_sha256=%s\n' "${ARCHIVE_SHA256}"
+        printf 'source_package=%s\n' "${SOURCE_PACKAGE}"
+        printf 'source_version=%s\n' "${SOURCE_VERSION}"
+        printf 'target_package=%s\n' "${ARCHIVE_PKGNAME}"
+        printf 'target_version=%s\n' "${ARCHIVE_PKGVER}"
+        printf 'socket_enabled=%s\n' "${SOCKET_ENABLED}"
+        printf 'socket_active=%s\n' "${SOCKET_ACTIVE}"
+        printf 'service_enabled=%s\n' "${SERVICE_ENABLED}"
+        printf 'service_active=%s\n' "${SERVICE_ACTIVE}"
+    } > "${BACKUP_PATH}/metadata" || return 1
+    [[ "$(/usr/bin/stat -c '%u:%g:%a' -- "${BACKUP_PATH}")" == '0:0:700' ]] \
+        || return 1
+    [[ "$(/usr/bin/stat -c '%u:%g:%a' -- "${BACKUP_PATH}/metadata")" == '0:0:600' ]] \
+        || return 1
+    if [[ "${MARKER_EXISTED}" -eq 1 ]]; then
+        /usr/bin/cmp -s -- "${MARKER_PATH}" "${BACKUP_PATH}/package-bootstrap.marker" \
+            || return 1
+    fi
+}
+
+backup_contents_are_expected() (
+    local path="$1"
+    local receipt_expected="$2"
+    local marker_expected="$3"
+    local entry
+    local -a entries expected
+
+    [[ "${receipt_expected}" =~ ^[01]$ && "${marker_expected}" =~ ^[01]$ ]] \
+        || return 1
+    [[ -d "${path}" && ! -L "${path}" ]] || return 1
+
+    expected=("${path}/config.toml" "${path}/metadata")
+    if [[ "${receipt_expected}" -eq 1 ]]; then
+        expected+=("${path}/receipt-v1.json")
+    fi
+    if [[ "${marker_expected}" -eq 1 ]]; then
+        expected+=("${path}/package-bootstrap.marker")
+    fi
+
+    shopt -s dotglob nullglob
+    entries=("${path}"/*)
+    [[ "${#entries[@]}" -eq "${#expected[@]}" ]] || return 1
+    for entry in "${entries[@]}"; do
+        [[ -f "${entry}" && ! -L "${entry}" ]] || return 1
+        case "${entry}" in
+            "${path}/config.toml"|"${path}/metadata") ;;
+            "${path}/receipt-v1.json") [[ "${receipt_expected}" -eq 1 ]] || return 1 ;;
+            "${path}/package-bootstrap.marker") [[ "${marker_expected}" -eq 1 ]] || return 1 ;;
+            *) return 1 ;;
+        esac
+    done
+    for entry in "${expected[@]}"; do
+        [[ -f "${entry}" && ! -L "${entry}" ]] || return 1
+    done
+)
+
+remove_completed_backup() {
+    local metadata file
+    local -a files=(
+        "${BACKUP_PATH}/config.toml"
+        "${BACKUP_PATH}/metadata"
+    )
+
+    backup_contents_are_expected \
+        "${BACKUP_PATH}" "${RECEIPT_EXISTED}" "${MARKER_EXISTED}" \
+        || return 1
+    metadata=$(/usr/bin/stat -c '%u:%g:%a' -- "${BACKUP_PATH}") || return 1
+    [[ "${metadata}" == '0:0:700' ]] || return 1
+
+    if [[ "${RECEIPT_EXISTED}" -eq 1 ]]; then
+        files+=("${BACKUP_PATH}/receipt-v1.json")
+    fi
+    if [[ "${MARKER_EXISTED}" -eq 1 ]]; then
+        files+=("${BACKUP_PATH}/package-bootstrap.marker")
+    fi
+    for file in "${files[@]}"; do
+        metadata=$(/usr/bin/stat -c '%u:%g:%h' -- "${file}") || return 1
+        [[ "${metadata}" == '0:0:1' ]] || return 1
+    done
+    [[ "$(/usr/bin/stat -c '%a' -- "${BACKUP_PATH}/metadata")" == 600 ]] \
+        || return 1
+    if [[ "${RECEIPT_EXISTED}" -eq 1 ]]; then
+        [[ "$(/usr/bin/stat -c '%a' -- "${BACKUP_PATH}/receipt-v1.json")" == 600 ]] \
+            || return 1
+    fi
+    if [[ "${MARKER_EXISTED}" -eq 1 ]]; then
+        [[ "$(/usr/bin/stat -c '%a' -- "${BACKUP_PATH}/package-bootstrap.marker")" == 600 ]] \
+            || return 1
+    fi
+
+    /usr/bin/rm -- "${files[@]}" || return 1
+    /usr/bin/rmdir -- "${BACKUP_PATH}"
+}
+
+both_units_inactive() {
+    [[ "$(unit_property howy.socket ActiveState)" == inactive ]] || return 1
+    [[ "$(unit_property howy.service ActiveState)" == inactive ]] || return 1
+}
+
+stop_units() {
+    local socket_status=0 service_status=0
+
+    /usr/bin/systemctl stop howy.socket || socket_status=$?
+    /usr/bin/systemctl stop howy.service || service_status=$?
+    [[ "${socket_status}" -eq 0 && "${service_status}" -eq 0 ]] || return 1
+    both_units_inactive
+}
+
+best_effort_stop_units() {
+    local status=0
+
+    /usr/bin/systemctl stop howy.socket >/dev/null 2>&1 || status=1
+    /usr/bin/systemctl stop howy.service >/dev/null 2>&1 || status=1
+    both_units_inactive >/dev/null 2>&1 || status=1
+    return "${status}"
+}
+
+retain_failure() {
+    local reason="$1"
+
+    if ! best_effort_stop_units; then
+        printf '%s\n' 'howy-v2-update: warning: could not prove both Howy units inactive; inspect them before recovery.' >&2
+    fi
+    printf 'howy-v2-update: update failed: %s\n' "${reason}" >&2
+    printf 'howy-v2-update: backup retained at %s; package bytes were not rolled back.\n' "${BACKUP_PATH}" >&2
+    printf '%s\n' 'howy-v2-update: inspect and preserve any needed backup files before recovery.' >&2
+    printf '%s\n' 'howy-v2-update: the retained backup blocks a new updater run.' >&2
+    printf '%s\n' 'howy-v2-update: before rerunning, explicitly remove only the reviewed backup files and then its empty directory; this updater will not resume or remove the retained backup automatically.' >&2
+    return 1
+}
+
+write_sentinel() {
+    path_is_absent "${SENTINEL_PATH}" || return 1
+    SENTINEL_CREATED=1
+    {
+        printf 'format=%s\n' "${UPDATE_FORMAT}"
+        printf 'archive=%s\n' "${ARCHIVE_PATH}"
+        printf 'archive_sha256=%s\n' "${ARCHIVE_SHA256}"
+        printf 'source_package=%s\n' "${SOURCE_PACKAGE}"
+        printf 'source_version=%s\n' "${SOURCE_VERSION}"
+        printf 'target_package=%s\n' "${ARCHIVE_PKGNAME}"
+        printf 'target_version=%s\n' "${ARCHIVE_PKGVER}"
+    } > "${SENTINEL_PATH}" || return 1
+    [[ "$(/usr/bin/stat -c '%u:%g:%a' -- "${SENTINEL_PATH}")" == '0:0:600' ]]
+}
+
+cleanup_sentinel() {
+    if [[ "${SENTINEL_CREATED}" -eq 1 ]]; then
+        /usr/bin/rm -f -- "${SENTINEL_PATH}" || true
+    fi
+}
+
+verify_installed_result() {
+    local version installed_package installed_version
+    local original_source_package="${SOURCE_PACKAGE}"
+    local original_source_version="${SOURCE_VERSION}"
+
+    version=$(query_package_version "${ARCHIVE_PKGNAME}") || return 1
+    [[ "${version}" == "${TARGET_VERSION}" ]] || return 1
+    if [[ "${SOURCE_PACKAGE}" != "${ARCHIVE_PKGNAME}" ]]; then
+        ! /usr/bin/pacman -Q -- "${SOURCE_PACKAGE}" >/dev/null 2>&1 || return 1
+    fi
+    if ! query_single_provider; then
+        SOURCE_PACKAGE=${original_source_package}
+        SOURCE_VERSION=${original_source_version}
+        return 1
+    fi
+    installed_package=${SOURCE_PACKAGE}
+    installed_version=${SOURCE_VERSION}
+    SOURCE_PACKAGE=${original_source_package}
+    SOURCE_VERSION=${original_source_version}
+    [[ "${installed_package}" == "${ARCHIVE_PKGNAME}" \
+        && "${installed_version}" == "${TARGET_VERSION}" ]]
+}
+
+restore_config() {
+    local mode live_metadata
+
+    mode=$(/usr/bin/stat -c '%a' -- "${BACKUP_PATH}/config.toml") || return 1
+    if [[ -f "${CONFIG_PATH}" && ! -L "${CONFIG_PATH}" ]]; then
+        live_metadata=$(/usr/bin/stat -c '%u:%g:%a:%h' -- "${CONFIG_PATH}") || return 1
+        if [[ "${live_metadata}" == "0:0:${mode}:1" ]] \
+            && /usr/bin/cmp -s -- "${BACKUP_PATH}/config.toml" "${CONFIG_PATH}"; then
+            return 0
+        fi
+    elif ! path_is_absent "${CONFIG_PATH}"; then
+        return 1
+    fi
+    /usr/bin/rm -f -- "${CONFIG_PATH}" || return 1
+    /usr/bin/install -o root -g root -m "${mode}" -- \
+        "${BACKUP_PATH}/config.toml" "${CONFIG_PATH}" || return 1
+    /usr/bin/cmp -s -- "${BACKUP_PATH}/config.toml" "${CONFIG_PATH}" || return 1
+    [[ "$(/usr/bin/stat -c '%u:%g:%a:%h' -- "${CONFIG_PATH}")" == "0:0:${mode}:1" ]]
+}
+
+verify_receipt_preservation() {
+    if [[ "${RECEIPT_EXISTED}" -eq 1 ]]; then
+        [[ -f "${RECEIPT_PATH}" && ! -L "${RECEIPT_PATH}" ]] || return 1
+        /usr/bin/cmp -s -- "${BACKUP_PATH}/receipt-v1.json" "${RECEIPT_PATH}"
+    else
+        path_is_absent "${RECEIPT_PATH}"
+    fi
+}
+
+set_unit_enablement() {
+    local unit="$1"
+    local state="$2"
+
+    case "${state}" in
+        enabled) /usr/bin/systemctl enable "${unit}" ;;
+        disabled) /usr/bin/systemctl disable "${unit}" ;;
+        *) return 1 ;;
+    esac
+}
+
+restore_unit_intent() {
+    set_unit_enablement howy.socket "${SOCKET_ENABLED}" || return 1
+    set_unit_enablement howy.service "${SERVICE_ENABLED}" || return 1
+    if [[ "${SOCKET_ACTIVE}" == active ]]; then
+        /usr/bin/systemctl start howy.socket || return 1
+    fi
+    if [[ "${SERVICE_ACTIVE}" == active ]]; then
+        /usr/bin/systemctl start howy.service || return 1
+    fi
+}
+
+verify_unit_intent() {
+    [[ "$(unit_property howy.socket UnitFileState)" == "${SOCKET_ENABLED}" ]] || return 1
+    [[ "$(unit_property howy.socket ActiveState)" == "${SOCKET_ACTIVE}" ]] || return 1
+    [[ "$(unit_property howy.service UnitFileState)" == "${SERVICE_ENABLED}" ]] || return 1
+    [[ "$(unit_property howy.service ActiveState)" == "${SERVICE_ACTIVE}" ]]
+}
+
+post_pacman_steps() {
+    verify_installed_result || return 1
+    if [[ "${TRANSITION_KIND}" == candidate ]]; then
+        path_is_absent "${MARKER_PATH}" || return 1
+    fi
+    restore_config || return 1
+    verify_receipt_preservation || return 1
+    /usr/lib/howy/howy-config-bridge complete-release-n || return 1
+    if [[ "${TRANSITION_KIND}" == candidate ]]; then
+        /usr/bin/howy package reconcile --allow-legacy-candidate-mode0 || return 1
+    else
+        /usr/bin/howy package reconcile || return 1
+    fi
+    if [[ "${RECEIPT_EXISTED}" -eq 0 ]]; then
+        path_is_absent "${RECEIPT_PATH}" || return 1
+    fi
+    restore_unit_intent || return 1
+    verify_unit_intent
+}
+
+main() {
+    local root_id
+
+    if [[ "$#" -ne 1 ]]; then
+        refuse 'usage: howy-v2-update <one-package-archive>'
+        return 1
+    fi
+    if ! root_id=$(/usr/bin/id -u); then
+        refuse 'could not determine the effective user'
+        return 1
+    fi
+    if [[ "${root_id}" != 0 ]]; then
+        refuse 'this updater must run as root'
+        return 1
+    fi
+    trap cleanup_sentinel EXIT
+
+    if ! validate_archive "$1"; then
+        return 1
+    fi
+    if ! path_is_absent "${SENTINEL_PATH}"; then
+        refuse "prepared sentinel already exists at ${SENTINEL_PATH}"
+        return 1
+    fi
+    if ! backup_path_available "${BACKUP_PATH}"; then
+        refuse "backup already exists at ${BACKUP_PATH}"
+        return 1
+    fi
+    if ! query_single_provider; then
+        return 1
+    fi
+    if ! transition_allowed "${SOURCE_PACKAGE}" "${SOURCE_VERSION}" "${ARCHIVE_PKGNAME}"; then
+        refuse "unsupported transition ${SOURCE_PACKAGE} ${SOURCE_VERSION} -> ${ARCHIVE_PKGNAME} ${ARCHIVE_PKGVER}"
+        return 1
+    fi
+    if ! preflight_transition_state; then
+        return 1
+    fi
+
+    if ! require_snapshot_file "${CONFIG_PATH}" 'Howy configuration' "${MAX_CONTROL_BYTES}"; then
+        return 1
+    fi
+    if ! capture_unit_intent; then
+        refuse 'unit intent must be exactly enabled/disabled and active/inactive'
+        return 1
+    fi
+    if ! create_backup; then
+        retain_failure 'could not create and verify the exact updater backup'
+        return 1
+    fi
+    if ! stop_units; then
+        retain_failure 'could not stop and prove both Howy units inactive'
+        return 1
+    fi
+    if ! require_archive_unchanged; then
+        retain_failure 'the canonical archive changed after preflight'
+        return 1
+    fi
+    if ! write_sentinel; then
+        retain_failure 'could not create the root-only prepared sentinel'
+        return 1
+    fi
+    if ! /usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"; then
+        retain_failure 'pacman -U failed'
+        return 1
+    fi
+    if ! post_pacman_steps; then
+        retain_failure 'post-install verification, reconciliation, or unit restoration failed'
+        return 1
+    fi
+
+    if ! /usr/bin/rm -f -- "${SENTINEL_PATH}"; then
+        retain_failure 'could not remove the prepared sentinel'
+        return 1
+    fi
+    SENTINEL_CREATED=0
+    if ! remove_completed_backup; then
+        retain_failure 'could not remove the completed updater backup'
+        return 1
+    fi
+    printf 'Howy update complete: package=%s version=%s archive_sha256=%s\n' \
+        "${ARCHIVE_PKGNAME}" "${ARCHIVE_PKGVER}" "${ARCHIVE_SHA256}"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+elif [[ "${HOWY_V2_UPDATE_INTERNAL_TEST:-0}" != 1 ]]; then
+    printf '%s\n' 'howy-v2-update: refusal: sourcing requires HOWY_V2_UPDATE_INTERNAL_TEST=1' >&2
+    return 1
+fi

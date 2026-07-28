@@ -1,0 +1,145 @@
+#!/bin/bash
+
+set -euo pipefail
+export LC_ALL=C
+
+readonly SENTINEL_PATH='/run/howy-v2-update-v1.prepared'
+readonly TARGET_VERSION='2.0.0-1'
+
+refuse() {
+    printf 'howy-v2-update-admission: refusal: %s\n' "$*" >&2
+    return 1
+}
+
+validate_sentinel() {
+    local triggering_package="$1"
+    local metadata archive archive_sha256 source_package source_version
+    local target_package target_version
+    local expected_digest actual_digest
+    local -a lines=()
+
+    if [[ ! -f "${SENTINEL_PATH}" || -L "${SENTINEL_PATH}" ]]; then
+        refuse 'the prepared sentinel is not a non-symlink regular file'
+        return 1
+    fi
+    if ! metadata=$(/usr/bin/stat -c '%u:%g:%a' -- "${SENTINEL_PATH}"); then
+        refuse 'the prepared sentinel metadata could not be read'
+        return 1
+    fi
+    if [[ "${metadata}" != '0:0:600' ]]; then
+        refuse 'the prepared sentinel must be root:root mode 0600'
+        return 1
+    fi
+    if ! mapfile -t lines < "${SENTINEL_PATH}"; then
+        refuse 'the prepared sentinel could not be read'
+        return 1
+    fi
+    if [[ "${#lines[@]}" -ne 7 || "${lines[0]}" != 'format=howy-v2-update-v1' ]]; then
+        refuse 'the prepared sentinel does not have the strict seven-line schema'
+        return 1
+    fi
+
+    case "${lines[1]}" in
+        archive=/*) archive=${lines[1]#archive=} ;;
+        *) refuse 'the prepared archive path is not absolute'; return 1 ;;
+    esac
+    case "${lines[2]}" in
+        archive_sha256=*) archive_sha256=${lines[2]#archive_sha256=} ;;
+        *) refuse 'the prepared archive hash field is malformed'; return 1 ;;
+    esac
+    case "${lines[3]}" in
+        source_package=*) source_package=${lines[3]#source_package=} ;;
+        *) refuse 'the prepared source package field is malformed'; return 1 ;;
+    esac
+    case "${lines[4]}" in
+        source_version=*) source_version=${lines[4]#source_version=} ;;
+        *) refuse 'the prepared source version field is malformed'; return 1 ;;
+    esac
+    case "${lines[5]}" in
+        target_package=*) target_package=${lines[5]#target_package=} ;;
+        *) refuse 'the prepared target package field is malformed'; return 1 ;;
+    esac
+    case "${lines[6]}" in
+        target_version=*) target_version=${lines[6]#target_version=} ;;
+        *) refuse 'the prepared target version field is malformed'; return 1 ;;
+    esac
+
+    if [[ ! "${archive_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+        refuse 'the prepared archive hash is not 64 lowercase hexadecimal characters'
+        return 1
+    fi
+    if [[ "${source_package}" != "${target_package}" ]]; then
+        refuse 'the prepared source and target package names differ'
+        return 1
+    fi
+    if [[ "${target_package}" != "${triggering_package}" ]]; then
+        refuse 'the prepared target package differs from the triggering package'
+        return 1
+    fi
+    if [[ "${source_version}" != "${TARGET_VERSION}" \
+        || "${target_version}" != "${TARGET_VERSION}" ]]; then
+        refuse 'the prepared source and target versions must both be 2.0.0-1'
+        return 1
+    fi
+
+    if ! expected_digest=$(printf '%s\n' \
+            'format=howy-v2-update-v1' \
+            "archive=${archive}" \
+            "archive_sha256=${archive_sha256}" \
+            "source_package=${source_package}" \
+            "source_version=${source_version}" \
+            "target_package=${target_package}" \
+            "target_version=${target_version}" \
+        | /usr/bin/sha256sum); then
+        refuse 'the canonical prepared sentinel hash could not be computed'
+        return 1
+    fi
+    if ! actual_digest=$(/usr/bin/sha256sum -- "${SENTINEL_PATH}"); then
+        refuse 'the prepared sentinel hash could not be computed'
+        return 1
+    fi
+    if [[ "${actual_digest%% *}" != "${expected_digest%% *}" ]]; then
+        refuse 'the prepared sentinel bytes are not canonical'
+        return 1
+    fi
+}
+
+main() {
+    local root_id triggering_package
+    local -a targets=()
+
+    if [[ "$#" -ne 0 ]]; then
+        refuse 'this helper accepts no arguments'
+        return 1
+    fi
+    if ! root_id=$(/usr/bin/id -u); then
+        refuse 'could not determine the effective user'
+        return 1
+    fi
+    if [[ "${root_id}" != 0 ]]; then
+        refuse 'this helper must run as root'
+        return 1
+    fi
+    if ! mapfile -t targets; then
+        refuse 'triggering package targets could not be read from stdin'
+        return 1
+    fi
+    if [[ "${#targets[@]}" -ne 1 ]]; then
+        refuse 'exactly one triggering stable package target is required'
+        return 1
+    fi
+    triggering_package=${targets[0]}
+    case "${triggering_package}" in
+        howy-cpu|howy-rocm|howy-cuda) ;;
+        *) refuse 'the triggering target is not a stable Howy package'; return 1 ;;
+    esac
+
+    validate_sentinel "${triggering_package}"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+elif [[ "${HOWY_V2_UPDATE_ADMISSION_INTERNAL_TEST:-0}" != 1 ]]; then
+    printf '%s\n' 'howy-v2-update-admission: refusal: sourcing requires HOWY_V2_UPDATE_ADMISSION_INTERNAL_TEST=1' >&2
+    return 1
+fi
