@@ -327,6 +327,196 @@ fn complete_upgrade_preserves_config_and_revalidates_marker() {
 }
 
 #[test]
+fn current_marker_validation_accepts_exact_null_and_restored_generation_bindings_read_only() {
+    let null_root = TestRoot::new();
+    write_mode(&null_root.path(CONFIG_PATH), b"administrator=true\n", 0o600);
+    ConfigBridge::rooted(&null_root.0)
+        .complete_release_n()
+        .unwrap();
+    let null_marker = fs::read(null_root.path(MARKER_PATH)).unwrap();
+    ConfigBridge::rooted(&null_root.0)
+        .validate_current_marker()
+        .unwrap();
+    assert_eq!(fs::read(null_root.path(MARKER_PATH)).unwrap(), null_marker);
+    assert!(!null_root.path(MANIFEST_PATH).exists());
+
+    let generation_root = TestRoot::new();
+    write_mode(
+        &generation_root.path(CONFIG_PATH),
+        b"administrator=restored\n",
+        0o600,
+    );
+    ConfigBridge::rooted(&generation_root.0)
+        .stash_release_n()
+        .unwrap();
+    fs::remove_file(generation_root.path(CONFIG_PATH)).unwrap();
+    generation_root.install_legacy();
+    ConfigBridge::rooted(&generation_root.0)
+        .bootstrap_release_n()
+        .unwrap();
+    let marker = fs::read(generation_root.path(MARKER_PATH)).unwrap();
+    let manifest = fs::read(generation_root.path(MANIFEST_PATH)).unwrap();
+    ConfigBridge::rooted(&generation_root.0)
+        .validate_current_marker()
+        .unwrap();
+    assert_eq!(fs::read(generation_root.path(MARKER_PATH)).unwrap(), marker);
+    assert_eq!(
+        fs::read(generation_root.path(MANIFEST_PATH)).unwrap(),
+        manifest
+    );
+}
+
+#[test]
+fn current_marker_validation_refuses_missing_static_malformed_unsafe_and_config_drift() {
+    for failure in [
+        "missing",
+        "candidate-static",
+        "malformed",
+        "unsafe",
+        "wrong-release",
+        "wrong-config",
+        "active-journal",
+    ] {
+        let root = TestRoot::new();
+        write_mode(&root.path(CONFIG_PATH), b"administrator=true\n", 0o600);
+        ConfigBridge::rooted(&root.0).complete_release_n().unwrap();
+        match failure {
+            "missing" => fs::remove_file(root.path(MARKER_PATH)).unwrap(),
+            "candidate-static" => write_mode(
+                &root.path(MARKER_PATH),
+                b"howy-rocm-mode0-candidate\n",
+                0o600,
+            ),
+            "malformed" => write_mode(&root.path(MARKER_PATH), b"{malformed", 0o600),
+            "unsafe" => {
+                fs::set_permissions(root.path(MARKER_PATH), fs::Permissions::from_mode(0o644))
+                    .unwrap()
+            }
+            "wrong-release" => {
+                let mut marker: BootstrapMarker =
+                    serde_json::from_slice(&fs::read(root.path(MARKER_PATH)).unwrap()).unwrap();
+                marker.release_id = "candidate".into();
+                write_mode(
+                    &root.path(MARKER_PATH),
+                    &serde_json::to_vec(&marker).unwrap(),
+                    0o600,
+                );
+            }
+            "wrong-config" => write_mode(&root.path(CONFIG_PATH), b"changed=true\n", 0o600),
+            "active-journal" => {
+                let marker: BootstrapMarker =
+                    serde_json::from_slice(&fs::read(root.path(MARKER_PATH)).unwrap()).unwrap();
+                let journal = BridgeJournal::StashReleaseN {
+                    schema_version: SCHEMA_VERSION,
+                    transaction_id: marker.transaction_id.clone(),
+                    source: marker.config.clone(),
+                    previous_manifest: None,
+                    new_manifest: Box::new(StashManifest {
+                        schema_version: SCHEMA_VERSION,
+                        release_id: RELEASE_ID.into(),
+                        config_path: CONFIG_PATH.into(),
+                        active: GenerationRecord {
+                            generation: 1,
+                            stash_transaction_id: marker.transaction_id.clone(),
+                            state: match marker.config.clone() {
+                                ConfigState::Present { file } => GenerationState::PresentStashed {
+                                    stash_path: stash_path(1),
+                                    stash_sha256: file.sha256.clone(),
+                                    stash_size: file.metadata.byte_length,
+                                    source: file,
+                                },
+                                ConfigState::Absent { absence } => {
+                                    GenerationState::Absent { absence }
+                                }
+                            },
+                        },
+                        consumed_generations: Vec::new(),
+                    }),
+                    manifest_stage_name: format!(
+                        "{CONTROL_STAGE_PREFIX}{}-manifest",
+                        marker.transaction_id
+                    ),
+                    marker: None,
+                };
+                write_mode(
+                    &root.path(JOURNAL_PATH),
+                    &serialize_control(&journal, "test journal").unwrap(),
+                    0o600,
+                );
+            }
+            _ => unreachable!(),
+        }
+        let marker_before = fs::read(root.path(MARKER_PATH)).ok();
+        let config_before = fs::read(root.path(CONFIG_PATH)).ok();
+        let journal_before = fs::read(root.path(JOURNAL_PATH)).ok();
+        assert!(
+            ConfigBridge::rooted(&root.0)
+                .validate_current_marker()
+                .is_err(),
+            "{failure} unexpectedly validated"
+        );
+        assert_eq!(fs::read(root.path(MARKER_PATH)).ok(), marker_before);
+        assert_eq!(fs::read(root.path(CONFIG_PATH)).ok(), config_before);
+        assert_eq!(fs::read(root.path(JOURNAL_PATH)).ok(), journal_before);
+    }
+}
+
+#[test]
+fn current_marker_validation_refuses_wrong_generation_transaction_and_restored_target() {
+    for failure in ["generation", "transaction", "restored-target"] {
+        let root = TestRoot::new();
+        write_mode(&root.path(CONFIG_PATH), b"administrator=restored\n", 0o600);
+        ConfigBridge::rooted(&root.0).stash_release_n().unwrap();
+        fs::remove_file(root.path(CONFIG_PATH)).unwrap();
+        root.install_legacy();
+        ConfigBridge::rooted(&root.0).bootstrap_release_n().unwrap();
+        match failure {
+            "generation" | "transaction" => {
+                let mut marker: BootstrapMarker =
+                    serde_json::from_slice(&fs::read(root.path(MARKER_PATH)).unwrap()).unwrap();
+                if failure == "generation" {
+                    marker.generation = marker.generation.map(|value| value + 1);
+                } else {
+                    marker.transaction_id = "00000000000000000000000000000000".into();
+                }
+                write_mode(
+                    &root.path(MARKER_PATH),
+                    &serde_json::to_vec(&marker).unwrap(),
+                    0o600,
+                );
+            }
+            "restored-target" => {
+                let mut manifest = root.manifest();
+                let GenerationState::Restored {
+                    restored_target: ConfigState::Present { file },
+                    ..
+                } = &mut manifest.active.state
+                else {
+                    panic!("expected restored present target")
+                };
+                file.sha256 = "00".repeat(32);
+                write_mode(
+                    &root.path(MANIFEST_PATH),
+                    &serialize_control(&manifest, "test manifest").unwrap(),
+                    0o600,
+                );
+            }
+            _ => unreachable!(),
+        }
+        let marker = fs::read(root.path(MARKER_PATH)).unwrap();
+        let manifest = fs::read(root.path(MANIFEST_PATH)).unwrap();
+        assert!(
+            ConfigBridge::rooted(&root.0)
+                .validate_current_marker()
+                .is_err(),
+            "{failure} unexpectedly validated"
+        );
+        assert_eq!(fs::read(root.path(MARKER_PATH)).unwrap(), marker);
+        assert_eq!(fs::read(root.path(MANIFEST_PATH)).unwrap(), manifest);
+    }
+}
+
+#[test]
 fn ensure_layout_creates_missing_leaves_and_refuses_symlink_traversal() {
     let root = TestRoot::new();
     fs::remove_dir(root.path("/etc/credstore.encrypted")).ok();

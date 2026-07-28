@@ -81,6 +81,15 @@ enum SecurityCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum PackageCommands {
+    /// Rebind a preserved security receipt to the installed package state.
+    Reconcile {
+        #[arg(long = "allow-legacy-candidate-mode0", hide = true)]
+        allow_legacy_candidate_mode0: bool,
+    },
+}
+
 #[derive(Parser)]
 #[command(
     name = "howy",
@@ -166,6 +175,12 @@ enum Commands {
         command: SecurityCommands,
     },
 
+    /// Validate and reconcile package-update security state.
+    Package {
+        #[command(subcommand)]
+        command: PackageCommands,
+    },
+
     /// Print the version.
     Version,
 }
@@ -213,11 +228,27 @@ fn main() -> Result<()> {
         Commands::Prewarm => cmd_prewarm(),
         Commands::Config { stdout } => cmd_config(stdout),
         Commands::Security { command } => cmd_security(command, yes),
+        Commands::Package { command } => cmd_package(command),
         Commands::Version => {
             println!("howy {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }
+}
+
+fn cmd_package(command: PackageCommands) -> Result<()> {
+    let mut runtime = security::RealSecurityRuntime::new();
+    let mut engine = security::SecurityEngine::new(&mut runtime);
+    let outcome = match command {
+        PackageCommands::Reconcile {
+            allow_legacy_candidate_mode0,
+        } => engine.package_reconcile(allow_legacy_candidate_mode0),
+    }
+    .map_err(|error| anyhow::anyhow!(error))?;
+    for message in outcome.messages {
+        println!("{message}");
+    }
+    Ok(())
 }
 
 fn cmd_security(command: SecurityCommands, assume_yes: bool) -> Result<()> {
@@ -779,8 +810,8 @@ fn configure_private_umask(command: &mut Command) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, CliProvisionPresence, Commands, SecurityCommands, configure_private_umask,
-        resolve_provision_presence, select_enrollment, test_auth_request,
+        Cli, CliProvisionPresence, Commands, PackageCommands, SecurityCommands,
+        configure_private_umask, resolve_provision_presence, select_enrollment, test_auth_request,
         validate_batch_enrollment_result, validate_live_enrollment_result,
     };
     use clap::Parser;
@@ -861,6 +892,74 @@ mod tests {
         assert!(
             Cli::try_parse_from(["howy", "security", "provision", "--mode", "1", "--new-key",])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn package_reconcile_command_surface_is_exact() {
+        let cli = Cli::try_parse_from(["howy", "package", "reconcile"]).unwrap();
+        let Commands::Package {
+            command:
+                PackageCommands::Reconcile {
+                    allow_legacy_candidate_mode0,
+                },
+        } = cli.command
+        else {
+            panic!("expected package reconcile")
+        };
+        assert!(!allow_legacy_candidate_mode0);
+
+        let cli = Cli::try_parse_from([
+            "howy",
+            "package",
+            "reconcile",
+            "--allow-legacy-candidate-mode0",
+        ])
+        .unwrap();
+        let Commands::Package {
+            command:
+                PackageCommands::Reconcile {
+                    allow_legacy_candidate_mode0,
+                },
+        } = cli.command
+        else {
+            panic!("expected package reconcile")
+        };
+        assert!(allow_legacy_candidate_mode0);
+
+        let help = match Cli::try_parse_from(["howy", "package", "reconcile", "--help"]) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("reconcile help unexpectedly parsed as a command"),
+        };
+        assert!(!help.contains("allow-legacy-candidate-mode0"));
+        assert!(Cli::try_parse_from(["howy", "package"]).is_err());
+        assert!(Cli::try_parse_from(["howy", "package", "update"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "howy",
+                "package",
+                "--allow-legacy-candidate-mode0",
+                "reconcile"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "howy",
+                "security",
+                "--allow-legacy-candidate-mode0",
+                "enable"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "howy",
+                "package",
+                "reconcile",
+                "--allow_legacy_candidate_mode0",
+            ])
+            .is_err()
         );
     }
 
