@@ -1,7 +1,6 @@
-pkgbase=howy-git
-pkgname=(howy-cpu-git howy-rocm-git howy-cuda-git)
-_basever=0.1.0
-pkgver=0.1.0.r26.g2dfe39e
+pkgbase=howy
+pkgname=(howy-cpu howy-rocm howy-cuda)
+pkgver=2.0.0
 pkgrel=1
 pkgdesc='Linux face authentication daemon — a howdy replacement'
 arch=('x86_64')
@@ -15,13 +14,9 @@ makedepends=(
   'protobuf'
   'systemd>=261'
 )
-source=("${pkgbase}::git+https://github.com/LLJY/howy.git")
+_commit='0a431e42d9dc166341a063c1642bf82520722c3b'
+source=("${pkgbase}::git+https://github.com/LLJY/howy.git#commit=${_commit}")
 sha256sums=('SKIP')
-
-pkgver() {
-  cd "${srcdir}/${pkgbase}"
-  printf '%s.r%s.g%s\n' "${_basever}" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
-}
 
 prepare() {
   cd "${srcdir}/${pkgbase}"
@@ -60,15 +55,21 @@ _package_common() {
   install -Dm755 "${srcdir}/target/release/howy" "${pkgdir}/usr/bin/howy"
   install -Dm755 "${srcdir}/target/release/howy-config-bridge" "${pkgdir}/usr/lib/howy/howy-config-bridge"
   install -Dm644 "${srcdir}/target/release/libpam_howy.so" "${pkgdir}/usr/lib/security/pam_howy.so"
+  ln -s pam_howy.so "${pkgdir}/usr/lib/security/pam_howdy.so"
 
   # Bridge release N deliberately retains package ownership and backup() of
   # the byte-identical previous-release payload. The secure template lives
   # under /usr/share and only the post_install bridge may exchange it.
   install -Dm644 packaging/config-release-n-legacy.toml "${pkgdir}/etc/howy/config.toml"
   install -Dm644 packaging/config.bootstrap.toml "${pkgdir}/usr/share/howy/config.bootstrap.toml"
+  install -Dm644 packaging/00-howy-update-admission.hook "${pkgdir}/usr/share/libalpm/hooks/00-howy-update-admission.hook"
   install -Dm644 packaging/05-howy-config-stash.hook "${pkgdir}/usr/share/libalpm/hooks/05-howy-config-stash.hook"
+  install -Dm644 packaging/10-howy-remove-prepare.hook "${pkgdir}/usr/share/libalpm/hooks/10-howy-remove-prepare.hook"
+  install -Dm755 scripts/howy-v2-update-admission "${pkgdir}/usr/lib/howy/howy-v2-update-admission"
+  install -Dm755 scripts/howy-v2-remove-prepare "${pkgdir}/usr/lib/howy/howy-v2-remove-prepare"
   install -Dm755 scripts/download-models.sh "${pkgdir}/usr/bin/howy-download-models"
   install -Dm755 scripts/enroll.py "${pkgdir}/usr/bin/howy-enroll"
+  install -Dm755 scripts/howy-v2-update "${pkgdir}/usr/bin/howy-v2-update"
   install -Dm644 systemd/howy.service "${pkgdir}/usr/lib/systemd/system/howy.service"
   install -Dm644 systemd/howy.socket "${pkgdir}/usr/lib/systemd/system/howy.socket"
   install -Dm644 sysusers.d/howy.conf "${pkgdir}/usr/lib/sysusers.d/howy.conf"
@@ -92,7 +93,7 @@ _package_common() {
 
 }
 
-package_howy-cpu-git() {
+package_howy-cpu() {
   pkgdesc='Linux face authentication daemon using ONNX Runtime CPU backend'
   depends=('onnxruntime-cpu' 'pam' 'systemd>=261')
   optdepends=(
@@ -103,15 +104,26 @@ package_howy-cpu-git() {
     'v4l-utils: inspect and tune camera controls'
     'tpm2-tss: TPM-backed systemd credential provisioning'
   )
-  provides=("howy=${pkgver}")
-  conflicts=('howy' 'howy-rocm-git' 'howy-cuda-git')
+  provides=("howy=${pkgver}" "howdy=${pkgver}")
+  conflicts=(
+    'howy'
+    'howy-git'
+    'howy-cpu-git'
+    'howy-rocm-git'
+    'howy-cuda-git'
+    'howy-rocm-mode0'
+    'howdy'
+    'howdy-git'
+    'howy-rocm'
+    'howy-cuda'
+  )
   backup=('etc/howy/config.toml')
   install=howy.install
 
   _package_common "${pkgname}"
 }
 
-package_howy-rocm-git() {
+package_howy-rocm() {
   pkgdesc='Linux face authentication daemon using ONNX Runtime ROCm backend'
   depends=('onnxruntime-rocm' 'pam' 'systemd>=261')
   optdepends=(
@@ -122,15 +134,26 @@ package_howy-rocm-git() {
     'v4l-utils: inspect and tune camera controls'
     'tpm2-tss: TPM-backed systemd credential provisioning'
   )
-  provides=("howy=${pkgver}")
-  conflicts=('howy' 'howy-cpu-git' 'howy-cuda-git')
+  provides=("howy=${pkgver}" "howdy=${pkgver}")
+  conflicts=(
+    'howy'
+    'howy-git'
+    'howy-cpu-git'
+    'howy-rocm-git'
+    'howy-cuda-git'
+    'howy-rocm-mode0'
+    'howdy'
+    'howdy-git'
+    'howy-cpu'
+    'howy-cuda'
+  )
   backup=('etc/howy/config.toml')
   install=howy.install
 
   _package_common "${pkgname}"
 }
 
-package_howy-cuda-git() {
+package_howy-cuda() {
   pkgdesc='Linux face authentication daemon using ONNX Runtime CUDA backend'
   depends=('onnxruntime-cuda' 'pam' 'systemd>=261')
   optdepends=(
@@ -141,8 +164,19 @@ package_howy-cuda-git() {
     'v4l-utils: inspect and tune camera controls'
     'tpm2-tss: TPM-backed systemd credential provisioning'
   )
-  provides=("howy=${pkgver}")
-  conflicts=('howy' 'howy-cpu-git' 'howy-rocm-git')
+  provides=("howy=${pkgver}" "howdy=${pkgver}")
+  conflicts=(
+    'howy'
+    'howy-git'
+    'howy-cpu-git'
+    'howy-rocm-git'
+    'howy-cuda-git'
+    'howy-rocm-mode0'
+    'howdy'
+    'howdy-git'
+    'howy-cpu'
+    'howy-rocm'
+  )
   backup=('etc/howy/config.toml')
   install=howy.install
 

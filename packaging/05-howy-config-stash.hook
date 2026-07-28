@@ -2,9 +2,9 @@
 Operation = Upgrade
 Operation = Remove
 Type = Package
-Target = howy-cpu-git
-Target = howy-rocm-git
-Target = howy-cuda-git
+Target = howy-cpu
+Target = howy-rocm
+Target = howy-cuda
 
 [Action]
 Description = Stashing the exact Howy configuration before removal or upgrade

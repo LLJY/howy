@@ -1,5 +1,51 @@
+_howy_prepared_update_exists() {
+  _howy_prepared=/run/howy-v2-update-v1.prepared
+  [ -f "${_howy_prepared}" ] && [ ! -L "${_howy_prepared}" ] || return 1
+  [ "$(/usr/bin/stat -c '%u:%g:%a' -- "${_howy_prepared}" 2>/dev/null)" = '0:0:600' ] \
+    || return 1
+
+  _howy_line_number=0
+  _howy_archive=
+  _howy_archive_sha256=
+  _howy_source_package=
+  _howy_source_version=
+  _howy_target_package=
+  _howy_target_version=
+  while IFS= read -r _howy_line; do
+    _howy_line_number=$((_howy_line_number + 1))
+    _howy_key=${_howy_line%%=*}
+    _howy_value=${_howy_line#*=}
+    [ "${_howy_key}" != "${_howy_line}" ] || return 1
+    case "${_howy_line_number}:${_howy_key}" in
+      1:format) [ "${_howy_value}" = howy-v2-update-v1 ] || return 1 ;;
+      2:archive) _howy_archive=${_howy_value} ;;
+      3:archive_sha256) _howy_archive_sha256=${_howy_value} ;;
+      4:source_package) _howy_source_package=${_howy_value} ;;
+      5:source_version) _howy_source_version=${_howy_value} ;;
+      6:target_package) _howy_target_package=${_howy_value} ;;
+      7:target_version) _howy_target_version=${_howy_value} ;;
+      *) return 1 ;;
+    esac
+  done < "${_howy_prepared}"
+  [ "${_howy_line_number}" -eq 7 ] || return 1
+  case "${_howy_archive}" in /*) ;; *) return 1 ;; esac
+  [ "${#_howy_archive_sha256}" -eq 64 ] || return 1
+  case "${_howy_archive_sha256}" in *[!0-9a-f]*) return 1 ;; esac
+  case "${_howy_source_package}" in
+    howy-cpu-git|howy-rocm-git|howy-cuda-git|howy-rocm-mode0|howy-cpu|howy-rocm|howy-cuda) ;;
+    *) return 1 ;;
+  esac
+  [ -n "${_howy_source_version}" ] || return 1
+  case "${_howy_target_package}" in howy-cpu|howy-rocm|howy-cuda) ;; *) return 1 ;; esac
+  [ "${_howy_target_version}" = 2.0.0-1 ]
+}
+
 post_install() {
   if ! /usr/lib/howy/howy-config-bridge bootstrap-release-n; then
+    if _howy_prepared_update_exists; then
+      printf '%s\n' 'Howy updater prepared this transaction; configuration completion is deferred to howy-v2-update.' >&2
+      return 0
+    fi
     printf '%s\n' 'Howy refused to replace /etc/howy/config.toml; the existing object was left untouched.' >&2
     return 1
   fi
@@ -15,20 +61,31 @@ post_upgrade() {
   fi
 
   printf '%s\n' 'Howy preserved /etc/howy/config.toml during this upgrade.'
-  printf '%s\n' 'Run `sudo howy doctor` to inspect migration or recovery status.'
-  printf '%s\n' 'If a bridge journal is reported, run `sudo /usr/lib/howy/howy-config-bridge recover`.'
-  printf '%s\n' 'The release-N stash hook cannot protect an upgrade path that skipped release N.'
+  printf '%s\n' 'Updates with a security receipt require /usr/bin/howy-v2-update; package reconciliation does not run inside pacman.'
 }
 
 pre_remove() {
   if ! /usr/lib/howy/howy-config-bridge stash-release-n; then
-    printf '%s\n' 'Howy could not create the exact release-N removal/variant stash; no package script modified the configuration.' >&2
+    printf '%s\n' 'Howy could not create the exact removal stash; no package script modified the configuration.' >&2
+    return 1
+  fi
+  if ! /usr/lib/howy/howy-v2-remove-prepare; then
+    printf '%s\n' 'Howy could not re-confirm inactive, disabled units during its defensive pre-remove scriptlet.' >&2
     return 1
   fi
 }
 
 post_remove() {
-  printf '%s\n' 'Howy package scripts deleted no configuration, models, encrypted records, credentials, receipts, accounts, or groups.'
+  if ! /usr/bin/systemctl daemon-reload; then
+    printf '%s\n' 'Howy could not reload the systemd manager after removal.' >&2
+    return 1
+  fi
+  if [ -e /var/lib/howy-package-bootstrap.complete ] \
+    || [ -L /var/lib/howy-package-bootstrap.complete ]; then
+    printf '%s\n' 'Howy retained an unexpected package marker for explicit review; package scripts refuse broad marker deletion.' >&2
+    return 1
+  fi
+
+  printf '%s\n' 'Howy package scripts preserved configuration, receipts, credentials, encrypted records, and enrolled records.'
   printf '%s\n' 'The exact pre-remove config state remains under /var/lib/howy/config-bridge; pacman backup policy may also retain /etc/howy/config.toml.pacsave.'
-  printf '%s\n' 'The package bootstrap marker was consumed by the abortable PreTransaction stash; retained configuration and model data were not deleted.'
 }
