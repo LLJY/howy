@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 howy-common = { path = "../howy-common" }
+howy-config-bridge = { path = "../howy-config-bridge" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

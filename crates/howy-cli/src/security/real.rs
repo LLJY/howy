@@ -1813,6 +1813,14 @@ impl SecurityRuntime for RealSecurityRuntime {
         Ok(())
     }
 
+    fn validate_package_marker(&mut self) -> SecurityResult<()> {
+        howy_config_bridge::ConfigBridge::new()
+            .validate_current_marker()
+            .map_err(|error| {
+                SecurityError::Refused(format!("package marker validation failed: {error}"))
+            })
+    }
+
     fn require_systemd_261(&mut self) -> SecurityResult<()> {
         let spec = CommandSpec {
             executable: command::SYSTEMCTL.into(),

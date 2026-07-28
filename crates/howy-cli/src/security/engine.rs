@@ -9,10 +9,10 @@ use howy_common::protocol::{
 use howy_common::provisioning::{
     ArtifactDescriptorIdentityV1, ArtifactReceipt, AtomicExpectedTargetV1, AtomicFileIdentityV1,
     AtomicWriteKindV1, AtomicWriteObservationV1, AtomicWritePlanV1, AtomicWriteRecordV1,
-    AtomicWriteStateV1, BASE_SERVICE_UNIT_PATH, BackupHashes, CleanupAdmissibility,
-    CleanupArtifactIdentityV1, CleanupManifestIdentityV1, CleanupPreAdmissionV1,
-    CleanupQuarantineStateV1, CleanupQuarantineV1, CleanupReferences, CleanupStateInput,
-    ConfiguredMode1CredentialSource, CredentialArtifactSourceIdentityV1,
+    AtomicWriteStateV1, BASE_SERVICE_UNIT_PATH, BASE_SOCKET_UNIT_PATH, BackupHashes,
+    CleanupAdmissibility, CleanupArtifactIdentityV1, CleanupManifestIdentityV1,
+    CleanupPreAdmissionV1, CleanupQuarantineStateV1, CleanupQuarantineV1, CleanupReferences,
+    CleanupStateInput, ConfiguredMode1CredentialSource, CredentialArtifactSourceIdentityV1,
     CredentialCryptographicValidation, CredentialPolicyMetadata, CredentialSelector,
     DaemonVerifierIdentityV1, DifferentModeArtifactState, DirectoryIdentityV1, EffectiveUnitSetV1,
     ExactFileSnapshot, ExistingProvisioningArtifact, ExistingProvisioningConfig,
@@ -33,9 +33,9 @@ use howy_common::provisioning::{
     classify_unit_admissibility, disabled_post_provision_unit_targets,
     inspect_systemd_credential_envelope, plaintext_recovery_action_for_phase,
     planned_effective_units, prepare_config_enable_patch, recovery_action_for_phase,
-    validate_journal_transition, validate_plaintext_journal_transition,
-    validate_receipt_transition, validate_supervisor_journal_transition,
-    validate_systemd_credential_envelope,
+    required_service_hardening, required_unit_conditions, validate_journal_transition,
+    validate_plaintext_journal_transition, validate_receipt_transition,
+    validate_supervisor_journal_transition, validate_systemd_credential_envelope,
 };
 
 use super::command::{
@@ -230,6 +230,7 @@ pub enum AtomicWriteReconciliation {
 pub trait SecurityRuntime {
     fn require_root(&mut self) -> SecurityResult<()>;
     fn acquire_lock(&mut self) -> SecurityResult<()>;
+    fn validate_package_marker(&mut self) -> SecurityResult<()>;
     fn require_systemd_261(&mut self) -> SecurityResult<()>;
     fn transaction_id(&mut self) -> SecurityResult<String>;
     fn generate_key(&mut self) -> SecurityResult<Box<dyn SecretKeyMaterial>>;
@@ -249,6 +250,38 @@ pub trait SecurityRuntime {
         plan: &AtomicWritePlanV1,
         staged: &AtomicFileIdentityV1,
     ) -> SecurityResult<AtomicWriteObservationV1>;
+    fn publish_package_receipt(
+        &mut self,
+        plan: &AtomicWritePlanV1,
+        bytes: &[u8],
+    ) -> SecurityResult<AtomicWriteObservationV1> {
+        if plan.target_path != SECURITY_RECEIPT_PATH
+            || plan.operation != AtomicWriteKindV1::Exchange
+            || !matches!(plan.expected_target, AtomicExpectedTargetV1::Present(_))
+            || plan.uid != 0
+            || plan.gid != 0
+            || plan.permissions != 0o600
+        {
+            return Err(SecurityError::operation(
+                "package receipt publication plan is invalid",
+            ));
+        }
+        let staged = self.create_atomic_stage(plan, bytes)?;
+        match self.commit_atomic_stage(plan, &staged) {
+            Ok(observation) => Ok(observation),
+            Err(publication_error) => match self.reconcile_atomic_write(plan, Some(&staged)) {
+                Ok(AtomicWriteReconciliation::NotCommitted) => Err(publication_error),
+                Ok(AtomicWriteReconciliation::Committed(_)) => {
+                    Err(SecurityError::Uncertain(format!(
+                        "receipt publication completed despite an error; prior receipt backup was retained: {publication_error}"
+                    )))
+                }
+                Err(reconciliation_error) => Err(SecurityError::Uncertain(format!(
+                    "receipt publication failed and could not be reconciled: {publication_error}; {reconciliation_error}"
+                ))),
+            },
+        }
+    }
     fn reconcile_atomic_write(
         &mut self,
         plan: &AtomicWritePlanV1,
@@ -441,6 +474,448 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             let _ = engine.recover_locked()?;
             engine.cleanup_locked(request)
         })
+    }
+
+    pub fn package_reconcile(
+        &mut self,
+        allow_legacy_candidate_mode0: bool,
+    ) -> SecurityResult<SecurityOutcome> {
+        self.runtime.require_root()?;
+        self.runtime.acquire_lock()?;
+        self.require_package_reconcile_controls_clear()?;
+        self.runtime.validate_package_marker()?;
+        self.require_package_reconcile_units_inactive()?;
+        self.runtime.daemon_reload()?;
+        self.require_package_reconcile_units_inactive()?;
+
+        let receipt = self.read_receipt_file()?;
+        match receipt {
+            None => self.reconcile_package_no_receipt(allow_legacy_candidate_mode0),
+            Some((receipt_file, receipt)) => {
+                if receipt_file.bytes
+                    != receipt
+                        .deterministic_bytes()
+                        .map_err(|error| SecurityError::operation(error.to_string()))?
+                {
+                    return Err(SecurityError::Refused(
+                        "Mode 1 receipt is not canonical".into(),
+                    ));
+                }
+                self.reconcile_package_mode1(receipt_file, receipt)
+            }
+        }
+    }
+
+    fn reconcile_package_no_receipt(
+        &mut self,
+        allow_legacy_candidate_mode0: bool,
+    ) -> SecurityResult<SecurityOutcome> {
+        let initial = self.observe_package_no_receipt_live(allow_legacy_candidate_mode0)?;
+        self.require_package_reconcile_controls_clear()?;
+        self.require_package_reconcile_units_inactive()?;
+        self.runtime.validate_package_marker()?;
+        if self.read_receipt_file()?.is_some() {
+            return Err(SecurityError::operation(
+                "receipt appeared during no-receipt package validation",
+            ));
+        }
+        let final_live = self.observe_package_no_receipt_live(allow_legacy_candidate_mode0)?;
+        if final_live != initial {
+            return Err(SecurityError::operation(
+                "no-receipt package state changed during reconciliation",
+            ));
+        }
+        let message = match initial.state {
+            PackageNoReceiptState::Bootstrap => {
+                "Package state reconciled: unprovisioned disabled bootstrap."
+            }
+            PackageNoReceiptState::Mode0 => {
+                "Package state reconciled: explicit provisioned Mode 0."
+            }
+            PackageNoReceiptState::LegacyCandidateMode0 => {
+                "Package state reconciled: legacy candidate Mode 0."
+            }
+        };
+        Ok(SecurityOutcome {
+            messages: vec![message.into()],
+            cleanup_command: None,
+        })
+    }
+
+    fn observe_package_no_receipt_live(
+        &mut self,
+        allow_legacy_candidate_mode0: bool,
+    ) -> SecurityResult<PackageNoReceiptLive> {
+        let config = self
+            .runtime
+            .read_file(howy_common::paths::CONFIG_FILE, MAX_CONFIG_BYTES)?
+            .ok_or_else(|| SecurityError::Refused("package config is missing".into()))?;
+        let artifact = self.runtime.read_file(
+            MODE1_CREDENTIAL_PATH,
+            howy_common::provisioning::SYSTEMD_CREDENTIAL_TEXT_SIZE_MAX,
+        )?;
+        let dropin = self
+            .runtime
+            .read_file(MODE1_DROPIN_PATH, MAX_DROPIN_BYTES)?;
+        let namespace_nonempty = self.runtime.namespace_nonempty()?;
+        let effective_units = self.observe_effective_units()?;
+        let base_service = self
+            .runtime
+            .read_file(BASE_SERVICE_UNIT_PATH, MAX_DROPIN_BYTES)?
+            .ok_or_else(|| SecurityError::operation("base howy.service is missing"))?;
+        let base_socket = self
+            .runtime
+            .read_file(BASE_SOCKET_UNIT_PATH, MAX_DROPIN_BYTES)?
+            .ok_or_else(|| SecurityError::operation("base howy.socket is missing"))?;
+
+        let state = if howy_config_bridge::validate_bootstrap_config(&config.bytes).is_ok() {
+            config.validate_regular(0, 0, 0o600)?;
+            if artifact.is_some() || dropin.is_some() || namespace_nonempty {
+                return Err(SecurityError::Refused(
+                    "unprovisioned bootstrap has Mode 1 object or record state".into(),
+                ));
+            }
+            validate_package_units_without_security_dropin(
+                &effective_units,
+                &base_service,
+                &base_socket,
+            )?;
+            PackageNoReceiptState::Bootstrap
+        } else {
+            match dropin.as_ref() {
+                Some(dropin) => {
+                    validate_package_mode0_config(&config)?;
+                    dropin.validate_regular(0, 0, 0o600)?;
+                    if dropin.bytes != MODE0_DROPIN_BYTES {
+                        return Err(SecurityError::Refused(
+                            "explicit Mode 0 security drop-in differs from policy".into(),
+                        ));
+                    }
+                    effective_units
+                        .validate_mode0(&dropin.sha256())
+                        .map_err(|error| SecurityError::operation(error.to_string()))?;
+                    validate_effective_fragment(
+                        &effective_units.service.fragment,
+                        BASE_SERVICE_UNIT_PATH,
+                        &base_service,
+                    )?;
+                    validate_effective_fragment(
+                        &effective_units.socket.fragment,
+                        BASE_SOCKET_UNIT_PATH,
+                        &base_socket,
+                    )?;
+                    validate_effective_fragment(
+                        effective_units.service.dropins.first().ok_or_else(|| {
+                            SecurityError::operation("effective Mode 0 drop-in is missing")
+                        })?,
+                        MODE1_DROPIN_PATH,
+                        dropin,
+                    )?;
+                    PackageNoReceiptState::Mode0
+                }
+                None if allow_legacy_candidate_mode0 => {
+                    validate_package_legacy_candidate_mode0_config(&config)?;
+                    if artifact.is_some() || namespace_nonempty {
+                        return Err(SecurityError::Refused(
+                            "legacy candidate Mode 0 has Mode 1 object or record state".into(),
+                        ));
+                    }
+                    validate_package_units_without_security_dropin(
+                        &effective_units,
+                        &base_service,
+                        &base_socket,
+                    )?;
+                    PackageNoReceiptState::LegacyCandidateMode0
+                }
+                None => {
+                    validate_package_mode0_config(&config)?;
+                    return Err(SecurityError::Refused(
+                        "explicit Mode 0 security drop-in is missing".into(),
+                    ));
+                }
+            }
+        };
+        let daemon = self.runtime.daemon_verifier_identity()?;
+        Ok(PackageNoReceiptLive {
+            state,
+            config,
+            artifact,
+            dropin,
+            namespace_nonempty,
+            base_service,
+            base_socket,
+            effective_units,
+            daemon,
+        })
+    }
+
+    fn reconcile_package_mode1(
+        &mut self,
+        receipt_file: ObservedFile,
+        receipt: ProvisioningReceiptV1,
+    ) -> SecurityResult<SecurityOutcome> {
+        if self
+            .runtime
+            .transient_exists(&readiness_unit_name(&receipt.transaction_id))?
+        {
+            return Err(SecurityError::Refused(
+                "receipt readiness transaction control is active".into(),
+            ));
+        }
+
+        let initial = self.observe_package_mode1_live(&receipt)?;
+        let preview_before = self.runtime.preview_verifier(&initial.config.bytes)?;
+        let readiness = self.run_stable_strong_readiness(
+            &receipt.transaction_id,
+            howy_common::paths::CONFIG_FILE,
+            MODE1_CREDENTIAL_PATH,
+            &initial.config.bytes,
+        )?;
+        if readiness != preview_before
+            || readiness.config_sha256 != selected_receipt_config_sha256(&receipt)
+            || readiness.daemon != self.runtime.daemon_verifier_identity()?
+        {
+            return Err(SecurityError::operation(
+                "fresh package readiness did not bind the admitted config and daemon",
+            ));
+        }
+        validate_receipted_credential_policy(&receipt, &initial.artifact)?;
+
+        let stable = self.observe_package_mode1_live(&receipt)?;
+        if stable != initial || self.runtime.preview_verifier(&stable.config.bytes)? != readiness {
+            return Err(SecurityError::operation(
+                "receipted state changed after fresh package readiness",
+            ));
+        }
+        self.require_package_reconcile_controls_clear()?;
+        self.require_package_reconcile_units_inactive()?;
+
+        let mut rebuilt = receipt.clone();
+        rebuilt.unit_credential = stable.unit_credential.clone();
+        rebuilt.effective_units = stable.effective_units.clone();
+        rebuilt.verifier = VerifierReceipt::new(readiness.clone())
+            .map_err(|error| SecurityError::operation(error.to_string()))?;
+        validate_package_reconcile_preservation(&receipt, &rebuilt)?;
+        rebuilt
+            .validate()
+            .map_err(|error| SecurityError::operation(error.to_string()))?;
+        let rebuilt_bytes = rebuilt
+            .deterministic_bytes()
+            .map_err(|error| SecurityError::operation(error.to_string()))?;
+
+        let publication_live = self.observe_package_mode1_live(&receipt)?;
+        if publication_live != stable
+            || self
+                .runtime
+                .preview_verifier(&publication_live.config.bytes)?
+                != readiness
+        {
+            return Err(SecurityError::operation(
+                "receipted state changed before package receipt publication",
+            ));
+        }
+        self.require_package_reconcile_controls_clear()?;
+        self.require_package_reconcile_units_inactive()?;
+        self.runtime.validate_package_marker()?;
+        let current_receipt = self
+            .read_receipt_file()?
+            .ok_or_else(|| SecurityError::operation("Mode 1 receipt disappeared"))?;
+        if current_receipt.0 != receipt_file || current_receipt.1 != receipt {
+            return Err(SecurityError::operation(
+                "Mode 1 receipt changed before package publication",
+            ));
+        }
+
+        let target = self
+            .runtime
+            .observe_atomic_target(SECURITY_RECEIPT_PATH, MAX_RECEIPT_BYTES)?;
+        if target.parent_directory.uid != 0
+            || target.parent_directory.gid != 0
+            || target.parent_directory.permissions
+                != expected_parent_permissions(SECURITY_RECEIPT_PATH)?
+            || target.target.as_ref() != Some(&receipt_file)
+        {
+            return Err(SecurityError::operation(
+                "receipt publication target changed or has unsafe metadata",
+            ));
+        }
+        let plan = AtomicWritePlanV1::new(
+            &receipt.transaction_id,
+            SECURITY_RECEIPT_PATH,
+            target.parent_directory,
+            AtomicExpectedTargetV1::Present(receipt_file.atomic_identity()),
+            0,
+            0,
+            0o600,
+            None,
+            &rebuilt_bytes,
+            AtomicWriteKindV1::Exchange,
+        )
+        .map_err(|error| SecurityError::operation(error.to_string()))?;
+        let publication = self
+            .runtime
+            .publish_package_receipt(&plan, &rebuilt_bytes)?;
+
+        self.validate_published_package_receipt(&rebuilt, &rebuilt_bytes, &readiness)?;
+        self.runtime.remove_atomic_backup(&plan, &publication)?;
+        self.validate_published_package_receipt(&rebuilt, &rebuilt_bytes, &readiness)?;
+
+        let state = match rebuilt.state {
+            ReceiptState::ProvisionedDisabled => "provisioned-disabled",
+            ReceiptState::Enabled => "enabled",
+        };
+        Ok(SecurityOutcome {
+            messages: vec![format!("Package receipt reconciled: Mode 1 {state}.")],
+            cleanup_command: None,
+        })
+    }
+
+    fn validate_published_package_receipt(
+        &mut self,
+        expected: &ProvisioningReceiptV1,
+        expected_bytes: &[u8],
+        readiness: &VerifierResultV1,
+    ) -> SecurityResult<()> {
+        self.require_package_reconcile_controls_clear()?;
+        self.require_package_reconcile_units_inactive()?;
+        self.runtime.validate_package_marker()?;
+        let (receipt_file, receipt) = self
+            .read_receipt_file()?
+            .ok_or_else(|| SecurityError::operation("published receipt disappeared"))?;
+        if receipt_file.bytes != expected_bytes || receipt != *expected {
+            return Err(SecurityError::operation(
+                "published receipt bytes or structure differ from reconciliation",
+            ));
+        }
+        let live = self.observe_package_mode1_live(&receipt)?;
+        validate_receipted_credential_policy(&receipt, &live.artifact)?;
+        if live.unit_credential != receipt.unit_credential
+            || live.effective_units != receipt.effective_units
+            || self.runtime.preview_verifier(&live.config.bytes)? != *readiness
+            || receipt.verifier.output != *readiness
+            || receipt.verifier.output.daemon != self.runtime.daemon_verifier_identity()?
+        {
+            return Err(SecurityError::operation(
+                "published receipt does not match live package state",
+            ));
+        }
+        Ok(())
+    }
+
+    fn observe_package_mode1_live(
+        &mut self,
+        receipt: &ProvisioningReceiptV1,
+    ) -> SecurityResult<PackageMode1Live> {
+        let config = self
+            .runtime
+            .read_file(howy_common::paths::CONFIG_FILE, MAX_CONFIG_BYTES)?
+            .ok_or_else(|| SecurityError::operation("receipted config is missing"))?;
+        validate_receipted_config(&config, receipt)?;
+        let artifact = self
+            .runtime
+            .read_file(
+                MODE1_CREDENTIAL_PATH,
+                howy_common::provisioning::SYSTEMD_CREDENTIAL_TEXT_SIZE_MAX,
+            )?
+            .ok_or_else(|| SecurityError::operation("receipted credential is missing"))?;
+        validate_receipted_artifact_structure(&artifact, receipt)?;
+        let dropin = self
+            .runtime
+            .read_file(MODE1_DROPIN_PATH, MAX_DROPIN_BYTES)?
+            .ok_or_else(|| SecurityError::operation("receipted drop-in is missing"))?;
+        dropin.validate_regular(0, 0, 0o600)?;
+        if dropin.bytes != MODE1_DROPIN_BYTES {
+            return Err(SecurityError::operation(
+                "receipted drop-in bytes differ from installed policy",
+            ));
+        }
+        let base_service = self
+            .runtime
+            .read_file(BASE_SERVICE_UNIT_PATH, MAX_DROPIN_BYTES)?
+            .ok_or_else(|| SecurityError::operation("base howy.service is missing"))?;
+        let base_socket = self
+            .runtime
+            .read_file(BASE_SOCKET_UNIT_PATH, MAX_DROPIN_BYTES)?
+            .ok_or_else(|| SecurityError::operation("base howy.socket is missing"))?;
+        base_service.validate_regular(0, 0, 0o644)?;
+        base_socket.validate_regular(0, 0, 0o644)?;
+
+        let effective_units = self.observe_effective_units()?;
+        effective_units
+            .validate_mode1(&dropin.sha256())
+            .map_err(|error| SecurityError::operation(error.to_string()))?;
+        validate_effective_fragment(
+            &effective_units.service.fragment,
+            BASE_SERVICE_UNIT_PATH,
+            &base_service,
+        )?;
+        validate_effective_fragment(
+            &effective_units.socket.fragment,
+            BASE_SOCKET_UNIT_PATH,
+            &base_socket,
+        )?;
+        let effective_dropin = effective_units
+            .service
+            .dropins
+            .first()
+            .ok_or_else(|| SecurityError::operation("effective Mode 1 drop-in is missing"))?;
+        validate_effective_fragment(effective_dropin, MODE1_DROPIN_PATH, &dropin)?;
+        let source = effective_units
+            .service
+            .set_credential
+            .first()
+            .ok_or_else(|| SecurityError::operation("effective credential source is missing"))?;
+        let unit_credential = UnitCredentialReceipt {
+            base_unit_sha256: base_service.sha256(),
+            dropin_sha256: dropin.sha256(),
+            source_companion_name: source.name.clone(),
+            configured_credential_source: ConfiguredMode1CredentialSource::parse(
+                source.value.as_bytes(),
+                Mode1CredentialSourcePolicy::Production,
+            )
+            .map_err(|error| SecurityError::operation(error.to_string()))?,
+        };
+
+        Ok(PackageMode1Live {
+            config,
+            artifact,
+            dropin,
+            base_service,
+            base_socket,
+            effective_units,
+            unit_credential,
+        })
+    }
+
+    fn require_package_reconcile_controls_clear(&mut self) -> SecurityResult<()> {
+        if self.runtime.load_journal()?.is_some() {
+            return Err(SecurityError::Refused(
+                "active provisioning journal blocks package reconciliation".into(),
+            ));
+        }
+        if self
+            .runtime
+            .read_file(SECURITY_TRANSACTION_GUARD_PATH, 256)?
+            .is_some()
+        {
+            return Err(SecurityError::Refused(
+                "active provisioning guard blocks package reconciliation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_package_reconcile_units_inactive(&mut self) -> SecurityResult<()> {
+        let (service, socket) = self.stable_unit_pair()?;
+        if service.rollback_target() != Some(StableRollbackTarget::InactiveDead)
+            || socket.rollback_target() != Some(StableRollbackTarget::InactiveDead)
+        {
+            return Err(SecurityError::Refused(
+                "howy.service and howy.socket must both be stopped before package reconciliation"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     fn supervise<T>(
@@ -4637,6 +5112,254 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackageMode1Live {
+    config: ObservedFile,
+    artifact: ObservedFile,
+    dropin: ObservedFile,
+    base_service: ObservedFile,
+    base_socket: ObservedFile,
+    effective_units: EffectiveUnitSetV1,
+    unit_credential: UnitCredentialReceipt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageNoReceiptState {
+    Bootstrap,
+    Mode0,
+    LegacyCandidateMode0,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackageNoReceiptLive {
+    state: PackageNoReceiptState,
+    config: ObservedFile,
+    artifact: Option<ObservedFile>,
+    dropin: Option<ObservedFile>,
+    namespace_nonempty: bool,
+    base_service: ObservedFile,
+    base_socket: ObservedFile,
+    effective_units: EffectiveUnitSetV1,
+    daemon: DaemonVerifierIdentityV1,
+}
+
+fn selected_receipt_config_sha256(receipt: &ProvisioningReceiptV1) -> Sha256Digest {
+    match receipt.state {
+        ReceiptState::ProvisionedDisabled => receipt.config_patch.disabled_sha256.clone(),
+        ReceiptState::Enabled => receipt.config_patch.enabled_sha256.clone(),
+    }
+}
+
+fn validate_receipted_config(
+    config: &ObservedFile,
+    receipt: &ProvisioningReceiptV1,
+) -> SecurityResult<()> {
+    config.validate_regular(0, 0, 0o600)?;
+    let source = std::str::from_utf8(&config.bytes)
+        .map_err(|_| SecurityError::operation("receipted config is not UTF-8"))?;
+    let parsed: HowyConfig = toml::from_str(source)
+        .map_err(|_| SecurityError::operation("receipted config is invalid"))?;
+    parsed.validate().map_err(SecurityError::operation)?;
+    let expected_disabled = receipt.state == ReceiptState::ProvisionedDisabled;
+    if parsed.security.embedding_mode != EmbeddingSecurityMode::AeadCached
+        || parsed.security.key_epoch != receipt.epoch
+        || parsed.security.cached.credential_name != receipt.credential_name
+        || parsed.core.disabled != expected_disabled
+        || config.sha256() != selected_receipt_config_sha256(receipt)
+    {
+        return Err(SecurityError::operation(
+            "live config does not match the receipted Mode 1 identity",
+        ));
+    }
+
+    match receipt.state {
+        ReceiptState::ProvisionedDisabled => {
+            apply_receipted_config_patch(&config.bytes, &receipt.config_patch)
+                .map_err(|error| SecurityError::operation(error.to_string()))?;
+        }
+        ReceiptState::Enabled => {
+            let start = usize::try_from(receipt.config_patch.byte_start)
+                .map_err(|_| SecurityError::operation("config patch offset overflow"))?;
+            let disabled_end = usize::try_from(receipt.config_patch.byte_end)
+                .map_err(|_| SecurityError::operation("config patch offset overflow"))?;
+            let enabled_end = disabled_end
+                .checked_add(1)
+                .ok_or_else(|| SecurityError::operation("config patch offset overflow"))?;
+            if config.bytes.get(start..enabled_end) != Some(b"false") {
+                return Err(SecurityError::operation(
+                    "enabled config does not carry the receipted patch token",
+                ));
+            }
+            let mut disabled = Vec::with_capacity(config.bytes.len().saturating_sub(1));
+            disabled.extend_from_slice(&config.bytes[..start]);
+            disabled.extend_from_slice(b"true");
+            disabled.extend_from_slice(&config.bytes[enabled_end..]);
+            let enabled = apply_receipted_config_patch(&disabled, &receipt.config_patch)
+                .map_err(|error| SecurityError::operation(error.to_string()))?;
+            if enabled != config.bytes {
+                return Err(SecurityError::operation(
+                    "enabled config does not round-trip through the receipted patch",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_receipted_artifact_structure(
+    artifact: &ObservedFile,
+    receipt: &ProvisioningReceiptV1,
+) -> SecurityResult<()> {
+    artifact.validate_regular(0, 0, 0o600)?;
+    let inspected = inspect_systemd_credential_envelope(&artifact.bytes)
+        .map_err(|error| SecurityError::operation(error.to_string()))?;
+    if receipt.artifact.path != MODE1_CREDENTIAL_PATH
+        || artifact.sha256() != receipt.artifact.sha256
+        || artifact.metadata.byte_length != receipt.artifact.size
+        || artifact.metadata.uid != receipt.artifact.uid
+        || artifact.metadata.gid != receipt.artifact.gid
+        || artifact.metadata.permissions != receipt.artifact.mode
+        || artifact.metadata.link_count != receipt.artifact.nlink
+        || inspected.actual_key_id != receipt.artifact.credential_policy.actual_key_id
+        || inspected.literal_pcr_mask != receipt.artifact.credential_policy.literal_pcr_mask
+        || inspected.envelope_sha256 != receipt.artifact.credential_policy.envelope_sha256
+        || inspected.envelope_size != receipt.artifact.credential_policy.envelope_size
+    {
+        return Err(SecurityError::operation(
+            "live credential artifact does not match the immutable receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_receipted_credential_policy(
+    receipt: &ProvisioningReceiptV1,
+    artifact: &ObservedFile,
+) -> SecurityResult<()> {
+    let inspected = inspect_systemd_credential_envelope(&artifact.bytes)
+        .map_err(|error| SecurityError::operation(error.to_string()))?;
+    let validation = CredentialCryptographicValidation {
+        envelope_sha256: inspected.envelope_sha256,
+        embedded_name: receipt.credential_name.clone(),
+        plaintext_size: howy_common::provisioning::SYSTEMD_CREDENTIAL_PLAINTEXT_BYTES,
+        authenticated: true,
+        exact_consumption: true,
+    };
+    let verified = validate_systemd_credential_envelope(
+        &artifact.bytes,
+        receipt.artifact.credential_policy.requested_selector,
+        &receipt.credential_name,
+        &validation,
+    )
+    .map_err(|error| SecurityError::operation(error.to_string()))?;
+    if verified != receipt.artifact.credential_policy {
+        return Err(SecurityError::operation(
+            "fresh readiness did not reverify the immutable credential policy",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_package_reconcile_preservation(
+    original: &ProvisioningReceiptV1,
+    rebuilt: &ProvisioningReceiptV1,
+) -> SecurityResult<()> {
+    let mut expected = original.clone();
+    expected.unit_credential = rebuilt.unit_credential.clone();
+    expected.effective_units = rebuilt.effective_units.clone();
+    expected.verifier = rebuilt.verifier.clone();
+    if expected != *rebuilt {
+        return Err(SecurityError::operation(
+            "package reconciliation changed an immutable receipt field",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_effective_fragment(
+    effective: &howy_common::provisioning::EffectiveUnitFileV1,
+    expected_path: &str,
+    live: &ObservedFile,
+) -> SecurityResult<()> {
+    if effective.path != expected_path
+        || effective.sha256 != live.sha256()
+        || effective.metadata.object_type != live.metadata.object_type
+        || effective.metadata.uid != live.metadata.uid
+        || effective.metadata.gid != live.metadata.gid
+        || effective.metadata.permissions != live.metadata.permissions
+        || effective.metadata.link_count != live.metadata.link_count
+        || effective.metadata.byte_length != live.metadata.byte_length
+    {
+        return Err(SecurityError::operation(
+            "effective unit fragment does not match the live file",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_package_mode0_config(config: &ObservedFile) -> SecurityResult<()> {
+    config.validate_regular(0, 0, 0o600)?;
+    validate_package_mode0_config_semantics(config)
+}
+
+fn validate_package_legacy_candidate_mode0_config(config: &ObservedFile) -> SecurityResult<()> {
+    let expected_permissions = if config.metadata.permissions == 0o644 {
+        0o644
+    } else {
+        0o600
+    };
+    config.validate_regular(0, 0, expected_permissions)?;
+    validate_package_mode0_config_semantics(config)
+}
+
+fn validate_package_mode0_config_semantics(config: &ObservedFile) -> SecurityResult<()> {
+    let source = std::str::from_utf8(&config.bytes)
+        .map_err(|_| SecurityError::operation("Mode 0 config is not UTF-8"))?;
+    let parsed: HowyConfig =
+        toml::from_str(source).map_err(|_| SecurityError::operation("Mode 0 config is invalid"))?;
+    parsed.validate().map_err(SecurityError::operation)?;
+    if parsed.security.embedding_mode != EmbeddingSecurityMode::Plaintext
+        || parsed.core.disabled
+        || parsed.presence.mode != PresenceMode::Off
+    {
+        return Err(SecurityError::Refused(
+            "config is not exact enabled Mode 0".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_package_units_without_security_dropin(
+    units: &EffectiveUnitSetV1,
+    service: &ObservedFile,
+    socket: &ObservedFile,
+) -> SecurityResult<()> {
+    service.validate_regular(0, 0, 0o644)?;
+    socket.validate_regular(0, 0, 0o644)?;
+    validate_effective_fragment(&units.service.fragment, BASE_SERVICE_UNIT_PATH, service)?;
+    validate_effective_fragment(&units.socket.fragment, BASE_SOCKET_UNIT_PATH, socket)?;
+    if units.service.unit_kind != UnitKind::Service
+        || units.socket.unit_kind != UnitKind::Socket
+        || !units.service.dropins.is_empty()
+        || !units.socket.dropins.is_empty()
+        || units.service.conditions != required_unit_conditions()
+        || units.socket.conditions != required_unit_conditions()
+        || !units.service.load_credential_encrypted.is_empty()
+        || !units.service.set_credential.is_empty()
+        || !units.socket.load_credential_encrypted.is_empty()
+        || !units.socket.set_credential.is_empty()
+        || units.service.exec_start != [vec!["/usr/bin/howyd".to_owned()]]
+        || !units.socket.exec_start.is_empty()
+        || units.service.hardening != required_service_hardening()
+        || !units.socket.hardening.is_empty()
+    {
+        return Err(SecurityError::operation(
+            "effective units are not exact unprovisioned bootstrap policy",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_explicit_mode(config: Option<&ObservedFile>) -> SecurityResult<Option<(u8, u64)>> {
     let Some(config) = config else {
         return Ok(None);
@@ -4841,7 +5564,7 @@ fn enabled_receipt_from(disabled: &ProvisioningReceiptV1) -> SecurityResult<Prov
     Ok(enabled)
 }
 
-fn receipt_matches_live<R: SecurityRuntime>(
+pub(super) fn receipt_matches_live<R: SecurityRuntime>(
     receipt: &ProvisioningReceiptV1,
     config: &ObservedFile,
     artifact: &ObservedFile,

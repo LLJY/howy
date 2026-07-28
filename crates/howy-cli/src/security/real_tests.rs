@@ -11,7 +11,7 @@ use crate::security::engine::{
     SecurityEngine, SecurityRuntime,
 };
 use howy_common::config::EmbeddingSecurityMode;
-use howy_common::provisioning::{JournalPhase, SECURITY_RECEIPT_PATH};
+use howy_common::provisioning::{JournalPhase, MAX_RECEIPT_BYTES, SECURITY_RECEIPT_PATH};
 
 const VALID_TRANSACTION: &str = "txn-0123456789abcdef0123456789abcdef";
 const VALID_UNIT: &str = "howy-readiness-txn-0123456789abcdef0123456789abcdef.service";
@@ -723,6 +723,173 @@ fn real_atomic_runtime_commits_absent_and_exchange_without_hidden_cleanup() {
         .remove_atomic_backup(&exchange_plan, &exchange_observation)
         .unwrap();
     assert!(!Path::new(&exchange_plan.staging_path).exists());
+}
+
+#[test]
+fn rooted_real_package_receipt_publication_uses_atomic_exchange_and_exact_cleanup() {
+    if !run_root_owned_branch(
+        "security::real::tests::rooted_real_package_receipt_publication_uses_atomic_exchange_and_exact_cleanup",
+    ) {
+        return;
+    }
+    let root = AtomicTempDir::new();
+    prepare_rooted_production_parents(&root.0);
+    let state = root.0.join("var/lib/howy/security-state");
+    fs::create_dir_all(&state).unwrap();
+    fs::set_permissions(
+        root.0.join("var/lib/howy"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let target = root.0.join(SECURITY_RECEIPT_PATH.trim_start_matches('/'));
+    write_mode(&target, b"old-receipt", 0o600);
+    let mut runtime = RealSecurityRuntime::rooted(&root.0).unwrap();
+    let observed = runtime
+        .observe_atomic_target(SECURITY_RECEIPT_PATH, MAX_RECEIPT_BYTES)
+        .unwrap();
+    let plan = AtomicWritePlanV1::new(
+        VALID_TRANSACTION,
+        SECURITY_RECEIPT_PATH,
+        observed.parent_directory,
+        AtomicExpectedTargetV1::Present(observed.target.unwrap().atomic_identity()),
+        0,
+        0,
+        0o600,
+        None,
+        b"new-receipt",
+        AtomicWriteKindV1::Exchange,
+    )
+    .unwrap();
+    runtime.atomic_failure = Some("rename");
+    assert!(
+        runtime
+            .publish_package_receipt(&plan, b"new-receipt")
+            .is_err()
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"old-receipt");
+    assert!(!runtime.paths.resolve(&plan.staging_path).unwrap().exists());
+    let publication = runtime
+        .publish_package_receipt(&plan, b"new-receipt")
+        .unwrap();
+    let backup = runtime
+        .paths
+        .resolve(plan.backup_path.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"new-receipt");
+    assert_eq!(fs::read(&backup).unwrap(), b"old-receipt");
+    runtime.remove_atomic_backup(&plan, &publication).unwrap();
+    assert!(!backup.exists());
+    assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o600);
+}
+
+#[test]
+fn rooted_real_package_receipt_postrename_and_cleanup_failures_retain_exact_backup() {
+    if !run_root_owned_branch(
+        "security::real::tests::rooted_real_package_receipt_postrename_and_cleanup_failures_retain_exact_backup",
+    ) {
+        return;
+    }
+    for failure in ["renamed", "directory-fsync"] {
+        let (root, mut runtime, target, plan) = rooted_package_receipt_fixture();
+        runtime.atomic_failure = Some(failure);
+        assert!(
+            runtime
+                .publish_package_receipt(&plan, b"new-receipt")
+                .is_err(),
+            "{failure} unexpectedly succeeded"
+        );
+        let backup = runtime.paths.resolve(&plan.staging_path).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new-receipt", "{failure}");
+        assert_eq!(fs::read(&backup).unwrap(), b"old-receipt", "{failure}");
+        let published = runtime
+            .observe_atomic_target(SECURITY_RECEIPT_PATH, MAX_RECEIPT_BYTES)
+            .unwrap()
+            .target
+            .unwrap()
+            .atomic_identity();
+        let AtomicWriteReconciliation::Committed(observation) = runtime
+            .reconcile_atomic_write(&plan, Some(&published))
+            .unwrap()
+        else {
+            panic!("{failure} did not reconcile as published")
+        };
+        runtime.remove_atomic_backup(&plan, &observation).unwrap();
+        assert!(!backup.exists());
+        assert_eq!(fs::read(&target).unwrap(), b"new-receipt");
+        assert!(
+            !root
+                .0
+                .join(SECURITY_JOURNAL_PATH.trim_start_matches('/'))
+                .exists()
+        );
+        drop(root);
+    }
+
+    let (root, mut runtime, target, plan) = rooted_package_receipt_fixture();
+    let publication = runtime
+        .publish_package_receipt(&plan, b"new-receipt")
+        .unwrap();
+    let backup = runtime.paths.resolve(&plan.staging_path).unwrap();
+    assert_eq!(fs::read(&backup).unwrap(), b"old-receipt");
+    // A post-publication validator may fail without authorizing backup cleanup.
+    let validation: SecurityResult<()> = Err(SecurityError::operation("validation failed"));
+    assert!(validation.is_err());
+    assert_eq!(fs::read(&target).unwrap(), b"new-receipt");
+    assert_eq!(fs::read(&backup).unwrap(), b"old-receipt");
+
+    runtime.atomic_failure = Some("backup-unlink");
+    assert!(runtime.remove_atomic_backup(&plan, &publication).is_err());
+    assert_eq!(fs::read(&target).unwrap(), b"new-receipt");
+    assert_eq!(fs::read(&backup).unwrap(), b"old-receipt");
+    runtime.remove_atomic_backup(&plan, &publication).unwrap();
+    assert!(!backup.exists());
+    assert_eq!(fs::read(&target).unwrap(), b"new-receipt");
+    assert!(
+        !root
+            .0
+            .join(SECURITY_JOURNAL_PATH.trim_start_matches('/'))
+            .exists()
+    );
+    drop(root);
+}
+
+fn rooted_package_receipt_fixture() -> (
+    AtomicTempDir,
+    RealSecurityRuntime,
+    PathBuf,
+    AtomicWritePlanV1,
+) {
+    let root = AtomicTempDir::new();
+    prepare_rooted_production_parents(&root.0);
+    let state = root.0.join("var/lib/howy/security-state");
+    fs::create_dir_all(&state).unwrap();
+    fs::set_permissions(
+        root.0.join("var/lib/howy"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let target = root.0.join(SECURITY_RECEIPT_PATH.trim_start_matches('/'));
+    write_mode(&target, b"old-receipt", 0o600);
+    let mut runtime = RealSecurityRuntime::rooted(&root.0).unwrap();
+    let observed = runtime
+        .observe_atomic_target(SECURITY_RECEIPT_PATH, MAX_RECEIPT_BYTES)
+        .unwrap();
+    let plan = AtomicWritePlanV1::new(
+        VALID_TRANSACTION,
+        SECURITY_RECEIPT_PATH,
+        observed.parent_directory,
+        AtomicExpectedTargetV1::Present(observed.target.unwrap().atomic_identity()),
+        0,
+        0,
+        0o600,
+        None,
+        b"new-receipt",
+        AtomicWriteKindV1::Exchange,
+    )
+    .unwrap();
+    (root, runtime, target, plan)
 }
 
 #[test]
@@ -1689,6 +1856,10 @@ impl SecurityRuntime for RootedEngineRuntime {
 
     fn acquire_lock(&mut self) -> SecurityResult<()> {
         self.fs.acquire_lock()
+    }
+
+    fn validate_package_marker(&mut self) -> SecurityResult<()> {
+        Ok(())
     }
 
     fn require_systemd_261(&mut self) -> SecurityResult<()> {

@@ -35,7 +35,7 @@ pub const MANIFEST_PATH: &str = "/var/lib/howy/config-bridge/manifest-v2.json";
 pub const MARKER_PATH: &str = "/var/lib/howy-package-bootstrap.complete";
 
 const LEGACY_BYTES: &[u8] = include_bytes!("../../../packaging/config-release-n-legacy.toml");
-const BOOTSTRAP_BYTES: &[u8] = include_bytes!("../../../packaging/config.bootstrap.toml");
+pub const BOOTSTRAP_BYTES: &[u8] = include_bytes!("../../../packaging/config.bootstrap.toml");
 const SCHEMA_VERSION: u16 = 2;
 const MARKER_SCHEMA_VERSION: u16 = 1;
 const RELEASE_ID: &str = "release-n";
@@ -683,6 +683,72 @@ impl ConfigBridge {
     pub fn recover(&mut self) -> Result<()> {
         self.begin()?;
         self.recover_locked(true)
+    }
+
+    /// Validate the existing positive package marker without creating,
+    /// replacing, or refreshing any bridge control.
+    pub fn validate_current_marker(&mut self) -> Result<()> {
+        self.begin()?;
+        if let Some(journal) = self.read_path(JOURNAL_PATH, MAX_CONTROL_BYTES)? {
+            require_control_file(
+                &journal,
+                self.paths.expected_uid,
+                self.paths.expected_gid,
+                "bridge journal",
+            )?;
+            let parsed: BridgeJournal = serde_json::from_slice(&journal.bytes)
+                .map_err(|_| BridgeError::refused("bridge journal is not the strict v2 schema"))?;
+            parsed.validate()?;
+            return Err(BridgeError::refused(
+                "active bridge journal blocks package marker validation",
+            ));
+        }
+        self.refuse_orphan_stages(None)?;
+
+        let marker_snapshot = self
+            .read_marker_snapshot()?
+            .ok_or_else(|| BridgeError::refused("package bootstrap marker is missing"))?;
+        let marker: BootstrapMarker = serde_json::from_slice(&marker_snapshot.bytes)
+            .map_err(|_| BridgeError::refused("package bootstrap marker is malformed"))?;
+        validate_marker(&marker)?;
+        let live = self.snapshot_config_state()?;
+        validate_safe_completion_state(&live, self.paths.expected_uid, self.paths.expected_gid)?;
+        if !config_states_exact_match(&marker.config, &live) {
+            return Err(BridgeError::refused(
+                "package bootstrap marker does not bind the current config identity",
+            ));
+        }
+
+        match (marker.generation, self.read_manifest()?) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(BridgeError::refused(
+                "generation-free marker conflicts with an active bridge manifest",
+            )),
+            (Some(_), None) => Err(BridgeError::refused(
+                "generated marker is missing its bridge manifest",
+            )),
+            (Some(generation), Some((manifest, _))) => {
+                let GenerationState::Restored {
+                    restored_target,
+                    restore_transaction_id,
+                    ..
+                } = &manifest.active.state
+                else {
+                    return Err(BridgeError::refused(
+                        "generated marker manifest is not restored",
+                    ));
+                };
+                if manifest.active.generation != generation
+                    || marker.transaction_id != *restore_transaction_id
+                    || !config_states_exact_match(&marker.config, restored_target)
+                {
+                    return Err(BridgeError::refused(
+                        "package marker generation or restored-target binding is invalid",
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
 
     fn require_identity(&self) -> Result<()> {
@@ -2009,6 +2075,10 @@ impl ConfigBridge {
             Ok(())
         }
     }
+}
+
+pub fn validate_bootstrap_config(bytes: &[u8]) -> Result<()> {
+    validate_bootstrap_semantics(bytes)
 }
 
 enum PublishOutcome {
