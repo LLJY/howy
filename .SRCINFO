@@ -17,6 +17,7 @@ pkgbase = howy
 pkgname = howy-cpu
 	pkgdesc = Linux face authentication daemon intended for ONNX Runtime CPU backend
 	install = howy.install
+	depends = diffutils
 	depends = onnxruntime
 	depends = pam
 	depends = systemd>=261
@@ -43,6 +44,7 @@ pkgname = howy-cpu
 pkgname = howy-rocm
 	pkgdesc = Linux face authentication daemon intended for ONNX Runtime ROCm backend
 	install = howy.install
+	depends = diffutils
 	depends = onnxruntime
 	depends = pam
 	depends = systemd>=261
@@ -69,6 +71,7 @@ pkgname = howy-rocm
 pkgname = howy-cuda
 	pkgdesc = Linux face authentication daemon intended for ONNX Runtime CUDA backend
 	install = howy.install
+	depends = diffutils
 	depends = onnxruntime
 	depends = pam
 	depends = systemd>=261
