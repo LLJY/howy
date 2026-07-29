@@ -856,7 +856,14 @@ main() {
         retain_failure 'could not create the root-only prepared sentinel'
         return 1
     fi
-    if ! /usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"; then
+    if ! HOWY_V2_UPDATE_FORMAT="${UPDATE_FORMAT}" \
+        HOWY_V2_UPDATE_ARCHIVE="${ARCHIVE_PATH}" \
+        HOWY_V2_UPDATE_ARCHIVE_SHA256="${ARCHIVE_SHA256}" \
+        HOWY_V2_UPDATE_SOURCE_PACKAGE="${SOURCE_PACKAGE}" \
+        HOWY_V2_UPDATE_SOURCE_VERSION="${SOURCE_VERSION}" \
+        HOWY_V2_UPDATE_TARGET_PACKAGE="${ARCHIVE_PKGNAME}" \
+        HOWY_V2_UPDATE_TARGET_VERSION="${ARCHIVE_PKGVER}" \
+        /usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"; then
         retain_failure 'pacman -U failed'
         return 1
     fi

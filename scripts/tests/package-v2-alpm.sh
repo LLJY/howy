@@ -91,7 +91,10 @@ archive_package() {
     local archive="$2"
     local -a entries=(.PKGINFO)
 
+    [[ ! -f "${tree}/.INSTALL" ]] || entries+=(.INSTALL)
+    [[ ! -d "${tree}/etc" ]] || entries+=(etc)
     [[ ! -d "${tree}/usr" ]] || entries+=(usr)
+    [[ ! -d "${tree}/var" ]] || entries+=(var)
     "${BSDTAR}" --uid 0 --gid 0 -cf "${archive}" -C "${tree}" "${entries[@]}"
 }
 
@@ -110,9 +113,35 @@ build_provider() {
             /usr/bin/mkdir -p "${tree}/usr/lib/security"
             printf 'stable pam module: %s\n' "${name}" > "${tree}/usr/lib/security/pam_howy.so"
             /usr/bin/ln -s pam_howy.so "${tree}/usr/lib/security/pam_howdy.so"
+            if [[ "${name}" == howy-rocm ]]; then
+                /usr/bin/mkdir -p "${tree}/etc/howy" "${tree}/usr/lib/howy"
+                printf 'backup = etc/howy/config.toml\n' >> "${tree}/.PKGINFO"
+                /usr/bin/install -m 0644 "${REPO_ROOT}/packaging/config-release-n-legacy.toml" \
+                    "${tree}/etc/howy/config.toml"
+                /usr/bin/install -m 0644 "${REPO_ROOT}/howy.install" "${tree}/.INSTALL"
+                {
+                    printf '#!/bin/bash\n'
+                    printf 'printf "%%s\\n" "$*" >> /bridge.calls\n'
+                    printf 'if [[ "$1" == bootstrap-release-n ]]; then\n'
+                    printf '    umask 077\n'
+                    printf '    : > /var/lib/howy-package-bootstrap.complete\n'
+                    printf 'fi\n'
+                    printf 'exit 0\n'
+                } > "${tree}/usr/lib/howy/howy-config-bridge"
+                /usr/bin/chmod 0755 "${tree}/usr/lib/howy/howy-config-bridge"
+            fi
             ;;
         howy-rocm-mode0)
-            /usr/bin/mkdir -p "${tree}/usr/lib/security"
+            /usr/bin/mkdir -p \
+                "${tree}/etc/howy" \
+                "${tree}/usr/lib/security" \
+                "${tree}/var/lib"
+            printf 'backup = etc/howy/config.toml\n' >> "${tree}/.PKGINFO"
+            /usr/bin/install -m 0600 "${REPO_ROOT}/packaging/deploy/config.toml" \
+                "${tree}/etc/howy/config.toml"
+            /usr/bin/install -m 0600 \
+                "${REPO_ROOT}/packaging/deploy/package-capability.marker" \
+                "${tree}/var/lib/howy-package-bootstrap.complete"
             printf 'candidate pam module\n' > "${tree}/usr/lib/security/pam_howy.so"
             /usr/bin/ln -s pam_howy.so "${tree}/usr/lib/security/pam_howdy.so"
             ;;
@@ -272,7 +301,7 @@ assert_conflict_without_replaces() {
 
 release_archive=$(build_provider howy-cpu-git 0.1.0.r26.g2dfe39e-1)
 stable_cpu_archive=$(build_provider howy-cpu 2.0.0-1 howy-cpu-git)
-candidate_archive=$(build_provider howy-rocm-mode0 0.1.0.r27.g0b76fa2-7)
+candidate_archive=$(build_provider howy-rocm-mode0 0.1.0.r27.g0b76fa2-6)
 stable_rocm_archive=$(build_provider howy-rocm 2.0.0-1 howy-rocm-mode0)
 removal_archive=$(build_removal_fixture)
 stable_old_archive=$(build_stable_update_fixture old 'old stable bytes')
@@ -299,11 +328,67 @@ if pacman_query "${case_dir}" howy-cpu-git >/dev/null 2>&1; then
 fi
 
 case_dir=$(new_root candidate-replacement)
+root="${case_dir}/root"
+copy_runtime /bin/bash "${root}"
+copy_runtime /usr/bin/bash "${root}"
+copy_runtime /usr/bin/sha256sum "${root}"
+copy_runtime /usr/bin/stat "${root}"
+/usr/bin/ln -s bash "${root}/bin/sh"
+/usr/bin/mkdir "${root}/dev"
+: > "${root}/dev/null"
+/usr/bin/chmod 0666 "${root}/dev/null"
 pacman_install "${case_dir}" "${candidate_archive}" >/dev/null
+/usr/bin/mkdir "${WORK}/candidate-config-baseline"
+"${BSDTAR}" -xf "${candidate_archive}" -C "${WORK}/candidate-config-baseline" \
+    etc/howy/config.toml
+/usr/bin/cmp -s -- "${WORK}/candidate-config-baseline/etc/howy/config.toml" \
+    "${root}/etc/howy/config.toml" \
+    || fail 'candidate fixture config was not byte-identical to its package baseline'
+[[ "$(/usr/bin/stat -c '%a' -- "${root}/etc/howy/config.toml")" == 600 ]] \
+    || fail 'candidate fixture config mode was not 0600'
+/usr/bin/cmp -s -- "${REPO_ROOT}/packaging/deploy/package-capability.marker" \
+    "${root}/var/lib/howy-package-bootstrap.complete" \
+    || fail 'candidate fixture marker did not match the exact package capability marker'
+[[ "$(/usr/bin/stat -c '%a' -- \
+    "${root}/var/lib/howy-package-bootstrap.complete")" == 600 ]] \
+    || fail 'candidate fixture marker mode was not 0600'
 [[ -L "${case_dir}/root/usr/lib/security/pam_howdy.so" \
     && "$(/usr/bin/readlink "${case_dir}/root/usr/lib/security/pam_howdy.so")" == pam_howy.so ]] \
     || fail 'candidate fixture did not begin with the relative PAM compatibility alias'
-pacman_replace "${case_dir}" "${stable_rocm_archive}" >/dev/null
+stable_rocm_sha=$(/usr/bin/sha256sum -- "${stable_rocm_archive}")
+stable_rocm_sha=${stable_rocm_sha%% *}
+/usr/bin/mkdir -p "$(/usr/bin/dirname "${root}${stable_rocm_archive}")"
+/usr/bin/cp -- "${stable_rocm_archive}" "${root}${stable_rocm_archive}"
+printf '%s\n' \
+    'format=howy-v2-update-v1' \
+    "archive=${stable_rocm_archive}" \
+    "archive_sha256=${stable_rocm_sha}" \
+    'source_package=howy-rocm-mode0' \
+    'source_version=0.1.0.r27.g0b76fa2-6' \
+    'target_package=howy-rocm' \
+    'target_version=2.0.0-1' > "${root}/run/howy-v2-update-v1.prepared"
+/usr/bin/chmod 0600 "${root}/run/howy-v2-update-v1.prepared"
+candidate_replace_output=$( \
+    HOWY_V2_UPDATE_FORMAT=howy-v2-update-v1 \
+    HOWY_V2_UPDATE_ARCHIVE="${stable_rocm_archive}" \
+    HOWY_V2_UPDATE_ARCHIVE_SHA256="${stable_rocm_sha}" \
+    HOWY_V2_UPDATE_SOURCE_PACKAGE=howy-rocm-mode0 \
+    HOWY_V2_UPDATE_SOURCE_VERSION=0.1.0.r27.g0b76fa2-6 \
+    HOWY_V2_UPDATE_TARGET_PACKAGE=howy-rocm \
+    HOWY_V2_UPDATE_TARGET_VERSION=2.0.0-1 \
+        pacman_replace "${case_dir}" "${stable_rocm_archive}" 2>&1
+) \
+    || fail 'prepared candidate replacement failed'
+[[ "${candidate_replace_output}" \
+    == *'configuration completion is deferred to howy-v2-update'* ]] \
+    || fail "prepared candidate replacement did not report updater deferral: ${candidate_replace_output}"
+[[ ! -e "${root}/bridge.calls" ]] \
+    || fail 'prepared candidate replacement invoked bootstrap before deferral'
+[[ ! -e "${root}/var/lib/howy-package-bootstrap.complete" ]] \
+    || fail 'prepared candidate replacement retained or created a bootstrap marker'
+/usr/bin/cmp -s -- "${REPO_ROOT}/packaging/config-release-n-legacy.toml" \
+    "${root}/etc/howy/config.toml" \
+    || fail 'candidate replacement did not install the stable legacy config payload'
 pacman_query "${case_dir}" howy-rocm >/dev/null \
     || fail 'stable ROCm target was not installed after candidate replacement'
 if pacman_query "${case_dir}" howy-rocm-mode0 >/dev/null 2>&1; then
@@ -316,6 +401,37 @@ fi
 [[ -f "${case_dir}/root/usr/lib/security/pam_howy.so" \
     && ! -L "${case_dir}/root/usr/lib/security/pam_howy.so" ]] \
     || fail 'candidate replacement lost the real pam_howy.so module'
+
+case_dir=$(new_root malformed-candidate-sentinel)
+root="${case_dir}/root"
+copy_runtime /bin/bash "${root}"
+copy_runtime /usr/bin/bash "${root}"
+copy_runtime /usr/bin/sha256sum "${root}"
+copy_runtime /usr/bin/stat "${root}"
+/usr/bin/ln -s bash "${root}/bin/sh"
+/usr/bin/mkdir "${root}/dev"
+: > "${root}/dev/null"
+/usr/bin/chmod 0666 "${root}/dev/null"
+pacman_install "${case_dir}" "${candidate_archive}" >/dev/null
+printf '%s\n' \
+    'format=howy-v2-update-v1' \
+    "archive=${stable_rocm_archive}" \
+    "archive_sha256=${stable_rocm_sha}" \
+    'source_package=howy-rocm-mode0' \
+    'source_version=0.1.0.r27.g0b76fa2-6' \
+    'target_package=howy-rocm' \
+    'target_version=2.0.0-1' \
+    'extra=malformed' > "${root}/run/howy-v2-update-v1.prepared"
+/usr/bin/chmod 0600 "${root}/run/howy-v2-update-v1.prepared"
+malformed_replace_output=$(pacman_replace "${case_dir}" "${stable_rocm_archive}" 2>&1) \
+    || fail 'candidate replacement with malformed sentinel failed fresh bootstrap'
+[[ "${malformed_replace_output}" \
+    != *'configuration completion is deferred to howy-v2-update'* ]] \
+    || fail 'malformed candidate sentinel incorrectly deferred bootstrap'
+[[ "$(<"${root}/bridge.calls")" == bootstrap-release-n ]] \
+    || fail 'malformed candidate sentinel did not invoke exact fresh bootstrap'
+[[ -f "${root}/var/lib/howy-package-bootstrap.complete" ]] \
+    || fail 'bootstrap-capable bridge fixture did not create its marker'
 
 case_dir=$(new_root stable-update-admission)
 root="${case_dir}/root"
