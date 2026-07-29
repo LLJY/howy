@@ -130,10 +130,14 @@ states are refused before pacman runs.
 The helper verifies the package identity/version and archive SHA-256, preserves
 configuration, receipt, data, and unit intent, supplies the expected conflict
 answer to pacman, and reconciles security receipts against the installed v2
-bytes. If an update fails after backup creation, it leaves the units stopped and
-retains `/var/lib/howy/v2-update-backup-v1`; inspect the reported package state
-and preserve any needed files before following the helper's cleanup/rerun
-instructions.
+bytes. Migrating legacy candidate Mode 0 atomically adds only the explicit
+empty-credential drop-in; it does not change embedding mode or migrate model or
+enrollment data. A failed candidate update reports the exact bridge and
+idempotent locked-reconciliation recovery commands because atomic publication
+may already have normalized Mode 0. Any failure after backup creation leaves the
+units stopped and retains `/var/lib/howy/v2-update-backup-v1`; inspect the
+package/config state, saved unit intent, and exact backup files before following
+the reported recovery and normal-rerun instructions.
 
 ### Initial setup and daemon activation
 

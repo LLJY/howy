@@ -37,6 +37,7 @@ struct FakeFile {
     metadata: FileMetadataSnapshotV1,
     device: u64,
     inode: u64,
+    parent_permissions: u32,
 }
 
 impl FakeFile {
@@ -50,7 +51,7 @@ impl FakeFile {
             parent_inode: 42,
             parent_uid: 0,
             parent_gid: 0,
-            parent_permissions: 0o700,
+            parent_permissions: self.parent_permissions,
             parent_link_count: 2,
         }
     }
@@ -115,6 +116,12 @@ struct FakeRuntime {
     daemon_identity: DaemonVerifierIdentityV1,
     package_marker: FakePackageMarkerState,
     mutate_marker_after_package_publication: bool,
+    mutate_effective_after_package_mode0_publication: bool,
+    package_mode0_target_occupancy: Option<Vec<u8>>,
+    last_package_mode0_publication: Option<AtomicWriteObservationV1>,
+    retain_package_mode0_stage_on_not_committed: bool,
+    daemon_reload_count: usize,
+    fail_daemon_reload_on: Option<usize>,
     host_secret_secure: bool,
     auto_tpm2_available: bool,
     fail_after: Option<&'static str>,
@@ -167,6 +174,12 @@ impl FakeRuntime {
             daemon_identity: fake_daemon_identity(),
             package_marker: FakePackageMarkerState::Valid,
             mutate_marker_after_package_publication: false,
+            mutate_effective_after_package_mode0_publication: false,
+            package_mode0_target_occupancy: None,
+            last_package_mode0_publication: None,
+            retain_package_mode0_stage_on_not_committed: false,
+            daemon_reload_count: 0,
+            fail_daemon_reload_on: None,
             host_secret_secure: true,
             auto_tpm2_available: false,
             fail_after: None,
@@ -194,6 +207,21 @@ impl FakeRuntime {
 
     fn put(&mut self, path: &str, bytes: &[u8], permissions: u32) {
         self.next_inode += 1;
+        let parent = std::path::Path::new(path)
+            .parent()
+            .and_then(std::path::Path::to_str)
+            .unwrap();
+        let parent_permissions = if matches!(
+            parent,
+            howy_common::provisioning::HOWY_CONFIG_DIRECTORY
+                | howy_common::provisioning::MODE1_CREDENTIAL_DIRECTORY
+                | howy_common::provisioning::SECURITY_STATE_DIRECTORY
+                | SECURITY_UNADOPTED_DIRECTORY
+        ) {
+            0o700
+        } else {
+            0o755
+        };
         self.files.insert(
             path.into(),
             FakeFile {
@@ -201,6 +229,7 @@ impl FakeRuntime {
                 metadata: metadata(bytes.len(), permissions),
                 device: 8,
                 inode: self.next_inode,
+                parent_permissions,
             },
         );
     }
@@ -493,7 +522,15 @@ impl SecurityRuntime for FakeRuntime {
         let package_receipt = plan.target_path == SECURITY_RECEIPT_PATH
             && plan.operation == AtomicWriteKindV1::Exchange
             && matches!(plan.expected_target, AtomicExpectedTargetV1::Present(_));
+        let package_mode0 = plan.target_path == MODE1_DROPIN_PATH
+            && plan.operation == AtomicWriteKindV1::NoReplace
+            && matches!(plan.expected_target, AtomicExpectedTargetV1::Absent)
+            && plan.uid == 0
+            && plan.gid == 0
+            && plan.permissions == 0o600
+            && bytes == MODE0_DROPIN_BYTES;
         let journaled = package_receipt
+            || package_mode0
             || self
                 .files
                 .get(SECURITY_JOURNAL_PATH)
@@ -528,6 +565,21 @@ impl SecurityRuntime for FakeRuntime {
             return Err(SecurityError::Uncertain(
                 "fake atomic stage identity changed".into(),
             ));
+        }
+        let package_mode0 = plan.target_path == MODE1_DROPIN_PATH
+            && plan.operation == AtomicWriteKindV1::NoReplace
+            && matches!(plan.expected_target, AtomicExpectedTargetV1::Absent);
+        if package_mode0 {
+            if let Some(bytes) = self.package_mode0_target_occupancy.take() {
+                self.put(&plan.target_path, &bytes, 0o600);
+            }
+            self.fail_after("package-mode0-before-rename")?;
+            if self.fail_after == Some("package-mode0-uncertain-before-rename") {
+                self.fail_after = None;
+                return Err(SecurityError::Uncertain(
+                    "injected uncertain failure before package Mode 0 rename".into(),
+                ));
+            }
         }
         let current = self.files.get(&plan.target_path).cloned();
         let expected_matches = match (&plan.expected_target, &current) {
@@ -577,6 +629,18 @@ impl SecurityRuntime for FakeRuntime {
             if self.mutate_marker_after_package_publication {
                 self.mutate_marker_after_package_publication = false;
                 self.package_marker = FakePackageMarkerState::Drifted;
+            }
+        } else if package_mode0 {
+            self.last_package_mode0_publication = Some(observation.clone());
+            if self.mutate_effective_after_package_mode0_publication {
+                self.mutate_effective_after_package_mode0_publication = false;
+                self.effective_override = Some(base_effective_units());
+            }
+            if self.fail_after == Some("package-mode0-post-rename") {
+                self.fail_after = None;
+                return Err(SecurityError::Uncertain(
+                    "injected failure after package Mode 0 rename".into(),
+                ));
             }
         }
         Ok(observation)
@@ -628,7 +692,11 @@ impl SecurityRuntime for FakeRuntime {
                 .as_ref()
                 .is_some_and(|file| file.atomic_identity() == *staged)
         {
-            self.files.remove(&plan.staging_path);
+            let retain_mode0_stage = plan.target_path == MODE1_DROPIN_PATH
+                && self.retain_package_mode0_stage_on_not_committed;
+            if !retain_mode0_stage {
+                self.files.remove(&plan.staging_path);
+            }
             return Ok(AtomicWriteReconciliation::NotCommitted);
         }
         Err(SecurityError::Uncertain(
@@ -1071,6 +1139,11 @@ impl SecurityRuntime for FakeRuntime {
 
     fn daemon_reload(&mut self) -> SecurityResult<()> {
         self.events.push("daemon-reload".into());
+        self.daemon_reload_count += 1;
+        if self.fail_daemon_reload_on == Some(self.daemon_reload_count) {
+            self.fail_daemon_reload_on = None;
+            return Err(SecurityError::operation("injected daemon reload failure"));
+        }
         self.effective_units = effective_units_for_files(
             self.files.get(BASE_SERVICE_UNIT_PATH),
             self.files.get(BASE_SOCKET_UNIT_PATH),
@@ -1578,6 +1651,13 @@ fn legacy_candidate_mode0_runtime() -> FakeRuntime {
         include_bytes!("../../../../packaging/deploy/config.toml"),
         0o644,
     );
+    runtime
+}
+
+fn normalizable_legacy_candidate_mode0_runtime() -> FakeRuntime {
+    let mut runtime = legacy_candidate_mode0_runtime();
+    let config = runtime.files[howy_common::paths::CONFIG_FILE].bytes.clone();
+    runtime.put(howy_common::paths::CONFIG_FILE, &config, 0o600);
     runtime
 }
 
@@ -3781,7 +3861,7 @@ fn package_reconcile_rebinds_disabled_receipt_and_preserves_immutable_fields() {
     assert!(!receipt_matches_live(&old_receipt, &config, &artifact, &mut runtime).unwrap());
 
     let outcome = SecurityEngine::new(&mut runtime)
-        .package_reconcile(false)
+        .package_reconcile(false, false)
         .unwrap();
     assert!(outcome.messages[0].contains("provisioned-disabled"));
     let rebuilt = runtime.receipt();
@@ -3864,9 +3944,22 @@ fn package_reconcile_rebinds_disabled_receipt_and_preserves_immutable_fields() {
         .collect();
     assert!(markers.len() >= 4);
     assert!(lock < markers[0]);
+    let stable_config = runtime.files[howy_common::paths::CONFIG_FILE].observed();
+    let stable_artifact = runtime.files[MODE1_CREDENTIAL_PATH].observed();
+    let stable_dropin = runtime.files[MODE1_DROPIN_PATH].observed();
     SecurityEngine::new(&mut runtime)
-        .package_reconcile(false)
+        .package_reconcile(true, true)
         .unwrap();
+    assert_eq!(
+        runtime.files[howy_common::paths::CONFIG_FILE].observed(),
+        stable_config
+    );
+    assert_eq!(
+        runtime.files[MODE1_CREDENTIAL_PATH].observed(),
+        stable_artifact
+    );
+    assert_eq!(runtime.files[MODE1_DROPIN_PATH].observed(), stable_dropin);
+    assert_eq!(runtime.receipt(), rebuilt);
 }
 
 #[test]
@@ -3882,7 +3975,7 @@ fn package_reconcile_retains_enabled_state_and_enabled_config_binding() {
     install_changed_package_state(&mut runtime);
 
     SecurityEngine::new(&mut runtime)
-        .package_reconcile(false)
+        .package_reconcile(false, false)
         .unwrap();
     let rebuilt = runtime.receipt();
     assert_eq!(rebuilt.state, ReceiptState::Enabled);
@@ -3944,7 +4037,7 @@ fn package_reconcile_refuses_tampering_controls_running_readiness_and_publicatio
         let before = runtime.files[SECURITY_RECEIPT_PATH].bytes.clone();
         assert!(
             SecurityEngine::new(&mut runtime)
-                .package_reconcile(false)
+                .package_reconcile(false, false)
                 .is_err(),
             "{failure} unexpectedly reconciled"
         );
@@ -3961,7 +4054,7 @@ fn package_reconcile_refuses_tampering_controls_running_readiness_and_publicatio
     non_root.root = false;
     non_root.locked = false;
     assert!(matches!(
-        SecurityEngine::new(&mut non_root).package_reconcile(false),
+        SecurityEngine::new(&mut non_root).package_reconcile(false, false),
         Err(SecurityError::Refused(_))
     ));
     assert!(!non_root.locked);
@@ -3990,7 +4083,7 @@ fn package_reconcile_publication_uncertainty_and_validation_failures_retain_exac
         }
         assert!(
             SecurityEngine::new(&mut runtime)
-                .package_reconcile(false)
+                .package_reconcile(false, false)
                 .is_err(),
             "{failure} unexpectedly succeeded"
         );
@@ -4031,7 +4124,7 @@ fn package_reconcile_publication_uncertainty_and_validation_failures_retain_exac
         runtime.remove_atomic_backup(&plan, &observation).unwrap();
         assert!(!runtime.files.contains_key(&plan.staging_path));
         SecurityEngine::new(&mut runtime)
-            .package_reconcile(false)
+            .package_reconcile(false, false)
             .unwrap_or_else(|error| panic!("{failure} retry failed: {error}"));
         assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
     }
@@ -4040,12 +4133,12 @@ fn package_reconcile_publication_uncertainty_and_validation_failures_retain_exac
     provision(&mut success).unwrap();
     install_changed_package_state(&mut success);
     SecurityEngine::new(&mut success)
-        .package_reconcile(false)
+        .package_reconcile(false, false)
         .unwrap();
     assert!(success.files.keys().all(|path| !path.ends_with(".stage")));
     assert!(!success.files.contains_key(SECURITY_JOURNAL_PATH));
     SecurityEngine::new(&mut success)
-        .package_reconcile(false)
+        .package_reconcile(false, false)
         .unwrap();
 }
 
@@ -4061,7 +4154,7 @@ fn package_reconcile_accepts_bootstrap_and_engine_provisioned_mode0_without_muta
     let bootstrap_service = bootstrap.service;
     let bootstrap_socket = bootstrap.socket;
     let outcome = SecurityEngine::new(&mut bootstrap)
-        .package_reconcile(false)
+        .package_reconcile(false, false)
         .unwrap();
     assert!(outcome.messages[0].contains("unprovisioned"));
     assert_eq!(
@@ -4071,6 +4164,15 @@ fn package_reconcile_accepts_bootstrap_and_engine_provisioned_mode0_without_muta
     assert_eq!(bootstrap.service, bootstrap_service);
     assert_eq!(bootstrap.socket, bootstrap_socket);
     assert!(!bootstrap.files.contains_key(SECURITY_RECEIPT_PATH));
+    let outcome = SecurityEngine::new(&mut bootstrap)
+        .package_reconcile(true, true)
+        .unwrap();
+    assert!(outcome.messages[0].contains("unprovisioned"));
+    assert_eq!(
+        bootstrap.files[howy_common::paths::CONFIG_FILE].observed(),
+        bootstrap_config
+    );
+    assert!(!bootstrap.files.contains_key(MODE1_DROPIN_PATH));
 
     let mut public_bootstrap = bootstrap.clone();
     public_bootstrap.put(
@@ -4080,7 +4182,7 @@ fn package_reconcile_accepts_bootstrap_and_engine_provisioned_mode0_without_muta
     );
     assert!(
         SecurityEngine::new(&mut public_bootstrap)
-            .package_reconcile(true)
+            .package_reconcile(true, false)
             .is_err()
     );
 
@@ -4109,7 +4211,7 @@ fn package_reconcile_accepts_bootstrap_and_engine_provisioned_mode0_without_muta
     let service = mode0.service;
     let socket = mode0.socket;
     let outcome = SecurityEngine::new(&mut mode0)
-        .package_reconcile(false)
+        .package_reconcile(false, false)
         .unwrap();
     assert!(outcome.messages[0].contains("provisioned Mode 0"));
     assert_eq!(
@@ -4124,7 +4226,7 @@ fn package_reconcile_accepts_bootstrap_and_engine_provisioned_mode0_without_muta
     assert!(!mode0.files.contains_key(SECURITY_RECEIPT_PATH));
 
     let outcome = SecurityEngine::new(&mut mode0)
-        .package_reconcile(true)
+        .package_reconcile(true, true)
         .unwrap();
     assert!(outcome.messages[0].contains("explicit provisioned Mode 0"));
     assert!(!outcome.messages[0].contains("legacy candidate"));
@@ -4133,7 +4235,7 @@ fn package_reconcile_accepts_bootstrap_and_engine_provisioned_mode0_without_muta
     mode0.put(howy_common::paths::CONFIG_FILE, &explicit_config, 0o644);
     assert!(
         SecurityEngine::new(&mut mode0)
-            .package_reconcile(true)
+            .package_reconcile(true, false)
             .is_err()
     );
 }
@@ -4145,7 +4247,7 @@ fn package_reconcile_refuses_partial_or_synthetic_no_receipt_states() {
     synthetic_mode0.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
     assert!(
         SecurityEngine::new(&mut synthetic_mode0)
-            .package_reconcile(false)
+            .package_reconcile(false, false)
             .is_err()
     );
 
@@ -4156,7 +4258,7 @@ fn package_reconcile_refuses_partial_or_synthetic_no_receipt_states() {
     mode1_config.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
     assert!(
         SecurityEngine::new(&mut mode1_config)
-            .package_reconcile(false)
+            .package_reconcile(false, false)
             .is_err()
     );
     assert!(!mode1_config.files.contains_key(SECURITY_RECEIPT_PATH));
@@ -4176,7 +4278,7 @@ fn package_reconcile_refuses_partial_or_synthetic_no_receipt_states() {
         }
         assert!(
             SecurityEngine::new(&mut partial)
-                .package_reconcile(false)
+                .package_reconcile(false, false)
                 .is_err()
         );
         assert!(!partial.files.contains_key(SECURITY_RECEIPT_PATH));
@@ -4206,7 +4308,7 @@ fn package_reconcile_admits_only_flagged_legacy_candidate_mode0_without_mutation
     let effective_before = candidate.effective_units.clone();
 
     let outcome = SecurityEngine::new(&mut candidate)
-        .package_reconcile(true)
+        .package_reconcile(true, false)
         .unwrap();
     assert_eq!(
         outcome.messages,
@@ -4226,7 +4328,7 @@ fn package_reconcile_admits_only_flagged_legacy_candidate_mode0_without_mutation
     let mut unflagged = legacy_candidate_mode0_runtime();
     assert!(
         SecurityEngine::new(&mut unflagged)
-            .package_reconcile(false)
+            .package_reconcile(false, false)
             .is_err()
     );
     assert!(!unflagged.files.contains_key(SECURITY_RECEIPT_PATH));
@@ -4237,10 +4339,222 @@ fn package_reconcile_admits_only_flagged_legacy_candidate_mode0_without_mutation
         .clone();
     private_candidate.put(howy_common::paths::CONFIG_FILE, &config, 0o600);
     let outcome = SecurityEngine::new(&mut private_candidate)
-        .package_reconcile(true)
+        .package_reconcile(true, false)
         .unwrap();
     assert!(outcome.messages[0].contains("legacy candidate Mode 0"));
     assert!(!private_candidate.files.contains_key(SECURITY_RECEIPT_PATH));
+}
+
+#[test]
+fn package_reconcile_normalization_requires_legacy_admission_before_state_checks() {
+    let mut runtime = legacy_candidate_mode0_runtime();
+    assert!(matches!(
+        SecurityEngine::new(&mut runtime).package_reconcile(false, true),
+        Err(SecurityError::Refused(_))
+    ));
+    assert!(runtime.events.is_empty());
+    assert!(!runtime.locked);
+    assert!(!runtime.files.contains_key(MODE1_DROPIN_PATH));
+
+    let mut public_candidate = legacy_candidate_mode0_runtime();
+    let error = SecurityEngine::new(&mut public_candidate)
+        .package_reconcile(true, true)
+        .unwrap_err();
+    assert!(matches!(&error, SecurityError::Refused(_)));
+    assert!(error.to_string().contains("root:root mode 0600 config"));
+    assert!(!public_candidate.files.contains_key(MODE1_DROPIN_PATH));
+}
+
+#[test]
+fn package_reconcile_normalizes_legacy_candidate_mode0_under_one_lock() {
+    let mut runtime = normalizable_legacy_candidate_mode0_runtime();
+    let config = runtime.files[howy_common::paths::CONFIG_FILE].observed();
+    let base_service = runtime.files[BASE_SERVICE_UNIT_PATH].observed();
+    let base_socket = runtime.files[BASE_SOCKET_UNIT_PATH].observed();
+    let daemon = runtime.daemon_identity.clone();
+
+    let outcome = SecurityEngine::new(&mut runtime)
+        .package_reconcile(true, true)
+        .unwrap();
+    assert_eq!(
+        outcome.messages,
+        ["Package state normalized: legacy candidate Mode 0 is now explicit Mode 0."]
+    );
+    assert_eq!(
+        runtime.files[howy_common::paths::CONFIG_FILE].observed(),
+        config
+    );
+    assert_eq!(
+        runtime.files[BASE_SERVICE_UNIT_PATH].observed(),
+        base_service
+    );
+    assert_eq!(runtime.files[BASE_SOCKET_UNIT_PATH].observed(), base_socket);
+    assert_eq!(runtime.daemon_identity, daemon);
+    assert_eq!(runtime.files[MODE1_DROPIN_PATH].bytes, MODE0_DROPIN_BYTES);
+    assert_eq!(runtime.files[MODE1_DROPIN_PATH].metadata.permissions, 0o600);
+    let publication = runtime.last_package_mode0_publication.as_ref().unwrap();
+    assert_eq!(
+        runtime.files[MODE1_DROPIN_PATH]
+            .observed()
+            .atomic_identity(),
+        publication.target
+    );
+    assert!(!runtime.files.contains_key(MODE1_CREDENTIAL_PATH));
+    assert!(!runtime.files.contains_key(SECURITY_RECEIPT_PATH));
+    assert!(!runtime.namespace_nonempty);
+    runtime
+        .effective_units
+        .validate_mode0(&Sha256Digest::from_bytes(MODE0_DROPIN_BYTES))
+        .unwrap();
+    assert_no_atomic_stages(&runtime);
+
+    let locks: Vec<_> = runtime
+        .events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.as_str() == "lock")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(locks.len(), 1);
+    let atomic_create = runtime
+        .events
+        .iter()
+        .position(|event| event.starts_with("atomic-create:"))
+        .unwrap();
+    assert!(locks[0] < atomic_create);
+
+    SecurityEngine::new(&mut runtime)
+        .package_reconcile(false, false)
+        .unwrap();
+}
+
+#[test]
+fn package_reconcile_mode0_normalization_never_overwrites_concurrent_occupancy() {
+    let mut runtime = normalizable_legacy_candidate_mode0_runtime();
+    runtime.package_mode0_target_occupancy = Some(MODE1_DROPIN_BYTES.to_vec());
+
+    assert!(
+        SecurityEngine::new(&mut runtime)
+            .package_reconcile(true, true)
+            .is_err()
+    );
+    assert_eq!(runtime.files[MODE1_DROPIN_PATH].bytes, MODE1_DROPIN_BYTES);
+    assert_no_atomic_stages(&runtime);
+    assert!(!runtime.files.contains_key(SECURITY_RECEIPT_PATH));
+}
+
+#[test]
+fn package_reconcile_mode0_atomic_failure_windows_clean_or_retain_exact_evidence() {
+    let mut not_committed = normalizable_legacy_candidate_mode0_runtime();
+    not_committed.fail_after = Some("package-mode0-uncertain-before-rename");
+    not_committed.retain_package_mode0_stage_on_not_committed = true;
+    let error = SecurityEngine::new(&mut not_committed)
+        .package_reconcile(true, true)
+        .unwrap_err();
+    assert!(matches!(&error, SecurityError::Uncertain(_)));
+    let message = error.to_string();
+    assert!(message.contains("was not committed"));
+    assert!(message.contains("exact stage was cleaned"));
+    assert!(message.contains("transaction="));
+    assert!(message.contains(&format!("target={MODE1_DROPIN_PATH}")));
+    assert!(message.contains("staging="));
+    assert!(message.contains("original failure"));
+    assert!(!not_committed.files.contains_key(MODE1_DROPIN_PATH));
+    assert_no_atomic_stages(&not_committed);
+    assert!(
+        not_committed
+            .events
+            .iter()
+            .any(|event| event.starts_with("remove-exact:") && event.ends_with(".stage"))
+    );
+
+    let mut committed = normalizable_legacy_candidate_mode0_runtime();
+    committed.fail_after = Some("package-mode0-post-rename");
+    let error = SecurityEngine::new(&mut committed)
+        .package_reconcile(true, true)
+        .unwrap_err();
+    assert!(matches!(&error, SecurityError::Uncertain(_)));
+    let message = error.to_string();
+    assert!(message.contains("publication committed despite an error"));
+    assert!(message.contains("transaction="));
+    assert!(message.contains(&format!("target={MODE1_DROPIN_PATH}")));
+    assert!(message.contains("staging="));
+    assert!(message.contains("target_identity="));
+    assert_eq!(committed.files[MODE1_DROPIN_PATH].bytes, MODE0_DROPIN_BYTES);
+    let publication = committed.last_package_mode0_publication.as_ref().unwrap();
+    assert_eq!(
+        committed.files[MODE1_DROPIN_PATH]
+            .observed()
+            .atomic_identity(),
+        publication.target
+    );
+    assert_no_atomic_stages(&committed);
+    SecurityEngine::new(&mut committed)
+        .package_reconcile(false, false)
+        .unwrap();
+}
+
+#[test]
+fn package_reconcile_mode0_post_publication_failures_leave_exact_explicit_state() {
+    let mut reload_failure = normalizable_legacy_candidate_mode0_runtime();
+    reload_failure.fail_daemon_reload_on = Some(2);
+    let error = SecurityEngine::new(&mut reload_failure)
+        .package_reconcile(true, true)
+        .unwrap_err();
+    assert!(matches!(&error, SecurityError::Uncertain(_)));
+    let message = error.to_string();
+    assert!(message.contains("exact Mode 0 drop-in committed"));
+    assert!(message.contains("transaction="));
+    assert!(message.contains(&format!("target={MODE1_DROPIN_PATH}")));
+    assert!(message.contains("staging="));
+    assert!(message.contains("target_identity="));
+    assert_eq!(
+        reload_failure.files[MODE1_DROPIN_PATH].bytes,
+        MODE0_DROPIN_BYTES
+    );
+    let publication = reload_failure
+        .last_package_mode0_publication
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        reload_failure.files[MODE1_DROPIN_PATH]
+            .observed()
+            .atomic_identity(),
+        publication.target
+    );
+    assert_no_atomic_stages(&reload_failure);
+    SecurityEngine::new(&mut reload_failure)
+        .package_reconcile(false, false)
+        .unwrap();
+
+    let mut final_validation_failure = normalizable_legacy_candidate_mode0_runtime();
+    final_validation_failure.mutate_effective_after_package_mode0_publication = true;
+    let error = SecurityEngine::new(&mut final_validation_failure)
+        .package_reconcile(true, true)
+        .unwrap_err();
+    assert!(matches!(&error, SecurityError::Uncertain(_)));
+    let message = error.to_string();
+    assert!(message.contains("exact Mode 0 drop-in committed"));
+    assert!(message.contains("post-publication verification failed"));
+    assert_eq!(
+        final_validation_failure.files[MODE1_DROPIN_PATH].bytes,
+        MODE0_DROPIN_BYTES
+    );
+    let publication = final_validation_failure
+        .last_package_mode0_publication
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        final_validation_failure.files[MODE1_DROPIN_PATH]
+            .observed()
+            .atomic_identity(),
+        publication.target
+    );
+    assert_no_atomic_stages(&final_validation_failure);
+    final_validation_failure.effective_override = None;
+    SecurityEngine::new(&mut final_validation_failure)
+        .package_reconcile(false, false)
+        .unwrap();
 }
 
 #[test]
@@ -4324,7 +4638,7 @@ fn package_reconcile_legacy_candidate_flag_refuses_objects_controls_and_drift() 
             .collect();
         assert!(
             SecurityEngine::new(&mut runtime)
-                .package_reconcile(true)
+                .package_reconcile(true, false)
                 .is_err(),
             "{scenario} unexpectedly reconciled"
         );
@@ -4365,7 +4679,7 @@ fn package_reconcile_legacy_candidate_flag_refuses_invalid_mode0_config_semantic
         }
         assert!(
             SecurityEngine::new(&mut runtime)
-                .package_reconcile(true)
+                .package_reconcile(true, false)
                 .is_err(),
             "{scenario} unexpectedly reconciled"
         );

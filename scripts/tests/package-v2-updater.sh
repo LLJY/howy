@@ -258,6 +258,37 @@ expect_failure 'complete symlink snapshot validation' \
 expect_failure 'complete oversized snapshot validation' \
     require_snapshot_file "${snapshot_file}" snapshot 1
 
+candidate_config="${WORK}/candidate-config.toml"
+printf 'candidate config\n' > "${candidate_config}"
+run_candidate_config_case() (
+    local expected_mode="$1"
+    local candidate_function snapshot_requirement_function
+
+    /usr/bin/chmod "${expected_mode}" "${candidate_config}"
+    snapshot_requirement_function=$(declare -f require_snapshot_file)
+    snapshot_requirement_function=${snapshot_requirement_function//\/usr\/bin\/stat/candidate_config_stat_mock}
+    candidate_function=$(declare -f require_candidate_config)
+    candidate_function=${candidate_function//CONFIG_PATH/TEST_CANDIDATE_CONFIG_PATH}
+    candidate_function=${candidate_function//\/usr\/bin\/stat/candidate_config_stat_mock}
+    eval "${snapshot_requirement_function}"
+    eval "${candidate_function}"
+
+    TEST_CANDIDATE_CONFIG_PATH=${candidate_config}
+    candidate_config_stat_mock() {
+        case "$1:$2" in
+            '-c:%u:%g:%h:%s')
+                printf '0:0:1:%s\n' "$(/usr/bin/stat -c '%s' -- "${!#}")"
+                ;;
+            *) /usr/bin/stat "$@" ;;
+        esac
+    }
+
+    require_candidate_config
+)
+expect_success 'candidate mode 0600 config preflight' run_candidate_config_case 0600
+expect_failure 'candidate mode 0644 config preflight refusal' \
+    run_candidate_config_case 0644
+
 provider_function=$(declare -f query_single_provider)
 provider_function=${provider_function//\/usr\/bin\/pacman/provider_pacman_mock}
 PROVIDER_MODE=success
@@ -760,6 +791,9 @@ assert_contains 'generated release-N marker refusal' \
     'generated release-N package markers are unsupported by the v2 updater'
 assert_contains 'candidate exact marker preflight remains exact' \
     "${production_transition_preflight_function}" 'candidate_marker_is_exact "${MARKER_PATH}"'
+assert_order 'candidate marker precedes exact mode 0600 config preflight' \
+    "${production_transition_preflight_function}" \
+    'candidate_marker_is_exact "${MARKER_PATH}"' 'require_candidate_config'
 assert_order 'transition preflight before backup' "${main_function}" \
     'preflight_transition_state' 'create_backup'
 assert_order 'backup before stop' "${main_function}" 'create_backup' 'stop_units'
@@ -794,7 +828,9 @@ assert_contains 'pacman failure contract' "${main_function}" "retain_failure 'pa
 assert_contains 'reconcile failure is nonzero' "${post_function}" \
     '/usr/bin/howy package reconcile || return 1'
 assert_contains 'candidate legacy reconcile admission' "${post_function}" \
-    '/usr/bin/howy package reconcile --allow-legacy-candidate-mode0 || return 1'
+    '/usr/bin/howy package reconcile --allow-legacy-candidate-mode0'
+assert_contains 'candidate legacy normalization option' "${post_function}" \
+    '--normalize-legacy-candidate-mode0'
 assert_contains 'unit restoration failure is nonzero' "${post_function}" \
     'restore_unit_intent || return 1'
 assert_contains 'post-pacman failure contract' "${main_function}" \
@@ -822,6 +858,74 @@ assert_contains 'strict shell mode' "${updater_text}" 'set -euo pipefail'
 assert_order 'sentinel trap precedes side effects' "${main_function}" \
     'trap cleanup_sentinel EXIT' 'validate_archive'
 
+POST_PACMAN_LOG="${WORK}/post-pacman.log"
+run_post_pacman_reconcile_sequence() (
+    local strict_status="$1"
+    local transition
+    local transformed
+    shift
+
+    transformed=$(declare -f post_pacman_steps)
+    transformed=${transformed//\/usr\/lib\/howy\/howy-config-bridge/post_pacman_bridge_mock}
+    transformed=${transformed//\/usr\/bin\/howy/post_pacman_howy_mock}
+    eval "${transformed}"
+
+    verify_installed_result() { :; }
+    path_is_absent() { :; }
+    restore_config() { :; }
+    verify_receipt_preservation() { :; }
+    restore_unit_intent() { :; }
+    verify_unit_intent() { :; }
+    post_pacman_bridge_mock() {
+        [[ "$*" == complete-release-n ]] || return 1
+        printf 'bridge:%s\n' "$*" >> "${POST_PACMAN_LOG}"
+    }
+    post_pacman_howy_mock() {
+        printf 'howy:%s\n' "$*" >> "${POST_PACMAN_LOG}"
+        if [[ "$*" == 'package reconcile' ]]; then
+            return "${strict_status}"
+        fi
+        [[ "$*" == \
+            'package reconcile --allow-legacy-candidate-mode0 --normalize-legacy-candidate-mode0' ]]
+    }
+
+    RECEIPT_EXISTED=1
+    : > "${POST_PACMAN_LOG}"
+    for transition in "$@"; do
+        TRANSITION_KIND=${transition}
+        post_pacman_steps || return 1
+    done
+)
+
+expect_success 'candidate invokes one locked Rust normalization reconcile' \
+    run_post_pacman_reconcile_sequence 1 candidate
+[[ "$(<"${POST_PACMAN_LOG}")" == \
+    $'bridge:complete-release-n\nhowy:package reconcile --allow-legacy-candidate-mode0 --normalize-legacy-candidate-mode0' ]] \
+    || fail 'candidate post-pacman steps did not use the exact combined reconcile flags'
+pass
+
+expect_failure 'stable damaged Mode 0 remains strict and refused' \
+    run_post_pacman_reconcile_sequence 1 stable
+[[ "$(<"${POST_PACMAN_LOG}")" == \
+    $'bridge:complete-release-n\nhowy:package reconcile' ]] \
+    || fail 'stable damaged Mode 0 used anything other than strict reconciliation'
+pass
+
+expect_success 'release-N post-pacman reconcile remains strict' \
+    run_post_pacman_reconcile_sequence 0 release-n
+[[ "$(<"${POST_PACMAN_LOG}")" == \
+    $'bridge:complete-release-n\nhowy:package reconcile' ]] \
+    || fail 'release-N post-pacman steps used anything other than strict reconciliation'
+pass
+
+expect_success 'candidate normalization to stable same-v2 branch sequence' \
+    run_post_pacman_reconcile_sequence 0 candidate stable
+post_pacman_log=$(<"${POST_PACMAN_LOG}")
+[[ "${post_pacman_log}" == \
+    $'bridge:complete-release-n\nhowy:package reconcile --allow-legacy-candidate-mode0 --normalize-legacy-candidate-mode0\nbridge:complete-release-n\nhowy:package reconcile' ]] \
+    || fail 'candidate to stable same-v2 sequence used the wrong reconcile branches'
+pass
+
 SOURCE_PACKAGE=howy-cpu
 SOURCE_VERSION=original-version
 ARCHIVE_PKGNAME=howy-cpu
@@ -844,6 +948,38 @@ best_effort_stop_units() {
 expect_failure 'retain_failure is nonzero' retain_failure 'mock failure'
 [[ "${FAILURE_STOP_CALLED}" -eq 1 ]] || fail 'retain_failure did not stop units'
 pass
+
+TRANSITION_KIND=candidate
+if candidate_recovery=$(retain_failure 'candidate mock failure' 2>&1); then
+    fail 'candidate retain_failure unexpectedly succeeded'
+fi
+assert_contains 'candidate recovery requires stable state review' "${candidate_recovery}" \
+    'after inspecting the retained backup and confirming installed stable v2 and /etc/howy/config.toml'
+assert_contains 'candidate recovery exact bridge command' "${candidate_recovery}" \
+    'sudo /usr/lib/howy/howy-config-bridge complete-release-n'
+assert_contains 'candidate recovery exact reconcile command' "${candidate_recovery}" \
+    'sudo howy package reconcile --allow-legacy-candidate-mode0 --normalize-legacy-candidate-mode0'
+assert_contains 'candidate recovery atomic publication caveat' "${candidate_recovery}" \
+    'successful atomic publication may already have normalized Mode 0'
+assert_contains 'candidate recovery idempotent state scope' "${candidate_recovery}" \
+    'idempotent for explicit Mode 0, Mode 1, and bootstrap state'
+assert_contains 'candidate recovery restores unit intent' "${candidate_recovery}" \
+    'review and restore saved unit intent'
+assert_contains 'candidate recovery removes exact backup files' "${candidate_recovery}" \
+    'remove only the exact reviewed backup files'
+
+for transition in stable release-n; do
+    TRANSITION_KIND=${transition}
+    if generic_recovery=$(retain_failure "${transition} mock failure" 2>&1); then
+        fail "${transition} retain_failure unexpectedly succeeded"
+    fi
+    assert_contains "${transition} retains generic rerun guidance" "${generic_recovery}" \
+        'before rerunning, explicitly remove only the reviewed backup files'
+    assert_not_contains "${transition} omits candidate bridge recovery" "${generic_recovery}" \
+        'sudo /usr/lib/howy/howy-config-bridge complete-release-n'
+    assert_not_contains "${transition} omits candidate reconcile recovery" "${generic_recovery}" \
+        '--normalize-legacy-candidate-mode0'
+done
 
 pkgbuild_text=$(<"${PKGBUILD_PATH}")
 srcinfo_text=$(<"${SRCINFO_PATH}")

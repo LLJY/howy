@@ -205,6 +205,23 @@ require_package_marker() {
     fi
 }
 
+require_candidate_config() {
+    local mode
+
+    if ! require_snapshot_file "${CONFIG_PATH}" 'candidate Howy configuration' \
+        "${MAX_CONTROL_BYTES}"; then
+        return 1
+    fi
+    if ! mode=$(/usr/bin/stat -c '%a' -- "${CONFIG_PATH}"); then
+        refuse 'the candidate Howy configuration mode could not be read'
+        return 1
+    fi
+    if [[ "${mode}" != 600 ]]; then
+        refuse 'the candidate Howy configuration is not exact root:root mode 0600 single-link state'
+        return 1
+    fi
+}
+
 RELEASE_N_MARKER_TEXT=''
 
 read_release_n_marker_text() {
@@ -469,6 +486,9 @@ preflight_transition_state() {
                 refuse 'the candidate package marker bytes or SHA-256 are not exact'
                 return 1
             fi
+            if ! require_candidate_config; then
+                return 1
+            fi
             ;;
         *)
             refuse 'internal transition classification failed'
@@ -668,7 +688,15 @@ retain_failure() {
     printf 'howy-v2-update: backup retained at %s; package bytes were not rolled back.\n' "${BACKUP_PATH}" >&2
     printf '%s\n' 'howy-v2-update: inspect and preserve any needed backup files before recovery.' >&2
     printf '%s\n' 'howy-v2-update: the retained backup blocks a new updater run.' >&2
-    printf '%s\n' 'howy-v2-update: before rerunning, explicitly remove only the reviewed backup files and then its empty directory; this updater will not resume or remove the retained backup automatically.' >&2
+    if [[ "${TRANSITION_KIND}" == candidate ]]; then
+        printf '%s\n' 'howy-v2-update: candidate recovery: after inspecting the retained backup and confirming installed stable v2 and /etc/howy/config.toml, run:' >&2
+        printf '%s\n' 'sudo /usr/lib/howy/howy-config-bridge complete-release-n' >&2
+        printf '%s\n' 'sudo howy package reconcile --allow-legacy-candidate-mode0 --normalize-legacy-candidate-mode0' >&2
+        printf '%s\n' 'howy-v2-update: successful atomic publication may already have normalized Mode 0; the reconcile command is idempotent for explicit Mode 0, Mode 1, and bootstrap state.' >&2
+        printf '%s\n' 'howy-v2-update: then review and restore saved unit intent, remove only the exact reviewed backup files and its empty directory, and perform a normal updater rerun.' >&2
+    else
+        printf '%s\n' 'howy-v2-update: before rerunning, explicitly remove only the reviewed backup files and then its empty directory; this updater will not resume or remove the retained backup automatically.' >&2
+    fi
     return 1
 }
 
@@ -783,7 +811,9 @@ post_pacman_steps() {
     verify_receipt_preservation || return 1
     /usr/lib/howy/howy-config-bridge complete-release-n || return 1
     if [[ "${TRANSITION_KIND}" == candidate ]]; then
-        /usr/bin/howy package reconcile --allow-legacy-candidate-mode0 || return 1
+        /usr/bin/howy package reconcile \
+            --allow-legacy-candidate-mode0 \
+            --normalize-legacy-candidate-mode0 || return 1
     else
         /usr/bin/howy package reconcile || return 1
     fi
