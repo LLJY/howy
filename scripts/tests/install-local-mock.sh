@@ -86,6 +86,7 @@ set_case_paths() {
     SYSTEMD_SYSUSERS="mock-systemd-sysusers"
     SYSTEMCTL_LOG="${root}/systemctl.log"
     SYSUSERS_LOG="${root}/sysusers.log"
+    PACMAN_LOG="${root}/pacman.log"
     TRANSACTION_LOG="${root}/transaction.log"
     SEEDED_HASHES="${root}/seeded-artifacts.sha256"
 }
@@ -109,6 +110,7 @@ prepare_case() {
     chmod 0755 "${HOWYD_SRC}" "${HOWY_SRC}" "${BRIDGE_SRC}"
     : > "${SYSTEMCTL_LOG}"
     : > "${SYSUSERS_LOG}"
+    : > "${PACMAN_LOG}"
     : > "${TRANSACTION_LOG}"
 
     STATE_CAPTURED=0
@@ -144,6 +146,10 @@ prepare_case() {
     ARTIFACT_DESTINATIONS=()
     ARTIFACT_BACKUP_PRESENT=()
     MOCK_ACCOUNT_STATE="absent"
+    MOCK_PACMAN_OWNED_PATH=""
+    MOCK_PACMAN_ERROR_PATH=""
+    MOCK_PACMAN_ERROR_STATUS=2
+    MOCK_PACMAN_ERROR_OUTPUT="error: failed to read package database"
     MOCK_SYSUSERS_FAIL=0
     MOCK_SYSUSERS_RESULT="conforming"
     STOP_FAIL_UNIT=""
@@ -213,11 +219,27 @@ assert_seeded_artifacts_unchanged() {
 
 require_root() { :; }
 require_command() { :; }
-build_release_artifacts() { :; }
+build_release_artifacts() { printf 'build\n' >> "${TRANSACTION_LOG}"; }
 run_install_prewarm() { PREWARM_MESSAGE="mock prewarm skipped"; }
 print_next_steps() { :; }
 userdel() { fail "installer attempted userdel"; }
 groupdel() { fail "installer attempted groupdel"; }
+
+pacman() {
+    printf '%s\n' "$*" >> "${PACMAN_LOG}"
+    [ "$#" -eq 3 ] && [ "$1" = -Qo ] && [ "$2" = -- ] \
+        || fail "unexpected pacman invocation: $*"
+    if [ "$3" = "${MOCK_PACMAN_OWNED_PATH}" ]; then
+        printf '%s is owned by howy-rocm 2.0.0-1\n' "$3"
+        return 0
+    fi
+    if [ "$3" = "${MOCK_PACMAN_ERROR_PATH}" ]; then
+        printf '%s\n' "${MOCK_PACMAN_ERROR_OUTPUT}"
+        return "${MOCK_PACMAN_ERROR_STATUS}"
+    fi
+    printf 'error: No package owns %s\n' "$3"
+    return 1
+}
 
 run_bridge() {
     local binary="$1"
@@ -426,7 +448,11 @@ test_first_install() {
     assert_contains "${log}" "preflight:absent"
     assert_contains "${log}" "run:${SYSUSERS_DEST}"
     assert_contains "${log}" "validate:conforming"
+    log=$(<"${PACMAN_LOG}")
+    assert_contains "${log}" "-Qo -- ${HOWYD_DEST}"
+    assert_contains "${log}" "-Qo -- ${ALPM_HOOK_DEST}"
     transaction=$(<"${TRANSACTION_LOG}")
+    assert_order "${transaction}" "build" "preflight:absent"
     assert_order "${transaction}" "sysusers:validate:conforming" "systemctl:is-active --quiet howy.service"
     rm -rf "${root}"
 }
@@ -541,6 +567,68 @@ test_migrate_flag_is_explicitly_unsupported_before_side_effects() {
     fi
     assert_contains "$(<"${root}/output")" "sudo howy security provision --mode 1"
     [ ! -e "${root}/dest" ] || fail "unsupported migrate flag had install side effects"
+    rm -rf "${root}"
+}
+
+test_package_owned_destination_aborts_before_build_or_side_effects() {
+    local root
+    local log
+    root=$(mktemp -d)
+    if (
+        prepare_case "${root}"
+        mkdir -p "$(dirname "${HOWY_DEST}")"
+        printf 'package-owned-howy\n' > "${HOWY_DEST}"
+        MOCK_PACMAN_OWNED_PATH="${HOWY_DEST}"
+        main </dev/null
+    ) >"${root}/output" 2>&1; then
+        fail "package-owned destination unexpectedly installed"
+    fi
+    set_case_paths "${root}"
+    assert_contains "$(<"${root}/output")" "Development-only local install refused"
+    assert_contains "$(<"${root}/output")" "sudo ./scripts/howy-v2-update <archive.pkg.tar.zst>"
+    assert_contains "$(<"${root}/output")" "sudo ./howy-v2-update <archive.pkg.tar.zst>"
+    assert_not_contains "$(<"${root}/output")" "sudo howy-v2-update <archive.pkg.tar.zst>"
+    assert_contains "$(<"${root}/output")" "sudo pacman -R <howy-package>"
+    [ "$(<"${HOWY_DEST}")" = "package-owned-howy" ] \
+        || fail "package-owned destination changed before refusal"
+    [ ! -e "${HOWYD_DEST}" ] || fail "package-owned preflight installed howyd"
+    [ ! -e "${CONFIG_DEST}" ] || fail "package-owned preflight created config"
+    [ ! -e "${SYSUSERS_DEST}" ] || fail "package-owned preflight installed sysusers definition"
+    [ ! -s "${TRANSACTION_LOG}" ] \
+        || fail "package-owned preflight built or started a transaction"
+    [ ! -s "${SYSTEMCTL_LOG}" ] || fail "package-owned preflight touched unit state"
+    [ ! -s "${SYSUSERS_LOG}" ] || fail "package-owned preflight touched account state"
+    log=$(<"${PACMAN_LOG}")
+    assert_contains "${log}" "-Qo -- ${HOWYD_DEST}"
+    assert_contains "${log}" "-Qo -- ${HOWY_DEST}"
+    assert_not_contains "${log}" "-Qo -- ${PAM_DEST}"
+    rm -rf "${root}"
+}
+
+test_package_ownership_error_aborts_before_build_or_side_effects() {
+    local root
+    local log
+    root=$(mktemp -d)
+    if (
+        prepare_case "${root}"
+        MOCK_PACMAN_ERROR_PATH="${HOWY_DEST}"
+        main </dev/null
+    ) >"${root}/output" 2>&1; then
+        fail "package ownership operational error unexpectedly installed"
+    fi
+    set_case_paths "${root}"
+    assert_contains "$(<"${root}/output")" "Package ownership check failed for ${HOWY_DEST}"
+    assert_contains "$(<"${root}/output")" "pacman exit 2"
+    assert_contains "$(<"${root}/output")" "error: failed to read package database"
+    assert_contains "$(<"${root}/output")" "Refusing to build or modify the system"
+    [ ! -e "${root}/dest" ] || fail "ownership error had install side effects"
+    [ ! -s "${TRANSACTION_LOG}" ] || fail "ownership error built or started a transaction"
+    [ ! -s "${SYSTEMCTL_LOG}" ] || fail "ownership error touched unit state"
+    [ ! -s "${SYSUSERS_LOG}" ] || fail "ownership error touched account state"
+    log=$(<"${PACMAN_LOG}")
+    assert_contains "${log}" "-Qo -- ${HOWYD_DEST}"
+    assert_contains "${log}" "-Qo -- ${HOWY_DEST}"
+    assert_not_contains "${log}" "-Qo -- ${PAM_DEST}"
     rm -rf "${root}"
 }
 
@@ -940,6 +1028,8 @@ test_successful_upgrade_restores_active_state
 test_fresh_bridge_failure_rolls_back_artifacts_without_touching_config
 test_unexpected_config_occupancy_race_fails_closed_without_ownership
 test_migrate_flag_is_explicitly_unsupported_before_side_effects
+test_package_owned_destination_aborts_before_build_or_side_effects
+test_package_ownership_error_aborts_before_build_or_side_effects
 test_stop_failure_prevents_replacement
 test_partial_stop_failure_restarts_only_unit_stopped_by_this_install
 test_conforming_preexisting_account_and_reinstall_are_idempotent
@@ -951,4 +1041,4 @@ test_fresh_sysusers_failure_removes_new_definition_without_runtime_touch
 test_post_creation_validation_failure_rolls_back_definition_without_account_delete
 test_uninstall_removes_only_definition_not_account
 test_pkgbuild_installs_release_n_bridge_for_all_variants
-printf 'install-local mock tests: 18 passed\n'
+printf 'install-local mock tests: 20 passed\n'
