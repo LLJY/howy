@@ -851,6 +851,14 @@ assert_contains 'removal hook package path and mode' "${pkgbuild_text}" \
     'install -Dm644 packaging/10-howy-remove-prepare.hook "${pkgdir}/usr/share/libalpm/hooks/10-howy-remove-prepare.hook"'
 assert_count 'config backup declarations' "${pkgbuild_text}" \
     "backup=('etc/howy/config.toml')" 3
+assert_count 'PKGBUILD virtual ONNX Runtime build dependency' "${pkgbuild_text}" \
+    "  'onnxruntime'" 1
+assert_count 'PKGBUILD virtual ONNX Runtime runtime dependencies' "${pkgbuild_text}" \
+    "  depends=('onnxruntime' 'pam' 'systemd>=261')" 3
+for concrete_runtime in onnxruntime-cpu onnxruntime-rocm onnxruntime-cuda; do
+    assert_not_contains "PKGBUILD concrete ONNX Runtime dependency ${concrete_runtime}" \
+        "${pkgbuild_text}" "${concrete_runtime}"
+done
 
 assert_contains '.SRCINFO canonical base' "${srcinfo_text}" 'pkgbase = howy'
 for package in howy-cpu howy-rocm howy-cuda; do
@@ -860,6 +868,14 @@ assert_not_contains '.SRCINFO old split identity' "${srcinfo_text}" 'pkgname = h
 assert_count '.SRCINFO config backup declarations' "${srcinfo_text}" \
     $'\tbackup = etc/howy/config.toml' 3
 assert_count '.SRCINFO has zero automatic replacements' "${srcinfo_text}" $'\treplaces = ' 0
+assert_count '.SRCINFO virtual ONNX Runtime build dependency' "${srcinfo_text}" \
+    $'\tmakedepends = onnxruntime' 1
+assert_count '.SRCINFO virtual ONNX Runtime runtime dependencies' "${srcinfo_text}" \
+    $'\tdepends = onnxruntime' 3
+for concrete_runtime in onnxruntime-cpu onnxruntime-rocm onnxruntime-cuda; do
+    assert_not_contains ".SRCINFO concrete ONNX Runtime dependency ${concrete_runtime}" \
+        "${srcinfo_text}" "${concrete_runtime}"
+done
 assert_count 'stable hook target count' "${hook_text}" 'Target = ' 3
 for package in howy-cpu howy-rocm howy-cuda; do
     assert_contains "stable hook ${package}" "${hook_text}" "Target = ${package}"

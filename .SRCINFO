@@ -8,16 +8,16 @@ pkgbase = howy
 	makedepends = cargo
 	makedepends = clang
 	makedepends = git
-	makedepends = onnxruntime-cpu
+	makedepends = onnxruntime
 	makedepends = protobuf
 	makedepends = systemd>=261
 	source = howy::git+https://github.com/LLJY/howy.git#commit=8bcec98eedf3aac75df31b390cb5e1a9ce17bf48
 	sha256sums = SKIP
 
 pkgname = howy-cpu
-	pkgdesc = Linux face authentication daemon using ONNX Runtime CPU backend
+	pkgdesc = Linux face authentication daemon intended for ONNX Runtime CPU backend
 	install = howy.install
-	depends = onnxruntime-cpu
+	depends = onnxruntime
 	depends = pam
 	depends = systemd>=261
 	optdepends = curl: download default ONNX models
@@ -41,9 +41,9 @@ pkgname = howy-cpu
 	backup = etc/howy/config.toml
 
 pkgname = howy-rocm
-	pkgdesc = Linux face authentication daemon using ONNX Runtime ROCm backend
+	pkgdesc = Linux face authentication daemon intended for ONNX Runtime ROCm backend
 	install = howy.install
-	depends = onnxruntime-rocm
+	depends = onnxruntime
 	depends = pam
 	depends = systemd>=261
 	optdepends = curl: download default ONNX models
@@ -67,9 +67,9 @@ pkgname = howy-rocm
 	backup = etc/howy/config.toml
 
 pkgname = howy-cuda
-	pkgdesc = Linux face authentication daemon using ONNX Runtime CUDA backend
+	pkgdesc = Linux face authentication daemon intended for ONNX Runtime CUDA backend
 	install = howy.install
-	depends = onnxruntime-cuda
+	depends = onnxruntime
 	depends = pam
 	depends = systemd>=261
 	optdepends = curl: download default ONNX models

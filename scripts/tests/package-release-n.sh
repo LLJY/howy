@@ -159,6 +159,12 @@ source "${REPO_ROOT}/PKGBUILD"
 [ "${pkgver}" = 2.0.0 ] || fail "root package version is not 2.0.0"
 [ "${pkgname[*]}" = "howy-cpu howy-rocm howy-cuda" ] \
     || fail "root split package names are not canonical"
+[[ " ${makedepends[*]} " == *" onnxruntime "* ]] \
+    || fail "root package lacks the virtual ONNX Runtime build dependency"
+for concrete_runtime in onnxruntime-cpu onnxruntime-rocm onnxruntime-cuda; do
+    [[ " ${makedepends[*]} " != *" ${concrete_runtime} "* ]] \
+        || fail "root package retains concrete build dependency ${concrete_runtime}"
+done
 
 # Direct package-function tests run without fakeroot, so ignore only the
 # requested root ownership flags. Modes and complete package content remain
@@ -207,17 +213,12 @@ for variant in howy-cpu howy-rocm howy-cuda; do
                 || fail "${variant} does not conflict with ${other}"
         fi
     done
-    case "${variant}" in
-        howy-cpu)
-            [ "${depends[0]}" = onnxruntime-cpu ] || fail "CPU package lost its runtime dependency"
-            ;;
-        howy-rocm)
-            [ "${depends[0]}" = onnxruntime-rocm ] || fail "ROCm package lost its runtime dependency"
-            ;;
-        howy-cuda)
-            [ "${depends[0]}" = onnxruntime-cuda ] || fail "CUDA package lost its runtime dependency"
-            ;;
-    esac
+    [[ " ${depends[*]} " == *" onnxruntime "* ]] \
+        || fail "${variant} lacks the virtual ONNX Runtime runtime dependency"
+    for concrete_runtime in onnxruntime-cpu onnxruntime-rocm onnxruntime-cuda; do
+        [[ " ${depends[*]} " != *" ${concrete_runtime} "* ]] \
+            || fail "${variant} retains concrete runtime dependency ${concrete_runtime}"
+    done
 
     for file in \
         usr/bin/howyd \
