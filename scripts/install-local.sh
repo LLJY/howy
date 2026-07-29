@@ -88,6 +88,42 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
 }
 
+preflight_package_owned_destinations() {
+    local destination
+    local ownership
+    local ownership_status
+    local -a destinations=(
+        "${HOWYD_DEST}"
+        "${HOWY_DEST}"
+        "${PAM_DEST}"
+        "${SERVICE_DEST}"
+        "${SOCKET_DEST}"
+        "${SYSUSERS_DEST}"
+        "${BRIDGE_DEST}"
+        "${BOOTSTRAP_DEST}"
+        "${ALPM_HOOK_DEST}"
+    )
+
+    command -v pacman >/dev/null 2>&1 || return 0
+
+    for destination in "${destinations[@]}"; do
+        if ownership=$(LC_ALL=C pacman -Qo -- "${destination}" 2>&1); then
+            ownership_status=0
+        else
+            ownership_status=$?
+        fi
+
+        if [ "${ownership_status}" -eq 0 ]; then
+            die "Development-only local install refused: ${ownership}. Use the v2 release checkout helper (sudo ./scripts/howy-v2-update <archive.pkg.tar.zst>) or standalone release helper (sudo ./howy-v2-update <archive.pkg.tar.zst>) for a supported update, or remove the package with sudo pacman -R <howy-package>."
+        fi
+        if [ "${ownership_status}" -eq 1 ] \
+            && [ "${ownership}" = "error: No package owns ${destination}" ]; then
+            continue
+        fi
+        die "Package ownership check failed for ${destination} (pacman exit ${ownership_status}): ${ownership:-no output}. Refusing to build or modify the system until the pacman query succeeds."
+    done
+}
+
 run_bridge() {
     "$@"
 }
@@ -744,6 +780,7 @@ EOF
 main() {
     parse_arguments "$@"
     require_root
+    preflight_package_owned_destinations
     require_command cargo
     require_command install
     require_command sha256sum
