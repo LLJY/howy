@@ -5,6 +5,7 @@ _howy_prepared_update_exists() {
     || return 1
 
   _howy_line_number=0
+  _howy_format=
   _howy_archive=
   _howy_archive_sha256=
   _howy_source_package=
@@ -17,7 +18,10 @@ _howy_prepared_update_exists() {
     _howy_value=${_howy_line#*=}
     [ "${_howy_key}" != "${_howy_line}" ] || return 1
     case "${_howy_line_number}:${_howy_key}" in
-      1:format) [ "${_howy_value}" = howy-v2-update-v1 ] || return 1 ;;
+      1:format)
+        [ "${_howy_value}" = howy-v2-update-v1 ] || return 1
+        _howy_format=${_howy_value}
+        ;;
       2:archive) _howy_archive=${_howy_value} ;;
       3:archive_sha256) _howy_archive_sha256=${_howy_value} ;;
       4:source_package) _howy_source_package=${_howy_value} ;;
@@ -37,15 +41,29 @@ _howy_prepared_update_exists() {
   esac
   [ -n "${_howy_source_version}" ] || return 1
   case "${_howy_target_package}" in howy-cpu|howy-rocm|howy-cuda) ;; *) return 1 ;; esac
-  [ "${_howy_target_version}" = 2.0.0-1 ]
+  [ "${_howy_target_version}" = 2.0.0-1 ] || return 1
+
+  [ "${HOWY_V2_UPDATE_FORMAT-}" = "${_howy_format}" ] || return 1
+  [ "${HOWY_V2_UPDATE_ARCHIVE-}" = "${_howy_archive}" ] || return 1
+  [ "${HOWY_V2_UPDATE_ARCHIVE_SHA256-}" = "${_howy_archive_sha256}" ] || return 1
+  [ "${HOWY_V2_UPDATE_SOURCE_PACKAGE-}" = "${_howy_source_package}" ] || return 1
+  [ "${HOWY_V2_UPDATE_SOURCE_VERSION-}" = "${_howy_source_version}" ] || return 1
+  [ "${HOWY_V2_UPDATE_TARGET_PACKAGE-}" = "${_howy_target_package}" ] || return 1
+  [ "${HOWY_V2_UPDATE_TARGET_VERSION-}" = "${_howy_target_version}" ] || return 1
+
+  [ -f "${_howy_archive}" ] && [ ! -L "${_howy_archive}" ] || return 1
+  _howy_actual_archive_sha256=$(/usr/bin/sha256sum -- "${_howy_archive}" 2>/dev/null) \
+    || return 1
+  [ "${_howy_actual_archive_sha256%% *}" = "${_howy_archive_sha256}" ]
 }
 
 post_install() {
+  if _howy_prepared_update_exists; then
+    printf '%s\n' 'Howy updater prepared this transaction; configuration completion is deferred to howy-v2-update.' >&2
+    return 0
+  fi
+
   if ! /usr/lib/howy/howy-config-bridge bootstrap-release-n; then
-    if _howy_prepared_update_exists; then
-      printf '%s\n' 'Howy updater prepared this transaction; configuration completion is deferred to howy-v2-update.' >&2
-      return 0
-    fi
     printf '%s\n' 'Howy refused to replace /etc/howy/config.toml; the existing object was left untouched.' >&2
     return 1
   fi

@@ -620,6 +620,17 @@ ARCHIVE_PKGNAME=howy-cpu
 ARCHIVE_PKGVER=2.0.0-1
 SENTINEL_CREATED=0
 expect_success 'updater writes same-name prepared sentinel' write_sentinel
+mapfile -t updater_sentinel_lines < "${ADMISSION_SENTINEL_PATH}"
+[[ "${#updater_sentinel_lines[@]}" -eq 7 \
+    && "${updater_sentinel_lines[0]}" == 'format=howy-v2-update-v1' \
+    && "${updater_sentinel_lines[1]}" == "archive=${ARCHIVE_PATH}" \
+    && "${updater_sentinel_lines[2]}" == "archive_sha256=${ARCHIVE_SHA256}" \
+    && "${updater_sentinel_lines[3]}" == "source_package=${SOURCE_PACKAGE}" \
+    && "${updater_sentinel_lines[4]}" == "source_version=${SOURCE_VERSION}" \
+    && "${updater_sentinel_lines[5]}" == "target_package=${ARCHIVE_PKGNAME}" \
+    && "${updater_sentinel_lines[6]}" == "target_version=${ARCHIVE_PKGVER}" ]] \
+    || fail 'updater prepared sentinel is not the exact seven-line schema'
+pass
 
 expect_failure 'update-admission helper rejects arguments' \
     run_update_admission_case root $'howy-cpu\n' unexpected
@@ -756,6 +767,15 @@ assert_order 'socket before service stop' "${stop_function}" \
     'stop howy.socket' 'stop howy.service'
 assert_order 'archive revalidation before pacman' "${main_function}" \
     'require_archive_unchanged' '/usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"'
+assert_order 'prepared sentinel before transaction bindings' "${main_function}" \
+    'write_sentinel' 'HOWY_V2_UPDATE_FORMAT="${UPDATE_FORMAT}"'
+assert_order 'transaction bindings before pacman' "${main_function}" \
+    'HOWY_V2_UPDATE_FORMAT="${UPDATE_FORMAT}"' \
+    '/usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"'
+assert_count 'exact inline transaction binding count' "${main_function}" \
+    'HOWY_V2_UPDATE_' 7
+assert_not_contains 'transaction bindings are not persistent exports' \
+    "${updater_text}" 'export HOWY_V2_UPDATE_'
 assert_order 'config restore before bridge completion' "${post_function}" \
     'restore_config' '/usr/lib/howy/howy-config-bridge complete-release-n'
 assert_order 'bridge completion before reconcile' "${post_function}" \
@@ -981,6 +1001,8 @@ expect_failure 'removal helper inactive verification failure' run_remove_helper_
 MOCK_DIR="${WORK}/install-script"
 /usr/bin/mkdir "${MOCK_DIR}"
 prepared_path="${MOCK_DIR}/prepared"
+prepared_archive="${MOCK_DIR}/howy-rocm-2.0.0-1-x86_64.pkg.tar.zst"
+prepared_archive_sha=''
 marker_path="${MOCK_DIR}/marker"
 install_text=$(<"${INSTALL_SCRIPT}")
 install_text=${install_text//\/usr\/lib\/howy\/howy-config-bridge/bridge_mock}
@@ -1020,8 +1042,49 @@ stat_mock() {
         /usr/bin/stat "$@"
     fi
 }
+reset_prepared_archive() {
+    local digest
+
+    printf 'stable archive bytes\n' > "${prepared_archive}"
+    digest=$(/usr/bin/sha256sum -- "${prepared_archive}")
+    prepared_archive_sha=${digest%% *}
+}
+write_install_prepared_fixture() {
+    printf '%s\n' \
+        'format=howy-v2-update-v1' \
+        "archive=${prepared_archive}" \
+        "archive_sha256=${prepared_archive_sha}" \
+        'source_package=howy-rocm-mode0' \
+        'source_version=0.1.0.r27.g0b76fa2-6' \
+        'target_package=howy-rocm' \
+        'target_version=2.0.0-1' > "${prepared_path}"
+}
+run_bound_post_install() {
+    local target_package="${1:-howy-rocm}"
+
+    HOWY_V2_UPDATE_FORMAT=howy-v2-update-v1 \
+    HOWY_V2_UPDATE_ARCHIVE="${prepared_archive}" \
+    HOWY_V2_UPDATE_ARCHIVE_SHA256="${prepared_archive_sha}" \
+    HOWY_V2_UPDATE_SOURCE_PACKAGE=howy-rocm-mode0 \
+    HOWY_V2_UPDATE_SOURCE_VERSION=0.1.0.r27.g0b76fa2-6 \
+    HOWY_V2_UPDATE_TARGET_PACKAGE="${target_package}" \
+    HOWY_V2_UPDATE_TARGET_VERSION=2.0.0-1 \
+        post_install
+}
 # shellcheck source=/dev/null
 source <(printf '%s\n' "${install_text}")
+unset \
+    HOWY_V2_UPDATE_FORMAT \
+    HOWY_V2_UPDATE_ARCHIVE \
+    HOWY_V2_UPDATE_ARCHIVE_SHA256 \
+    HOWY_V2_UPDATE_SOURCE_PACKAGE \
+    HOWY_V2_UPDATE_SOURCE_VERSION \
+    HOWY_V2_UPDATE_TARGET_PACKAGE \
+    HOWY_V2_UPDATE_TARGET_VERSION
+post_install_function=$(declare -f post_install)
+assert_order 'prepared sentinel validation precedes fresh bootstrap' \
+    "${post_install_function}" '_howy_prepared_update_exists' \
+    'bridge_mock bootstrap-release-n'
 
 INSTALL_LOG=''
 BOOTSTRAP_STATUS=0
@@ -1036,19 +1099,62 @@ INSTALL_LOG=''
 BOOTSTRAP_STATUS=1
 /usr/bin/rm -f -- "${prepared_path}"
 expect_failure 'fresh install bridge failure without sentinel' post_install
-printf '%s\n' \
-    'format=howy-v2-update-v1' \
-    'archive=/tmp/howy.pkg.tar.zst' \
-    'archive_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
-    'source_package=howy-cpu-git' \
-    'source_version=0.1.0.r26.g2dfe39e-1' \
-    'target_package=howy-cpu' \
-    'target_version=2.0.0-1' > "${prepared_path}"
-post_install > "${MOCK_DIR}/prepared.output" 2>&1 \
-    || fail 'prepared update did not defer failed fresh bootstrap'
+reset_prepared_archive
+write_install_prepared_fixture
+INSTALL_LOG=''
+BOOTSTRAP_STATUS=0
+run_bound_post_install > "${MOCK_DIR}/prepared.output" 2>&1 \
+    || fail 'prepared candidate replacement did not defer fresh bootstrap'
 prepared_output=$(<"${MOCK_DIR}/prepared.output")
 assert_contains 'prepared update deferral' "${prepared_output}" \
     'configuration completion is deferred to howy-v2-update'
+[[ -z "${INSTALL_LOG}" ]] \
+    || fail 'prepared candidate replacement invoked the bootstrap bridge'
+pass
+
+printf 'extra=malformed\n' >> "${prepared_path}"
+INSTALL_LOG=''
+BOOTSTRAP_STATUS=1
+if post_install > "${MOCK_DIR}/malformed.output" 2>&1; then
+    fail 'malformed prepared sentinel bypassed bootstrap refusal'
+fi
+malformed_output=$(<"${MOCK_DIR}/malformed.output")
+assert_not_contains 'malformed sentinel does not defer' "${malformed_output}" \
+    'configuration completion is deferred to howy-v2-update'
+assert_contains 'malformed sentinel reaches bootstrap' "${INSTALL_LOG}" \
+    'bridge:bootstrap-release-n'
+assert_contains 'malformed sentinel preserves refusal' "${malformed_output}" \
+    'Howy refused to replace /etc/howy/config.toml'
+
+write_install_prepared_fixture
+INSTALL_LOG=''
+BOOTSTRAP_STATUS=1
+expect_failure 'unbound stale sentinel does not defer' post_install
+assert_contains 'stale sentinel reaches bootstrap' "${INSTALL_LOG}" \
+    'bridge:bootstrap-release-n'
+
+write_install_prepared_fixture
+/usr/bin/rm -- "${prepared_archive}"
+INSTALL_LOG=''
+expect_failure 'missing prepared archive does not defer' run_bound_post_install
+assert_contains 'missing prepared archive reaches bootstrap' "${INSTALL_LOG}" \
+    'bridge:bootstrap-release-n'
+
+reset_prepared_archive
+write_install_prepared_fixture
+printf 'changed\n' >> "${prepared_archive}"
+INSTALL_LOG=''
+expect_failure 'changed prepared archive does not defer' run_bound_post_install
+assert_contains 'changed prepared archive reaches bootstrap' "${INSTALL_LOG}" \
+    'bridge:bootstrap-release-n'
+
+reset_prepared_archive
+write_install_prepared_fixture
+INSTALL_LOG=''
+expect_failure 'mismatched transaction binding does not defer' \
+    run_bound_post_install howy-cpu
+assert_contains 'mismatched transaction binding reaches bootstrap' "${INSTALL_LOG}" \
+    'bridge:bootstrap-release-n'
 
 INSTALL_LOG=''
 COMPLETE_STATUS=0
