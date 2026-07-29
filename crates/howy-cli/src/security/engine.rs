@@ -479,7 +479,13 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
     pub fn package_reconcile(
         &mut self,
         allow_legacy_candidate_mode0: bool,
+        normalize_legacy_candidate_mode0: bool,
     ) -> SecurityResult<SecurityOutcome> {
+        if normalize_legacy_candidate_mode0 && !allow_legacy_candidate_mode0 {
+            return Err(SecurityError::Refused(
+                "legacy candidate Mode 0 normalization requires explicit legacy admission".into(),
+            ));
+        }
         self.runtime.require_root()?;
         self.runtime.acquire_lock()?;
         self.require_package_reconcile_controls_clear()?;
@@ -490,7 +496,10 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
 
         let receipt = self.read_receipt_file()?;
         match receipt {
-            None => self.reconcile_package_no_receipt(allow_legacy_candidate_mode0),
+            None => self.reconcile_package_no_receipt(
+                allow_legacy_candidate_mode0,
+                normalize_legacy_candidate_mode0,
+            ),
             Some((receipt_file, receipt)) => {
                 if receipt_file.bytes
                     != receipt
@@ -509,6 +518,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
     fn reconcile_package_no_receipt(
         &mut self,
         allow_legacy_candidate_mode0: bool,
+        normalize_legacy_candidate_mode0: bool,
     ) -> SecurityResult<SecurityOutcome> {
         let initial = self.observe_package_no_receipt_live(allow_legacy_candidate_mode0)?;
         self.require_package_reconcile_controls_clear()?;
@@ -525,6 +535,11 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
                 "no-receipt package state changed during reconciliation",
             ));
         }
+        if normalize_legacy_candidate_mode0
+            && initial.state == PackageNoReceiptState::LegacyCandidateMode0
+        {
+            return self.normalize_legacy_candidate_mode0(&initial);
+        }
         let message = match initial.state {
             PackageNoReceiptState::Bootstrap => {
                 "Package state reconciled: unprovisioned disabled bootstrap."
@@ -540,6 +555,245 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             messages: vec![message.into()],
             cleanup_command: None,
         })
+    }
+
+    fn normalize_legacy_candidate_mode0(
+        &mut self,
+        initial: &PackageNoReceiptLive,
+    ) -> SecurityResult<SecurityOutcome> {
+        if initial.config.metadata.permissions != 0o600 {
+            return Err(SecurityError::Refused(
+                "legacy candidate Mode 0 normalization requires root:root mode 0600 config".into(),
+            ));
+        }
+        validate_package_mode0_config(&initial.config)?;
+        let transaction_id = self.runtime.transaction_id()?;
+        let plan = self.prepare_atomic_plan(
+            &transaction_id,
+            MODE1_DROPIN_PATH,
+            MODE0_DROPIN_BYTES,
+            0,
+            0,
+            0o600,
+            None,
+            true,
+        )?;
+
+        self.require_package_reconcile_controls_clear()?;
+        self.require_package_reconcile_units_inactive()?;
+        self.runtime.validate_package_marker()?;
+        if self.read_receipt_file()?.is_some() {
+            return Err(SecurityError::operation(
+                "receipt appeared before legacy Mode 0 normalization",
+            ));
+        }
+        let before_publication = self.observe_package_no_receipt_live(true)?;
+        if before_publication != *initial {
+            return Err(SecurityError::operation(
+                "legacy candidate Mode 0 changed before normalization",
+            ));
+        }
+
+        let publication = self.publish_package_mode0_dropin(&plan)?;
+
+        let post_publication = (|| -> SecurityResult<()> {
+            self.require_package_reconcile_controls_clear()?;
+            self.require_package_reconcile_units_inactive()?;
+            self.runtime.validate_package_marker()?;
+            if self.read_receipt_file()?.is_some() {
+                return Err(SecurityError::operation(
+                    "receipt appeared after legacy Mode 0 normalization",
+                ));
+            }
+            self.runtime.daemon_reload()?;
+            self.require_package_reconcile_units_inactive()?;
+            let normalized = self.observe_package_no_receipt_live(false)?;
+            self.validate_normalized_package_mode0(initial, &normalized, &plan, &publication)?;
+
+            self.require_package_reconcile_controls_clear()?;
+            self.require_package_reconcile_units_inactive()?;
+            self.runtime.validate_package_marker()?;
+            if self.read_receipt_file()?.is_some() {
+                return Err(SecurityError::operation(
+                    "receipt appeared during normalized Mode 0 verification",
+                ));
+            }
+            let verified = self.observe_package_no_receipt_live(false)?;
+            if verified != normalized {
+                return Err(SecurityError::operation(
+                    "normalized Mode 0 changed during strict verification",
+                ));
+            }
+            self.validate_normalized_package_mode0(initial, &verified, &plan, &publication)
+        })();
+        if let Err(error) = post_publication {
+            return Err(SecurityError::Uncertain(format!(
+                "exact Mode 0 drop-in committed but post-publication verification failed; \
+                 transaction={} target={} staging={} target_identity={:?}; {error}",
+                plan.transaction_id, plan.target_path, plan.staging_path, publication.target,
+            )));
+        }
+
+        Ok(SecurityOutcome {
+            messages: vec![
+                "Package state normalized: legacy candidate Mode 0 is now explicit Mode 0.".into(),
+            ],
+            cleanup_command: None,
+        })
+    }
+
+    fn publish_package_mode0_dropin(
+        &mut self,
+        plan: &AtomicWritePlanV1,
+    ) -> SecurityResult<AtomicWriteObservationV1> {
+        if plan.target_path != MODE1_DROPIN_PATH
+            || plan.operation != AtomicWriteKindV1::NoReplace
+            || !matches!(plan.expected_target, AtomicExpectedTargetV1::Absent)
+            || plan.uid != 0
+            || plan.gid != 0
+            || plan.permissions != 0o600
+            || plan.timestamps.is_some()
+            || plan.byte_length != MODE0_DROPIN_BYTES.len() as u64
+            || plan.bytes_sha256 != Sha256Digest::from_bytes(MODE0_DROPIN_BYTES)
+        {
+            return Err(SecurityError::operation(
+                "legacy Mode 0 publication plan is invalid",
+            ));
+        }
+
+        let staged = self.runtime.create_atomic_stage(plan, MODE0_DROPIN_BYTES)?;
+        match self.runtime.commit_atomic_stage(plan, &staged) {
+            Ok(observation) => Ok(observation),
+            Err(publication_error) => {
+                #[cfg(test)]
+                if matches!(publication_error, SecurityError::InjectedCrash(_)) {
+                    return Err(publication_error);
+                }
+
+                if !matches!(publication_error, SecurityError::Uncertain(_)) {
+                    return match self.cleanup_uncommitted_mode0_stage(plan, &staged) {
+                        Ok(()) => Err(publication_error),
+                        Err(cleanup_error) => Err(SecurityError::Uncertain(format!(
+                            "legacy Mode 0 publication failed and exact stage cleanup failed; \
+                             transaction={} target={} staging={}; {publication_error}; \
+                             {cleanup_error}",
+                            plan.transaction_id, plan.target_path, plan.staging_path,
+                        ))),
+                    };
+                }
+
+                match self.runtime.reconcile_atomic_write(plan, Some(&staged)) {
+                    Ok(AtomicWriteReconciliation::NotCommitted) => {
+                        match self.cleanup_uncommitted_mode0_stage(plan, &staged) {
+                            Ok(()) => Err(SecurityError::Uncertain(format!(
+                                "legacy Mode 0 publication was not committed and the exact stage \
+                                 was cleaned; transaction={} target={} staging={}; original \
+                                 failure: {publication_error}",
+                                plan.transaction_id, plan.target_path, plan.staging_path,
+                            ))),
+                            Err(cleanup_error) => Err(SecurityError::Uncertain(format!(
+                                "legacy Mode 0 publication was not committed but exact stage \
+                                 cleanup failed; transaction={} target={} staging={}; original \
+                                 failure: {publication_error}; {cleanup_error}",
+                                plan.transaction_id, plan.target_path, plan.staging_path,
+                            ))),
+                        }
+                    }
+                    Ok(AtomicWriteReconciliation::Committed(observation)) => {
+                        Err(SecurityError::Uncertain(format!(
+                            "legacy Mode 0 publication committed despite an error; exact target \
+                             evidence was retained; transaction={} target={} staging={} \
+                             target_identity={:?}; original failure: {publication_error}",
+                            plan.transaction_id,
+                            plan.target_path,
+                            plan.staging_path,
+                            observation.target,
+                        )))
+                    }
+                    Err(reconciliation_error) => Err(SecurityError::Uncertain(format!(
+                        "legacy Mode 0 publication failed and could not be reconciled; evidence \
+                         was retained; transaction={} target={} staging={}; original failure: \
+                         {publication_error}; {reconciliation_error}",
+                        plan.transaction_id, plan.target_path, plan.staging_path,
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn cleanup_uncommitted_mode0_stage(
+        &mut self,
+        plan: &AtomicWritePlanV1,
+        staged: &AtomicFileIdentityV1,
+    ) -> SecurityResult<()> {
+        let observed = self
+            .runtime
+            .observe_atomic_target(&plan.staging_path, MAX_DROPIN_BYTES)?;
+        if observed.parent_directory != plan.parent_directory {
+            return Err(SecurityError::Uncertain(format!(
+                "Mode 0 stage parent identity changed at {}",
+                plan.staging_path
+            )));
+        }
+        match observed.target {
+            None => Ok(()),
+            Some(file) if file.atomic_identity() == *staged => {
+                self.runtime.remove_file_exact(&plan.staging_path, staged)?;
+                let after = self
+                    .runtime
+                    .observe_atomic_target(&plan.staging_path, MAX_DROPIN_BYTES)?;
+                if after.parent_directory != plan.parent_directory || after.target.is_some() {
+                    return Err(SecurityError::Uncertain(format!(
+                        "exact Mode 0 stage cleanup could not prove absence at {}",
+                        plan.staging_path
+                    )));
+                }
+                Ok(())
+            }
+            Some(_) => Err(SecurityError::Uncertain(format!(
+                "Mode 0 stage identity changed at {}",
+                plan.staging_path
+            ))),
+        }
+    }
+
+    fn validate_normalized_package_mode0(
+        &self,
+        initial: &PackageNoReceiptLive,
+        normalized: &PackageNoReceiptLive,
+        plan: &AtomicWritePlanV1,
+        publication: &AtomicWriteObservationV1,
+    ) -> SecurityResult<()> {
+        let dropin = normalized
+            .dropin
+            .as_ref()
+            .ok_or_else(|| SecurityError::operation("normalized Mode 0 drop-in is missing"))?;
+        let parent = &plan.parent_directory;
+        if initial.state != PackageNoReceiptState::LegacyCandidateMode0
+            || initial.dropin.is_some()
+            || initial.artifact.is_some()
+            || initial.namespace_nonempty
+            || normalized.state != PackageNoReceiptState::Mode0
+            || normalized.config != initial.config
+            || normalized.artifact.is_some()
+            || normalized.namespace_nonempty
+            || normalized.base_service != initial.base_service
+            || normalized.base_socket != initial.base_socket
+            || normalized.daemon != initial.daemon
+            || dropin.bytes != MODE0_DROPIN_BYTES
+            || dropin.atomic_identity() != publication.target
+            || dropin.parent_device_id != parent.device_id
+            || dropin.parent_inode != parent.inode
+            || dropin.parent_uid != parent.uid
+            || dropin.parent_gid != parent.gid
+            || dropin.parent_permissions != parent.permissions
+            || dropin.parent_link_count != parent.link_count
+        {
+            return Err(SecurityError::operation(
+                "normalized Mode 0 differs from the exact legacy transition",
+            ));
+        }
+        Ok(())
     }
 
     fn observe_package_no_receipt_live(

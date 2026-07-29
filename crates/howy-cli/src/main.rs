@@ -87,6 +87,12 @@ enum PackageCommands {
     Reconcile {
         #[arg(long = "allow-legacy-candidate-mode0", hide = true)]
         allow_legacy_candidate_mode0: bool,
+        #[arg(
+            long = "normalize-legacy-candidate-mode0",
+            hide = true,
+            requires = "allow_legacy_candidate_mode0"
+        )]
+        normalize_legacy_candidate_mode0: bool,
     },
 }
 
@@ -242,7 +248,11 @@ fn cmd_package(command: PackageCommands) -> Result<()> {
     let outcome = match command {
         PackageCommands::Reconcile {
             allow_legacy_candidate_mode0,
-        } => engine.package_reconcile(allow_legacy_candidate_mode0),
+            normalize_legacy_candidate_mode0,
+        } => engine.package_reconcile(
+            allow_legacy_candidate_mode0,
+            normalize_legacy_candidate_mode0,
+        ),
     }
     .map_err(|error| anyhow::anyhow!(error))?;
     for message in outcome.messages {
@@ -902,12 +912,14 @@ mod tests {
             command:
                 PackageCommands::Reconcile {
                     allow_legacy_candidate_mode0,
+                    normalize_legacy_candidate_mode0,
                 },
         } = cli.command
         else {
             panic!("expected package reconcile")
         };
         assert!(!allow_legacy_candidate_mode0);
+        assert!(!normalize_legacy_candidate_mode0);
 
         let cli = Cli::try_parse_from([
             "howy",
@@ -920,18 +932,52 @@ mod tests {
             command:
                 PackageCommands::Reconcile {
                     allow_legacy_candidate_mode0,
+                    normalize_legacy_candidate_mode0,
                 },
         } = cli.command
         else {
             panic!("expected package reconcile")
         };
         assert!(allow_legacy_candidate_mode0);
+        assert!(!normalize_legacy_candidate_mode0);
+
+        let cli = Cli::try_parse_from([
+            "howy",
+            "package",
+            "reconcile",
+            "--allow-legacy-candidate-mode0",
+            "--normalize-legacy-candidate-mode0",
+        ])
+        .unwrap();
+        let Commands::Package {
+            command:
+                PackageCommands::Reconcile {
+                    allow_legacy_candidate_mode0,
+                    normalize_legacy_candidate_mode0,
+                },
+        } = cli.command
+        else {
+            panic!("expected package reconcile")
+        };
+        assert!(allow_legacy_candidate_mode0);
+        assert!(normalize_legacy_candidate_mode0);
+
+        assert!(
+            Cli::try_parse_from([
+                "howy",
+                "package",
+                "reconcile",
+                "--normalize-legacy-candidate-mode0",
+            ])
+            .is_err()
+        );
 
         let help = match Cli::try_parse_from(["howy", "package", "reconcile", "--help"]) {
             Err(error) => error.to_string(),
             Ok(_) => panic!("reconcile help unexpectedly parsed as a command"),
         };
         assert!(!help.contains("allow-legacy-candidate-mode0"));
+        assert!(!help.contains("normalize-legacy-candidate-mode0"));
         assert!(Cli::try_parse_from(["howy", "package"]).is_err());
         assert!(Cli::try_parse_from(["howy", "package", "update"]).is_err());
         assert!(
