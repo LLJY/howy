@@ -854,7 +854,9 @@ assert_count 'config backup declarations' "${pkgbuild_text}" \
 assert_count 'PKGBUILD virtual ONNX Runtime build dependency' "${pkgbuild_text}" \
     "  'onnxruntime'" 1
 assert_count 'PKGBUILD virtual ONNX Runtime runtime dependencies' "${pkgbuild_text}" \
-    "  depends=('onnxruntime' 'pam' 'systemd>=261')" 3
+    "  depends=('diffutils' 'onnxruntime' 'pam' 'systemd>=261')" 3
+assert_count 'PKGBUILD direct diffutils runtime dependencies' "${pkgbuild_text}" \
+    "'diffutils'" 3
 for concrete_runtime in onnxruntime-cpu onnxruntime-rocm onnxruntime-cuda; do
     assert_not_contains "PKGBUILD concrete ONNX Runtime dependency ${concrete_runtime}" \
         "${pkgbuild_text}" "${concrete_runtime}"
@@ -872,6 +874,8 @@ assert_count '.SRCINFO virtual ONNX Runtime build dependency' "${srcinfo_text}" 
     $'\tmakedepends = onnxruntime' 1
 assert_count '.SRCINFO virtual ONNX Runtime runtime dependencies' "${srcinfo_text}" \
     $'\tdepends = onnxruntime' 3
+assert_count '.SRCINFO direct diffutils runtime dependencies' "${srcinfo_text}" \
+    $'\tdepends = diffutils' 3
 for concrete_runtime in onnxruntime-cpu onnxruntime-rocm onnxruntime-cuda; do
     assert_not_contains ".SRCINFO concrete ONNX Runtime dependency ${concrete_runtime}" \
         "${srcinfo_text}" "${concrete_runtime}"

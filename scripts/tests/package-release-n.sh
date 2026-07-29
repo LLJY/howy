@@ -195,6 +195,8 @@ for variant in howy-cpu howy-rocm howy-cuda; do
 
     [ "${backup[*]}" = "etc/howy/config.toml" ] || fail "${variant} lost config backup ownership"
     [ "${install}" = "howy.install" ] || fail "${variant} lost install script"
+    [ "$(printf '%s\n' "${depends[@]}" | grep -cx 'diffutils')" -eq 1 ] \
+        || fail "${variant} must depend on diffutils exactly once"
     [[ " ${depends[*]} " == *" systemd>=261 "* ]] || fail "${variant} lacks systemd>=261"
     [[ " ${optdepends[*]} " == *" tpm2-tss: TPM-backed systemd credential provisioning "* ]] \
         || fail "${variant} lacks reviewed TPM optional dependency"
