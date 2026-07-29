@@ -14,7 +14,7 @@ makedepends=(
   'protobuf'
   'systemd>=261'
 )
-_commit='c9b7847512569dbd30bbb55aae059440dc0764bb'
+_commit='00c8d154e5e97a3cc34812e5d15ba98987877def'
 source=("${pkgbase}::git+https://github.com/LLJY/howy.git#commit=${_commit}")
 sha256sums=('SKIP')
 
