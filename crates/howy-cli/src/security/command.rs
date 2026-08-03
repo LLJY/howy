@@ -263,6 +263,7 @@ mod tests {
             "--property=UMask=0077",
             "--property=NoNewPrivileges=yes",
             "--property=ProtectSystem=strict",
+            "--property=ProtectHome=yes",
         ] {
             assert!(spec.arguments.iter().any(|argument| argument == required));
         }

@@ -57,6 +57,7 @@ const TRANSIENT_CLEANUP_RESERVE: Duration = Duration::from_secs(15);
 const TRANSIENT_STATE_MAX: usize = 256;
 const EFFECTIVE_SHOW_MAX: usize = 16_384;
 const UNIT_STATE_MAX: usize = 1_024;
+const DIRECTORY_DIAGNOSTIC_PREFIX_MAX: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParsedJournal {
@@ -2977,6 +2978,43 @@ fn split_absolute(path: &str) -> SecurityResult<(&Path, &str)> {
     Ok((parent, name))
 }
 
+fn directory_metadata_violation(stat: &libc::stat) -> Option<&'static str> {
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        Some("not-directory")
+    } else if stat.st_uid != 0 {
+        Some("non-root-owner")
+    } else if stat.st_gid != 0 {
+        Some("non-root-group")
+    } else if stat.st_mode & 0o022 != 0 {
+        Some("group-or-other-writable")
+    } else if stat.st_nlink == 0 {
+        Some("zero-link-count")
+    } else {
+        None
+    }
+}
+
+fn bounded_logical_directory_prefix(path: &Path) -> String {
+    const TRUNCATION_MARKER: &str = "...";
+
+    let prefix = path.to_string_lossy();
+    if prefix.len() <= DIRECTORY_DIAGNOSTIC_PREFIX_MAX {
+        return prefix.into_owned();
+    }
+    let mut end = DIRECTORY_DIAGNOSTIC_PREFIX_MAX - TRUNCATION_MARKER.len();
+    while !prefix.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{TRUNCATION_MARKER}", &prefix[..end])
+}
+
+fn directory_traversal_error(logical_prefix: &Path, category: &'static str) -> SecurityError {
+    SecurityError::operation(format!(
+        "directory traversal rejected at {}: {category}",
+        bounded_logical_directory_prefix(logical_prefix)
+    ))
+}
+
 fn open_directory_path(
     root: &Path,
     path: &Path,
@@ -3009,15 +3047,8 @@ fn open_directory_path(
     }
     let mut current = unsafe { OwnedFd::from_raw_fd(root_fd) };
     let root_stat = fstat(current.as_raw_fd())?;
-    if (root_stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
-        || root_stat.st_uid != 0
-        || root_stat.st_gid != 0
-        || root_stat.st_mode & 0o022 != 0
-        || root_stat.st_nlink == 0
-    {
-        return Err(SecurityError::operation(
-            "security root directory metadata is unsafe",
-        ));
+    if let Some(category) = directory_metadata_violation(&root_stat) {
+        return Err(directory_traversal_error(Path::new("/"), category));
     }
     let components: Vec<_> = relative
         .components()
@@ -3027,7 +3058,9 @@ fn open_directory_path(
             _ => None,
         })
         .collect();
+    let mut logical_prefix = PathBuf::from("/");
     for (index, component) in components.iter().enumerate() {
+        logical_prefix.push(component);
         let component = cstring(component.as_bytes())?;
         let mut fd = unsafe {
             libc::openat(
@@ -3065,23 +3098,17 @@ fn open_directory_path(
             };
         }
         if fd < 0 {
-            return Err(SecurityError::operation(
-                "no-follow directory traversal failed",
+            return Err(directory_traversal_error(
+                &logical_prefix,
+                "no-follow-open-failed",
             ));
         }
-        let stat = fstat(fd)?;
-        if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
-            || stat.st_uid != 0
-            || stat.st_gid != 0
-            || stat.st_mode & 0o022 != 0
-            || stat.st_nlink == 0
-        {
-            unsafe { libc::close(fd) };
-            return Err(SecurityError::operation(
-                "directory traversal metadata is unsafe",
-            ));
+        let descriptor = unsafe { OwnedFd::from_raw_fd(fd) };
+        let stat = fstat(descriptor.as_raw_fd())?;
+        if let Some(category) = directory_metadata_violation(&stat) {
+            return Err(directory_traversal_error(&logical_prefix, category));
         }
-        current = unsafe { OwnedFd::from_raw_fd(fd) };
+        current = descriptor;
     }
     Ok(Some(current))
 }

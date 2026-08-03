@@ -69,6 +69,8 @@ write_pkginfo() {
     local name="$2"
     local version="$3"
     local conflict="${4:-}"
+    local depend="${5:-}"
+    local provides="${6:-}"
 
     {
         printf 'pkgname = %s\n' "${name}"
@@ -82,6 +84,12 @@ write_pkginfo() {
         printf 'arch = x86_64\n'
         if [[ -n "${conflict}" ]]; then
             printf 'conflict = %s\n' "${conflict}"
+        fi
+        if [[ -n "${depend}" ]]; then
+            printf 'depend = %s\n' "${depend}"
+        fi
+        if [[ -n "${provides}" ]]; then
+            printf 'provides = %s\n' "${provides}"
         fi
     } > "${destination}"
 }
@@ -102,12 +110,21 @@ build_provider() {
     local name="$1"
     local version="$2"
     local conflict="${3:-}"
+    local depend="${4:-}"
+    local provides="${5:-}"
     local tree="${WORK}/tree-${name}-${version}"
     local archive="${PACKAGES}/${name}-${version}-x86_64.pkg.tar"
 
     /usr/bin/mkdir -p "${tree}/usr/share/howy-v2-alpm"
-    write_pkginfo "${tree}/.PKGINFO" "${name}" "${version}" "${conflict}"
-    printf '%s %s\n' "${name}" "${version}" > "${tree}/usr/share/howy-v2-alpm/provider"
+    write_pkginfo \
+        "${tree}/.PKGINFO" \
+        "${name}" \
+        "${version}" \
+        "${conflict}" \
+        "${depend}" \
+        "${provides}"
+    printf '%s %s\n' "${name}" "${version}" \
+        > "${tree}/usr/share/howy-v2-alpm/${name}"
     case "${name}" in
         howy-cpu|howy-rocm|howy-cuda)
             /usr/bin/mkdir -p "${tree}/usr/lib/security"
@@ -306,9 +323,36 @@ stable_rocm_archive=$(build_provider howy-rocm 2.0.0-1 howy-rocm-mode0)
 removal_archive=$(build_removal_fixture)
 stable_old_archive=$(build_stable_update_fixture old 'old stable bytes')
 stable_new_archive=$(build_stable_update_fixture new 'new stable bytes')
+runtime_old_archive=$(build_provider \
+    onnxruntime-opt-rocm 1.24.4-9 '' '' 'onnxruntime=1.24.4')
+runtime_new_archive=$(build_provider \
+    onnxruntime-opt-rocm 1.28.0-1 '' '' 'onnxruntime=1.28.0')
+runtime_dependent_archive=$(build_provider \
+    howy-runtime-probe 2.0.0-1 '' 'onnxruntime=1.28.0')
 
 assert_conflict_without_replaces "${stable_cpu_archive}" howy-cpu-git
 assert_conflict_without_replaces "${stable_rocm_archive}" howy-rocm-mode0
+
+case_dir=$(new_root runtime-exact-provider)
+pacman_install "${case_dir}" "${runtime_new_archive}" >/dev/null
+pacman_install "${case_dir}" "${runtime_dependent_archive}" >/dev/null \
+    || fail 'provider capability onnxruntime=1.28.0 did not satisfy the exact dependency'
+
+case_dir=$(new_root runtime-old-provider)
+pacman_install "${case_dir}" "${runtime_old_archive}" >/dev/null
+if pacman_install "${case_dir}" "${runtime_dependent_archive}" >/dev/null 2>&1; then
+    fail 'provider capability onnxruntime=1.24.4 satisfied the 1.28.0 dependency'
+fi
+
+case_dir=$(new_root runtime-provider-downgrade)
+pacman_install "${case_dir}" "${runtime_new_archive}" >/dev/null
+pacman_install "${case_dir}" "${runtime_dependent_archive}" >/dev/null
+if pacman_install "${case_dir}" "${runtime_old_archive}" >/dev/null 2>&1; then
+    fail 'ALPM allowed the installed provider to break the exact ONNX Runtime dependency'
+fi
+[[ "$(pacman_query "${case_dir}" onnxruntime-opt-rocm)" \
+    == 'onnxruntime-opt-rocm 1.28.0-1' ]] \
+    || fail 'refused provider downgrade changed the installed provider'
 
 archive_payload="${WORK}/stable-rocm-archive-payload"
 /usr/bin/mkdir "${archive_payload}"
@@ -518,4 +562,4 @@ pacman_query "${case_dir}" howy-cpu >/dev/null \
 [[ "$(<"${root}/remove-helper.calls")" == 'stop howy.socket' ]] \
     || fail 'removal helper did not fail at the isolated socket stop as arranged'
 
-printf '%s\n' 'v2 isolated ALPM: conflict-only predecessor replacement, PAM alias, stable update admission, and removal abort passed'
+printf '%s\n' 'v2 isolated ALPM: exact runtime capability, conflict-only predecessor replacement, PAM alias, stable update admission, and removal abort passed'
