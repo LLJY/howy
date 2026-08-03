@@ -908,46 +908,16 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
         receipt_file: ObservedFile,
         receipt: ProvisioningReceiptV1,
     ) -> SecurityResult<SecurityOutcome> {
-        if self
-            .runtime
-            .transient_exists(&readiness_unit_name(&receipt.transaction_id))?
-        {
-            return Err(SecurityError::Refused(
-                "receipt readiness transaction control is active".into(),
-            ));
-        }
-
         let initial = self.observe_package_mode1_live(&receipt)?;
-        let preview_before = self.runtime.preview_verifier(&initial.config.bytes)?;
-        let readiness = self.run_stable_strong_readiness(
-            &receipt.transaction_id,
-            howy_common::paths::CONFIG_FILE,
-            MODE1_CREDENTIAL_PATH,
-            &initial.config.bytes,
-        )?;
-        if readiness != preview_before
-            || readiness.config_sha256 != selected_receipt_config_sha256(&receipt)
-            || readiness.daemon != self.runtime.daemon_verifier_identity()?
-        {
-            return Err(SecurityError::operation(
-                "fresh package readiness did not bind the admitted config and daemon",
-            ));
-        }
         validate_receipted_credential_policy(&receipt, &initial.artifact)?;
 
-        let stable = self.observe_package_mode1_live(&receipt)?;
-        if stable != initial || self.runtime.preview_verifier(&stable.config.bytes)? != readiness {
-            return Err(SecurityError::operation(
-                "receipted state changed after fresh package readiness",
-            ));
-        }
-        self.require_package_reconcile_controls_clear()?;
-        self.require_package_reconcile_units_inactive()?;
-
         let mut rebuilt = receipt.clone();
-        rebuilt.unit_credential = stable.unit_credential.clone();
-        rebuilt.effective_units = stable.effective_units.clone();
-        rebuilt.verifier = VerifierReceipt::new(readiness.clone())
+        rebuilt.unit_credential = initial.unit_credential.clone();
+        rebuilt.effective_units = initial.effective_units.clone();
+        let mut verifier = receipt.verifier.output.clone();
+        verifier.config_sha256 = selected_receipt_config_sha256(&receipt);
+        verifier.daemon = initial.daemon.clone();
+        rebuilt.verifier = VerifierReceipt::new(verifier)
             .map_err(|error| SecurityError::operation(error.to_string()))?;
         validate_package_reconcile_preservation(&receipt, &rebuilt)?;
         rebuilt
@@ -957,15 +927,9 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             .deterministic_bytes()
             .map_err(|error| SecurityError::operation(error.to_string()))?;
 
-        let publication_live = self.observe_package_mode1_live(&receipt)?;
-        if publication_live != stable
-            || self
-                .runtime
-                .preview_verifier(&publication_live.config.bytes)?
-                != readiness
-        {
+        if self.observe_package_mode1_live(&receipt)? != initial {
             return Err(SecurityError::operation(
-                "receipted state changed before package receipt publication",
+                "package-owned Mode 1 state changed during reconciliation",
             ));
         }
         self.require_package_reconcile_controls_clear()?;
@@ -1010,9 +974,8 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             .runtime
             .publish_package_receipt(&plan, &rebuilt_bytes)?;
 
-        self.validate_published_package_receipt(&rebuilt, &rebuilt_bytes, &readiness)?;
+        self.validate_published_package_receipt(&rebuilt, &rebuilt_bytes, &publication)?;
         self.runtime.remove_atomic_backup(&plan, &publication)?;
-        self.validate_published_package_receipt(&rebuilt, &rebuilt_bytes, &readiness)?;
 
         let state = match rebuilt.state {
             ReceiptState::ProvisionedDisabled => "provisioned-disabled",
@@ -1028,29 +991,17 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
         &mut self,
         expected: &ProvisioningReceiptV1,
         expected_bytes: &[u8],
-        readiness: &VerifierResultV1,
+        publication: &AtomicWriteObservationV1,
     ) -> SecurityResult<()> {
-        self.require_package_reconcile_controls_clear()?;
-        self.require_package_reconcile_units_inactive()?;
-        self.runtime.validate_package_marker()?;
         let (receipt_file, receipt) = self
             .read_receipt_file()?
             .ok_or_else(|| SecurityError::operation("published receipt disappeared"))?;
-        if receipt_file.bytes != expected_bytes || receipt != *expected {
-            return Err(SecurityError::operation(
-                "published receipt bytes or structure differ from reconciliation",
-            ));
-        }
-        let live = self.observe_package_mode1_live(&receipt)?;
-        validate_receipted_credential_policy(&receipt, &live.artifact)?;
-        if live.unit_credential != receipt.unit_credential
-            || live.effective_units != receipt.effective_units
-            || self.runtime.preview_verifier(&live.config.bytes)? != *readiness
-            || receipt.verifier.output != *readiness
-            || receipt.verifier.output.daemon != self.runtime.daemon_verifier_identity()?
+        if receipt_file.bytes != expected_bytes
+            || receipt != *expected
+            || receipt_file.atomic_identity() != publication.target
         {
             return Err(SecurityError::operation(
-                "published receipt does not match live package state",
+                "published receipt metadata, bytes, structure, or atomic identity differ from reconciliation",
             ));
         }
         Ok(())
@@ -1129,6 +1080,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             )
             .map_err(|error| SecurityError::operation(error.to_string()))?,
         };
+        let daemon = self.runtime.daemon_verifier_identity()?;
 
         Ok(PackageMode1Live {
             config,
@@ -1138,6 +1090,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             base_socket,
             effective_units,
             unit_credential,
+            daemon,
         })
     }
 
@@ -5375,6 +5328,7 @@ struct PackageMode1Live {
     base_socket: ObservedFile,
     effective_units: EffectiveUnitSetV1,
     unit_credential: UnitCredentialReceipt,
+    daemon: DaemonVerifierIdentityV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5508,7 +5462,7 @@ fn validate_receipted_credential_policy(
     .map_err(|error| SecurityError::operation(error.to_string()))?;
     if verified != receipt.artifact.credential_policy {
         return Err(SecurityError::operation(
-            "fresh readiness did not reverify the immutable credential policy",
+            "live credential envelope does not match the immutable credential policy",
         ));
     }
     Ok(())

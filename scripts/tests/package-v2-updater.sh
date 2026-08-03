@@ -123,6 +123,100 @@ HOWY_V2_UPDATE_INTERNAL_TEST=1
 # shellcheck source=../howy-v2-update
 source "${UPDATER}"
 
+run_unit_intent_case() (
+    local socket_active_raw="$1"
+    local socket_substate_raw="$2"
+    local service_active_raw="$3"
+    local service_substate_raw="$4"
+    local expected_socket_active="$5"
+    local expected_service_active="$6"
+    local socket_enabled="${7:-enabled}"
+    local service_enabled="${8:-enabled}"
+
+    unit_snapshot_output() {
+        case "$1" in
+            howy.socket)
+                printf 'ActiveState=%s\nSubState=%s\nUnitFileState=%s\n' \
+                    "${socket_active_raw}" "${socket_substate_raw}" "${socket_enabled}"
+                ;;
+            howy.service)
+                printf 'ActiveState=%s\nSubState=%s\nUnitFileState=%s\n' \
+                    "${service_active_raw}" "${service_substate_raw}" "${service_enabled}"
+                ;;
+            *) return 99 ;;
+        esac
+    }
+
+    capture_unit_intent || return 1
+    [[ "${SOCKET_ACTIVE}:${SERVICE_ACTIVE}" == \
+        "${expected_socket_active}:${expected_service_active}" ]] || return 1
+    [[ "${SOCKET_ACTIVE_RAW}:${SOCKET_SUBSTATE_RAW}" == \
+        "${socket_active_raw}:${socket_substate_raw}" ]] || return 1
+    [[ "${SERVICE_ACTIVE_RAW}:${SERVICE_SUBSTATE_RAW}" == \
+        "${service_active_raw}:${service_substate_raw}" ]] || return 1
+    [[ "${SOCKET_ENABLED}:${SERVICE_ENABLED}" == \
+        "${socket_enabled}:${service_enabled}" ]]
+)
+
+for active_state in active activating reloading refreshing; do
+    expect_success "${active_state} normalizes both units to active intent" \
+        run_unit_intent_case \
+        "${active_state}" socket-any-substate \
+        "${active_state}" service-any-substate \
+        active active
+done
+for active_state in inactive failed deactivating maintenance; do
+    expect_success "${active_state} normalizes both units to inactive intent" \
+        run_unit_intent_case \
+        "${active_state}" socket-any-substate \
+        "${active_state}" service-any-substate \
+        inactive inactive
+done
+expect_success 'arbitrary nonempty substates and mixed enablement are retained' \
+    run_unit_intent_case refreshing custom-socket maintenance custom-service \
+    active inactive disabled enabled
+expect_failure 'unknown socket active state' \
+    run_unit_intent_case unknown listening active running active active
+expect_failure 'unknown service active state' \
+    run_unit_intent_case active listening unknown running active active
+expect_failure 'empty active state' \
+    run_unit_intent_case '' listening active running active active
+expect_failure 'empty substate' \
+    run_unit_intent_case active '' active running active active
+expect_failure 'unsupported socket enablement' \
+    run_unit_intent_case active listening active running active active static enabled
+expect_failure 'unsupported service enablement' \
+    run_unit_intent_case active listening active running active active enabled masked
+
+run_malformed_unit_snapshot_case() (
+    unit_snapshot_output() {
+        printf '%s\n' \
+            'ActiveState=active' \
+            'ActiveState=inactive' \
+            'SubState=running' \
+            'UnitFileState=enabled'
+    }
+    capture_unit_snapshot howy.service
+)
+expect_failure 'duplicate unit snapshot property' run_malformed_unit_snapshot_case
+
+backup_function=$(declare -f create_backup)
+assert_contains 'backup normalized socket activity metadata' "${backup_function}" \
+    "printf 'socket_active=%s\\n' \"\${SOCKET_ACTIVE}\""
+assert_contains 'backup raw socket activity metadata' "${backup_function}" \
+    "printf 'socket_active_raw=%s\\n' \"\${SOCKET_ACTIVE_RAW}\""
+assert_contains 'backup raw socket substate metadata' "${backup_function}" \
+    "printf 'socket_substate_raw=%s\\n' \"\${SOCKET_SUBSTATE_RAW}\""
+assert_contains 'backup normalized service activity metadata' "${backup_function}" \
+    "printf 'service_active=%s\\n' \"\${SERVICE_ACTIVE}\""
+assert_contains 'backup raw service activity metadata' "${backup_function}" \
+    "printf 'service_active_raw=%s\\n' \"\${SERVICE_ACTIVE_RAW}\""
+assert_contains 'backup raw service substate metadata' "${backup_function}" \
+    "printf 'service_substate_raw=%s\\n' \"\${SERVICE_SUBSTATE_RAW}\""
+assert_order 'backup v1 normalized fields precede additive raw fields' "${backup_function}" \
+    "printf 'service_active=%s\\n' \"\${SERVICE_ACTIVE}\"" \
+    "printf 'socket_active_raw=%s\\n' \"\${SOCKET_ACTIVE_RAW}\""
+
 pkginfo_text() {
     printf 'pkgname = %s\npkgbase = %s\npkgver = %s\narch = %s' \
         "$1" "$2" "$3" "$4"
@@ -578,6 +672,527 @@ expect_failure 'symlinked expected backup entry is refused' backup_contents_are_
 /usr/bin/rm -- "${backup}/config.toml"
 printf 'config\n' > "${backup}/config.toml"
 
+resume_archive_tree="${WORK}/resume-archive-tree"
+resume_archive="${WORK}/howy-rocm-2.0.0-1-x86_64.pkg.tar"
+/usr/bin/mkdir "${resume_archive_tree}"
+printf '%s\n' \
+    'pkgname = howy-rocm' \
+    'pkgbase = howy' \
+    'pkgver = 2.0.0-1' \
+    'arch = x86_64' > "${resume_archive_tree}/.PKGINFO"
+/usr/bin/bsdtar -cf "${resume_archive}" -C "${resume_archive_tree}" .PKGINFO
+resume_archive_digest=$(/usr/bin/sha256sum -- "${resume_archive}")
+resume_archive_sha=${resume_archive_digest%% *}
+
+write_retained_metadata_fixture() {
+    local path="$1"
+    local schema="$2"
+    local source_package="$3"
+    local source_version="$4"
+    local archive_path="$5"
+    local archive_sha="$6"
+    local socket_enabled="${7:-disabled}"
+    local socket_active="${8:-inactive}"
+    local service_enabled="${9:-enabled}"
+    local service_active="${10:-active}"
+
+    {
+        printf '%s\n' \
+            'format=howy-v2-update-v1' \
+            "archive=${archive_path}" \
+            "archive_sha256=${archive_sha}" \
+            "source_package=${source_package}" \
+            "source_version=${source_version}" \
+            'target_package=howy-rocm' \
+            'target_version=2.0.0-1' \
+            "socket_enabled=${socket_enabled}" \
+            "socket_active=${socket_active}" \
+            "service_enabled=${service_enabled}" \
+            "service_active=${service_active}"
+        if [[ "${schema}" == current ]]; then
+            printf '%s\n' \
+                'socket_active_raw=failed' \
+                'socket_substate_raw=stored-socket-history' \
+                'service_active_raw=refreshing' \
+                'service_substate_raw=stored-service-history'
+        fi
+    } > "${path}"
+}
+
+legacy_metadata="${WORK}/legacy-retained-metadata"
+write_retained_metadata_fixture \
+    "${legacy_metadata}" legacy howy-rocm-mode0 0.1.0.r27.g0b76fa2-6 \
+    "${resume_archive}" "${resume_archive_sha}"
+expect_success 'legacy eleven-field retained metadata parsing' \
+    parse_retained_backup_metadata "${legacy_metadata}"
+[[ "${RETAINED_SOURCE_PACKAGE}:${RETAINED_SOURCE_VERSION}" == \
+    'howy-rocm-mode0:0.1.0.r27.g0b76fa2-6' \
+    && "${RETAINED_ARCHIVE_PATH}:${RETAINED_ARCHIVE_SHA256}" == \
+        "${resume_archive}:${resume_archive_sha}" \
+    && -z "${STORED_SOCKET_ACTIVE_RAW}${STORED_SERVICE_ACTIVE_RAW}" ]] \
+    || fail 'legacy retained metadata populated incorrect fields'
+pass
+
+current_metadata="${WORK}/current-retained-metadata"
+write_retained_metadata_fixture \
+    "${current_metadata}" current howy-rocm 2.0.0-1 \
+    "${resume_archive}" "${resume_archive_sha}"
+expect_success 'current additive-raw-field retained metadata parsing' \
+    parse_retained_backup_metadata "${current_metadata}"
+[[ "${RETAINED_SOURCE_PACKAGE}:${RETAINED_SOURCE_VERSION}" == 'howy-rocm:2.0.0-1' \
+    && "${STORED_SOCKET_ACTIVE_RAW}:${STORED_SOCKET_SUBSTATE_RAW}" == \
+        'failed:stored-socket-history' \
+    && "${STORED_SERVICE_ACTIVE_RAW}:${STORED_SERVICE_SUBSTATE_RAW}" == \
+        'refreshing:stored-service-history' ]] \
+    || fail 'current retained metadata populated incorrect raw history'
+pass
+printf 'duplicate=field\n' >> "${current_metadata}"
+expect_failure 'retained metadata rejects an extra field' \
+    parse_retained_backup_metadata "${current_metadata}"
+invalid_stored_intent_metadata="${WORK}/invalid-stored-intent-metadata"
+write_retained_metadata_fixture \
+    "${invalid_stored_intent_metadata}" current \
+    howy-rocm-mode0 0.1.0.r27.g0b76fa2-6 \
+    "${resume_archive}" "${resume_archive_sha}" masked inactive enabled active
+expect_failure 'retained metadata rejects non-exact stored enablement' \
+    parse_retained_backup_metadata "${invalid_stored_intent_metadata}"
+write_retained_metadata_fixture \
+    "${invalid_stored_intent_metadata}" current \
+    howy-rocm-mode0 0.1.0.r27.g0b76fa2-6 \
+    "${resume_archive}" "${resume_archive_sha}" disabled failed enabled active
+expect_failure 'retained metadata rejects non-normalized stored activity' \
+    parse_retained_backup_metadata "${invalid_stored_intent_metadata}"
+metadata_parser_function=$(declare -f parse_retained_backup_metadata)
+assert_not_contains 'retained metadata parser does not evaluate metadata' \
+    "${metadata_parser_function}" 'eval '
+assert_not_contains 'retained metadata parser does not source metadata' \
+    "${metadata_parser_function}" 'source '
+
+prepare_resume_case() {
+    local name="$1"
+    local schema="$2"
+    local source_package="$3"
+    local source_version="$4"
+    local installed_state="$5"
+    local behavior="$6"
+    local metadata_archive=${resume_archive}
+    local metadata_sha=${resume_archive_sha}
+
+    RESUME_CASE_ROOT="${WORK}/resume-${name}"
+    RESUME_SCHEMA=${schema}
+    RESUME_SOURCE_PACKAGE=${source_package}
+    RESUME_SOURCE_VERSION=${source_version}
+    RESUME_INITIAL_INSTALLED_STATE=${installed_state}
+    RESUME_BEHAVIOR=${behavior}
+    RESUME_LOG="${RESUME_CASE_ROOT}/commands.log"
+    /usr/bin/rm -rf -- "${RESUME_CASE_ROOT}"
+    /usr/bin/mkdir -p "${RESUME_CASE_ROOT}/backup"
+    /usr/bin/chmod 0700 "${RESUME_CASE_ROOT}/backup"
+    printf 'saved config\n' > "${RESUME_CASE_ROOT}/backup/config.toml"
+    printf 'saved receipt\n' > "${RESUME_CASE_ROOT}/backup/receipt-v1.json"
+    printf 'saved marker\n' > "${RESUME_CASE_ROOT}/backup/package-bootstrap.marker"
+    case "${installed_state}" in
+        source|source-version-mismatch)
+            printf 'saved config\n' > "${RESUME_CASE_ROOT}/config.toml"
+            printf 'saved receipt\n' > "${RESUME_CASE_ROOT}/receipt-v1.json"
+            printf 'live candidate marker\n' > "${RESUME_CASE_ROOT}/live-marker"
+            ;;
+        *)
+            printf 'live config from completed pacman\n' > "${RESUME_CASE_ROOT}/config.toml"
+            printf 'live receipt from completed pacman\n' > "${RESUME_CASE_ROOT}/receipt-v1.json"
+            ;;
+    esac
+    case "${behavior}" in
+        archive-path-mismatch) metadata_archive="${resume_archive}.different" ;;
+        archive-hash-mismatch)
+            metadata_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+            ;;
+    esac
+    write_retained_metadata_fixture \
+        "${RESUME_CASE_ROOT}/backup/metadata" "${schema}" \
+        "${source_package}" "${source_version}" \
+        "${metadata_archive}" "${metadata_sha}"
+    /usr/bin/chmod 0600 \
+        "${RESUME_CASE_ROOT}/backup/metadata" \
+        "${RESUME_CASE_ROOT}/backup/receipt-v1.json" \
+        "${RESUME_CASE_ROOT}/backup/package-bootstrap.marker"
+    : > "${RESUME_LOG}"
+}
+
+run_resume_main_case() (
+    local transformed
+
+    transformed=$(<"${UPDATER}")
+    transformed=${transformed//\/etc\/howy\/config.toml/${RESUME_CASE_ROOT}\/config.toml}
+    transformed=${transformed//\/var\/lib\/howy\/security-state\/receipt-v1.json/${RESUME_CASE_ROOT}\/receipt-v1.json}
+    transformed=${transformed//\/var\/lib\/howy-package-bootstrap.complete/${RESUME_CASE_ROOT}\/live-marker}
+    transformed=${transformed//\/var\/lib\/howy\/v2-update-backup-v1/${RESUME_CASE_ROOT}\/backup}
+    transformed=${transformed//\/run\/howy-v2-update-v1.prepared/${RESUME_CASE_ROOT}\/prepared}
+    transformed=${transformed//\/usr\/lib\/howy\/howy-config-bridge/resume_bridge_mock}
+    transformed=${transformed//\/usr\/bin\/systemctl/resume_systemctl_mock}
+    transformed=${transformed//\/usr\/bin\/pacman/resume_pacman_mock}
+    transformed=${transformed//\/usr\/bin\/stat/resume_stat_mock}
+    transformed=${transformed//\/usr\/bin\/install/resume_install_mock}
+    transformed=${transformed//\/usr\/bin\/howy/resume_howy_mock}
+    transformed=${transformed//\/usr\/bin\/id/resume_id_mock}
+
+    RESUME_CASE_ROOT="${RESUME_CASE_ROOT}" \
+    RESUME_SOURCE_PACKAGE="${RESUME_SOURCE_PACKAGE}" \
+    RESUME_SOURCE_VERSION="${RESUME_SOURCE_VERSION}" \
+    RESUME_INITIAL_INSTALLED_STATE="${RESUME_INITIAL_INSTALLED_STATE}" \
+    RESUME_BEHAVIOR="${RESUME_BEHAVIOR}" \
+    RESUME_LOG="${RESUME_LOG}" \
+    RESUME_UPDATER_TEXT="${transformed}" \
+        /usr/bin/bash -s -- "${resume_archive}" <<'RESUME_HARNESS'
+    set -euo pipefail
+    HOWY_V2_UPDATE_INTERNAL_TEST=1
+    # shellcheck source=/dev/null
+    source <(printf '%s\n' "${RESUME_UPDATER_TEXT}")
+
+    RESUME_INSTALLED_FIXTURE=${RESUME_INITIAL_INSTALLED_STATE}
+    RESUME_SOCKET_ENABLED=enabled
+    RESUME_SOCKET_ACTIVE=reloading
+    RESUME_SOCKET_SUBSTATE=custom-socket-live
+    RESUME_SERVICE_ENABLED=disabled
+    RESUME_SERVICE_ACTIVE=maintenance
+    RESUME_SERVICE_SUBSTATE=custom-service-live
+
+    resume_id_mock() {
+        printf '0\n'
+    }
+    resume_stat_mock() {
+        local path=${!#}
+
+        if [[ "${path}" == "${BACKUP_PATH}" ]]; then
+            case "$1:$2" in
+                '-c:%u:%g:%a') printf '0:0:700\n'; return 0 ;;
+            esac
+        elif [[ "${path}" == "${BACKUP_PATH}/"* ]]; then
+            case "$1:$2" in
+                '-c:%u:%g:%h') printf '0:0:1\n'; return 0 ;;
+            esac
+        elif [[ "${path}" == "${SENTINEL_PATH}" ]]; then
+            case "$1:$2" in
+                '-c:%u:%g:%a') printf '0:0:600\n'; return 0 ;;
+            esac
+        elif [[ "${path}" == "${CONFIG_PATH}" ]]; then
+            case "$1:$2" in
+                '-c:%u:%g:%a:%h')
+                    printf '0:0:%s:1\n' "$(/usr/bin/stat -c '%a' -- "${path}")"
+                    return 0
+                    ;;
+            esac
+        fi
+        /usr/bin/stat "$@"
+    }
+    resume_install_mock() {
+        [[ "$1:$2:$3:$4:$5:$7:$8:$9" == \
+            "-o:root:-g:root:-m:--:${BACKUP_PATH}/config.toml:${CONFIG_PATH}" ]] \
+            || return 89
+        /usr/bin/install -m "$6" -- "$8" "$9"
+    }
+    resume_pacman_mock() {
+        printf 'pacman:%s\n' "$*" >> "${RESUME_LOG}"
+        case "$1" in
+            -Qq)
+                case "${RESUME_INSTALLED_FIXTURE}" in
+                    source|source-version-mismatch) printf '%s\n' howy-rocm-mode0 ;;
+                    target|target-version-mismatch) printf '%s\n' howy-rocm ;;
+                    ambiguous) printf '%s\n' howy-rocm-mode0 howy-rocm ;;
+                    absent) : ;;
+                    *) return 98 ;;
+                esac
+                ;;
+            -Qqo)
+                case "${RESUME_INSTALLED_FIXTURE}" in
+                    source|source-version-mismatch) printf '%s\n' howy-rocm-mode0 ;;
+                    target|target-version-mismatch) printf '%s\n' howy-rocm ;;
+                    *) return 97 ;;
+                esac
+                ;;
+            -Q)
+                case "$3:${RESUME_INSTALLED_FIXTURE}" in
+                    howy-rocm-mode0:source)
+                        printf 'howy-rocm-mode0 %s\n' "${RESUME_SOURCE_VERSION}"
+                        ;;
+                    howy-rocm-mode0:source-version-mismatch)
+                        printf 'howy-rocm-mode0 0.1.0.r27.g0b76fa2-5\n'
+                        ;;
+                    howy-rocm:target) printf 'howy-rocm 2.0.0-1\n' ;;
+                    howy-rocm:target-version-mismatch) printf 'howy-rocm 2.0.0-2\n' ;;
+                    *) return 1 ;;
+                esac
+                ;;
+            --ask=4)
+                [[ "$*" == "--ask=4 -U --noconfirm -- ${ARCHIVE_PATH}" ]] || return 96
+                [[ -f "${SENTINEL_PATH}" && ! -L "${SENTINEL_PATH}" ]] || return 95
+                mapfile -t resume_sentinel_lines < "${SENTINEL_PATH}" || return 94
+                [[ "${#resume_sentinel_lines[@]}" -eq 7 ]] || return 93
+                [[ "${HOWY_V2_UPDATE_FORMAT}:${HOWY_V2_UPDATE_ARCHIVE}:${HOWY_V2_UPDATE_ARCHIVE_SHA256}" == \
+                    "${UPDATE_FORMAT}:${ARCHIVE_PATH}:${ARCHIVE_SHA256}" ]] || return 92
+                [[ "${HOWY_V2_UPDATE_TARGET_PACKAGE}:${HOWY_V2_UPDATE_TARGET_VERSION}" == \
+                    "${ARCHIVE_PKGNAME}:${ARCHIVE_PKGVER}" ]] || return 91
+                printf 'pacman-binding:source=%s:%s:target=%s:%s:sentinel-source=%s:%s\n' \
+                    "${HOWY_V2_UPDATE_SOURCE_PACKAGE}" \
+                    "${HOWY_V2_UPDATE_SOURCE_VERSION}" \
+                    "${HOWY_V2_UPDATE_TARGET_PACKAGE}" \
+                    "${HOWY_V2_UPDATE_TARGET_VERSION}" \
+                    "${resume_sentinel_lines[3]#source_package=}" \
+                    "${resume_sentinel_lines[4]#source_version=}" >> "${RESUME_LOG}"
+                [[ "${RESUME_BEHAVIOR}" != pacman-failure ]] || return 90
+                if [[ "${RESUME_INSTALLED_FIXTURE}" == source ]]; then
+                    printf 'stable package config payload\n' > "${CONFIG_PATH}"
+                fi
+                /usr/bin/rm -f -- "${MARKER_PATH}"
+                RESUME_INSTALLED_FIXTURE=target
+                ;;
+            *) return 99 ;;
+        esac
+    }
+    resume_systemctl_mock() {
+        local argument property='' unit=${!#}
+
+        printf 'systemctl:%s\n' "$*" >> "${RESUME_LOG}"
+        case "$1" in
+            show)
+                if [[ " $* " == *' --value '* ]]; then
+                    for argument in "$@"; do
+                        case "${argument}" in
+                            --property=*) property=${argument#--property=} ;;
+                        esac
+                    done
+                    case "${unit}:${property}" in
+                        howy.socket:UnitFileState) printf '%s\n' "${RESUME_SOCKET_ENABLED}" ;;
+                        howy.socket:ActiveState) printf '%s\n' "${RESUME_SOCKET_ACTIVE}" ;;
+                        howy.service:UnitFileState) printf '%s\n' "${RESUME_SERVICE_ENABLED}" ;;
+                        howy.service:ActiveState) printf '%s\n' "${RESUME_SERVICE_ACTIVE}" ;;
+                        *) return 96 ;;
+                    esac
+                else
+                    case "${unit}" in
+                        howy.socket)
+                            printf 'SubState=%s\nUnitFileState=%s\nActiveState=%s\n' \
+                                "${RESUME_SOCKET_SUBSTATE}" \
+                                "${RESUME_SOCKET_ENABLED}" \
+                                "${RESUME_SOCKET_ACTIVE}"
+                            ;;
+                        howy.service)
+                            printf 'SubState=%s\nUnitFileState=%s\nActiveState=%s\n' \
+                                "${RESUME_SERVICE_SUBSTATE}" \
+                                "${RESUME_SERVICE_ENABLED}" \
+                                "${RESUME_SERVICE_ACTIVE}"
+                            ;;
+                        *) return 95 ;;
+                    esac
+                fi
+                ;;
+            stop)
+                case "$2" in
+                    howy.socket) RESUME_SOCKET_ACTIVE=inactive ;;
+                    howy.service) RESUME_SERVICE_ACTIVE=inactive ;;
+                    *) return 94 ;;
+                esac
+                ;;
+            enable)
+                case "$2" in
+                    howy.socket) RESUME_SOCKET_ENABLED=enabled ;;
+                    howy.service) RESUME_SERVICE_ENABLED=enabled ;;
+                    *) return 93 ;;
+                esac
+                ;;
+            disable)
+                case "$2" in
+                    howy.socket) RESUME_SOCKET_ENABLED=disabled ;;
+                    howy.service) RESUME_SERVICE_ENABLED=disabled ;;
+                    *) return 92 ;;
+                esac
+                ;;
+            start)
+                case "$2" in
+                    howy.socket) RESUME_SOCKET_ACTIVE=active ;;
+                    howy.service) RESUME_SERVICE_ACTIVE=active ;;
+                    *) return 91 ;;
+                esac
+                ;;
+            *) return 90 ;;
+        esac
+    }
+    resume_bridge_mock() {
+        local marker_state=absent
+        local sentinel_state=absent
+
+        if [[ -e "${MARKER_PATH}" || -L "${MARKER_PATH}" ]]; then
+            marker_state=present
+        fi
+        if [[ -e "${SENTINEL_PATH}" || -L "${SENTINEL_PATH}" ]]; then
+            sentinel_state=present
+        fi
+        printf 'bridge:%s:marker-%s:sentinel-%s\n' \
+            "$*" "${marker_state}" "${sentinel_state}" >> "${RESUME_LOG}"
+        [[ "${RESUME_BEHAVIOR}" != bridge-failure ]] || return 1
+        /usr/bin/rm -f -- "${MARKER_PATH}"
+    }
+    resume_howy_mock() {
+        printf 'howy:%s\n' "$*" >> "${RESUME_LOG}"
+    }
+
+    main "$1"
+RESUME_HARNESS
+)
+
+prepare_resume_case source-success current \
+    howy-rocm-mode0 0.1.0.r27.g0b76fa2-6 source success
+if source_resume_output=$(run_resume_main_case 2>&1); then
+    pass
+else
+    fail "source-state retained-backup resume failed: ${source_resume_output}"
+fi
+source_resume_log=$(<"${RESUME_LOG}")
+assert_contains 'source-state resume completion output' "${source_resume_output}" \
+    'Howy update finalization resumed: package=howy-rocm version=2.0.0-1'
+assert_count 'resume captures one coherent snapshot per unit' \
+    "${source_resume_log}" \
+    'systemctl:show --property=UnitFileState --property=ActiveState --property=SubState --no-pager' 2
+assert_count 'source-state resume reruns pacman exactly once' \
+    "${source_resume_log}" 'pacman:--ask=4 -U --noconfirm --' 1
+assert_contains 'source-state pacman keeps candidate transaction binding' \
+    "${source_resume_log}" \
+    'pacman-binding:source=howy-rocm-mode0:0.1.0.r27.g0b76fa2-6:target=howy-rocm:2.0.0-1:sentinel-source=howy-rocm-mode0:0.1.0.r27.g0b76fa2-6'
+assert_order 'source-state sentinel-backed pacman precedes bridge' \
+    "${source_resume_log}" 'pacman-binding:' \
+    'bridge:complete-release-n:marker-absent:sentinel-absent'
+assert_contains 'source-state resume uses legacy normalization reconcile' \
+    "${source_resume_log}" \
+    'howy:package reconcile --allow-legacy-candidate-mode0 --normalize-legacy-candidate-mode0'
+assert_contains 'stored socket disablement is restored on source resume' \
+    "${source_resume_log}" 'systemctl:disable howy.socket'
+assert_contains 'stored service enablement is restored on source resume' \
+    "${source_resume_log}" 'systemctl:enable howy.service'
+assert_not_contains 'stored inactive socket is not restarted on source resume' \
+    "${source_resume_log}" 'systemctl:start howy.socket'
+assert_contains 'stored active service is restarted on source resume' \
+    "${source_resume_log}" 'systemctl:start howy.service'
+[[ "$(<"${RESUME_CASE_ROOT}/config.toml")" == 'saved config' ]] \
+    || fail 'source-state resume did not restore the backed-up config'
+pass
+[[ "$(<"${RESUME_CASE_ROOT}/receipt-v1.json")" == 'saved receipt' ]] \
+    || fail 'source-state resume did not preserve the backed-up receipt bytes'
+pass
+[[ ! -e "${RESUME_CASE_ROOT}/backup" && ! -L "${RESUME_CASE_ROOT}/backup" ]] \
+    || fail 'source-state resume did not remove the exact completed backup'
+pass
+[[ ! -e "${RESUME_CASE_ROOT}/prepared" && ! -L "${RESUME_CASE_ROOT}/prepared" ]] \
+    || fail 'source-state resume left a prepared sentinel'
+pass
+
+prepare_resume_case target-success current \
+    howy-rocm-mode0 0.1.0.r27.g0b76fa2-6 target success
+if target_resume_output=$(run_resume_main_case 2>&1); then
+    pass
+else
+    fail "target-state retained-backup resume failed: ${target_resume_output}"
+fi
+target_resume_log=$(<"${RESUME_LOG}")
+assert_count 'target-state resume reruns pacman exactly once' \
+    "${target_resume_log}" 'pacman:--ask=4 -U --noconfirm --' 1
+assert_contains 'target-state resume rewrites transaction as stable same-name update' \
+    "${target_resume_log}" \
+    'pacman-binding:source=howy-rocm:2.0.0-1:target=howy-rocm:2.0.0-1:sentinel-source=howy-rocm:2.0.0-1'
+assert_contains 'candidate-origin target resume retains normalization reconcile' \
+    "${target_resume_log}" \
+    'howy:package reconcile --allow-legacy-candidate-mode0 --normalize-legacy-candidate-mode0'
+assert_contains 'target-state bridge runs without a stale sentinel' \
+    "${target_resume_log}" \
+    'bridge:complete-release-n:marker-absent:sentinel-absent'
+assert_contains 'stored socket disablement is restored on target resume' \
+    "${target_resume_log}" 'systemctl:disable howy.socket'
+assert_contains 'stored service activity is restored on target resume' \
+    "${target_resume_log}" 'systemctl:start howy.service'
+[[ "$(<"${RESUME_CASE_ROOT}/config.toml")" == \
+    'live config from completed pacman' ]] \
+    || fail 'target-state resume restored the stale config snapshot'
+pass
+[[ "$(<"${RESUME_CASE_ROOT}/receipt-v1.json")" == \
+    'live receipt from completed pacman' ]] \
+    || fail 'target-state resume restored the stale receipt snapshot'
+pass
+[[ ! -e "${RESUME_CASE_ROOT}/backup" && ! -L "${RESUME_CASE_ROOT}/backup" ]] \
+    || fail 'target-state resume did not clean its exact backup'
+pass
+[[ ! -e "${RESUME_CASE_ROOT}/prepared" && ! -L "${RESUME_CASE_ROOT}/prepared" ]] \
+    || fail 'target-state resume left a prepared sentinel'
+pass
+
+prepare_resume_case archive-mismatch legacy \
+    howy-rocm-mode0 0.1.0.r27.g0b76fa2-6 source archive-hash-mismatch
+expect_failure 'retained backup exact archive hash mismatch refusal' run_resume_main_case
+archive_mismatch_log=$(<"${RESUME_LOG}")
+assert_not_contains 'archive mismatch refuses before installed package query' \
+    "${archive_mismatch_log}" 'pacman:'
+assert_not_contains 'archive mismatch refuses before unit stop' \
+    "${archive_mismatch_log}" 'systemctl:stop'
+[[ -d "${RESUME_CASE_ROOT}/backup" ]] \
+    || fail 'archive mismatch removed the retained backup'
+pass
+
+prepare_resume_case archive-path-mismatch legacy \
+    howy-rocm-mode0 0.1.0.r27.g0b76fa2-6 source archive-path-mismatch
+expect_failure 'retained backup exact archive path mismatch refusal' run_resume_main_case
+archive_path_mismatch_log=$(<"${RESUME_LOG}")
+assert_not_contains 'archive path mismatch refuses before installed package query' \
+    "${archive_path_mismatch_log}" 'pacman:'
+assert_not_contains 'archive path mismatch refuses before unit stop' \
+    "${archive_path_mismatch_log}" 'systemctl:stop'
+[[ -d "${RESUME_CASE_ROOT}/backup" ]] \
+    || fail 'archive path mismatch removed the retained backup'
+pass
+
+for installed_state in ambiguous source-version-mismatch target-version-mismatch absent; do
+    prepare_resume_case "state-refusal-${installed_state}" current \
+        howy-rocm-mode0 0.1.0.r27.g0b76fa2-6 "${installed_state}" success
+    expect_failure "resume refuses ${installed_state} installed state" run_resume_main_case
+    state_refusal_log=$(<"${RESUME_LOG}")
+    assert_not_contains "${installed_state} refuses before pacman transaction" \
+        "${state_refusal_log}" 'pacman:--ask=4 -U'
+    assert_not_contains "${installed_state} refuses before unit stop" \
+        "${state_refusal_log}" 'systemctl:stop'
+    [[ -d "${RESUME_CASE_ROOT}/backup" ]] \
+        || fail "${installed_state} refusal removed the retained backup"
+    pass
+done
+
+prepare_resume_case pacman-failure current \
+    howy-rocm-mode0 0.1.0.r27.g0b76fa2-6 source pacman-failure
+expect_failure 'resumed pacman failure retains exact backup' run_resume_main_case
+pacman_failure_log=$(<"${RESUME_LOG}")
+assert_contains 'resumed pacman failure saw its prepared sentinel' \
+    "${pacman_failure_log}" \
+    'pacman-binding:source=howy-rocm-mode0:0.1.0.r27.g0b76fa2-6:target=howy-rocm:2.0.0-1:sentinel-source=howy-rocm-mode0:0.1.0.r27.g0b76fa2-6'
+[[ -d "${RESUME_CASE_ROOT}/backup" ]] \
+    || fail 'resumed pacman failure removed the retained backup'
+pass
+[[ ! -e "${RESUME_CASE_ROOT}/prepared" && ! -L "${RESUME_CASE_ROOT}/prepared" ]] \
+    || fail 'resumed pacman failure left a stale prepared sentinel'
+pass
+
+prepare_resume_case bridge-failure current \
+    howy-rocm-mode0 0.1.0.r27.g0b76fa2-6 source bridge-failure
+expect_failure 'resume finalization failure retains exact backup' run_resume_main_case
+bridge_failure_log=$(<"${RESUME_LOG}")
+assert_contains 'resume finalization failure reran pacman before bridge' \
+    "${bridge_failure_log}" 'pacman:--ask=4 -U --noconfirm --'
+assert_contains 'resume failure reached bridge after sentinel removal' \
+    "${bridge_failure_log}" \
+    'bridge:complete-release-n:marker-absent:sentinel-absent'
+[[ -d "${RESUME_CASE_ROOT}/backup" \
+    && -f "${RESUME_CASE_ROOT}/backup/metadata" \
+    && -f "${RESUME_CASE_ROOT}/backup/config.toml" ]] \
+    || fail 'resume finalization failure did not retain the exact backup'
+pass
+[[ ! -e "${RESUME_CASE_ROOT}/prepared" && ! -L "${RESUME_CASE_ROOT}/prepared" ]] \
+    || fail 'resume finalization failure left a stale prepared sentinel'
+pass
+
 ADMISSION_SENTINEL_PATH="${WORK}/howy-v2-update-v1.prepared"
 admission_helper_text=$(<"${ADMISSION_HELPER}")
 
@@ -756,6 +1371,7 @@ expect_failure 'update-admission helper rejects target-version mismatch' \
     run_update_admission_case root $'howy-cpu\n'
 
 main_function=$(declare -f main)
+resume_function=$(declare -f resume_retained_update)
 stop_function=$(declare -f stop_units)
 post_function=$(declare -f post_pacman_steps)
 restore_config_function=$(declare -f restore_config)
@@ -808,6 +1424,22 @@ assert_order 'transaction bindings before pacman' "${main_function}" \
     '/usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"'
 assert_count 'exact inline transaction binding count' "${main_function}" \
     'HOWY_V2_UPDATE_' 7
+assert_order 'resume archive revalidation before sentinel' "${resume_function}" \
+    'require_archive_unchanged' 'write_sentinel'
+assert_order 'resume sentinel before transaction bindings' "${resume_function}" \
+    'write_sentinel' 'HOWY_V2_UPDATE_FORMAT="${UPDATE_FORMAT}"'
+assert_order 'resume transaction bindings before pacman' "${resume_function}" \
+    'HOWY_V2_UPDATE_FORMAT="${UPDATE_FORMAT}"' \
+    '/usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"'
+assert_count 'exact resumed transaction binding count' "${resume_function}" \
+    'HOWY_V2_UPDATE_' 7
+assert_order 'resumed pacman before sentinel removal' "${resume_function}" \
+    '/usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"' \
+    '/usr/bin/rm -f -- "${SENTINEL_PATH}"'
+assert_order 'resume sentinel removal before post-pacman work' "${resume_function}" \
+    '/usr/bin/rm -f -- "${SENTINEL_PATH}"' 'post_pacman_steps'
+assert_order 'resume post-pacman work before backup cleanup' "${resume_function}" \
+    'post_pacman_steps' 'remove_completed_backup'
 assert_not_contains 'transaction bindings are not persistent exports' \
     "${updater_text}" 'export HOWY_V2_UPDATE_'
 assert_order 'config restore before bridge completion' "${post_function}" \
@@ -839,12 +1471,8 @@ assert_contains 'failure stop contract' "${retain_function}" 'best_effort_stop_u
 assert_not_contains 'failure path retains backup' "${retain_function}" 'remove_completed_backup'
 assert_contains 'failure backup review guidance' "${retain_function}" \
     'inspect and preserve any needed backup files before recovery'
-assert_contains 'failure backup blocks retry guidance' "${retain_function}" \
-    'the retained backup blocks a new updater run'
-assert_contains 'failure backup explicit-removal guidance' "${retain_function}" \
-    'explicitly remove only the reviewed backup files and then its empty directory'
-assert_contains 'failure path rejects automatic resume promise' "${retain_function}" \
-    'will not resume or remove the retained backup automatically'
+assert_contains 'failure exact-archive resume guidance' "${retain_function}" \
+    'rerunning the updater with the exact archive resumes finalization'
 assert_order 'cleanup validates before removal' "${cleanup_function}" \
     'backup_contents_are_expected' '/usr/bin/rm -- "${files[@]}"'
 assert_contains 'cleanup exact directory removal' "${cleanup_function}" \
@@ -953,32 +1581,19 @@ TRANSITION_KIND=candidate
 if candidate_recovery=$(retain_failure 'candidate mock failure' 2>&1); then
     fail 'candidate retain_failure unexpectedly succeeded'
 fi
-assert_contains 'candidate recovery requires stable state review' "${candidate_recovery}" \
-    'after inspecting the retained backup and confirming installed stable v2 and /etc/howy/config.toml'
-assert_contains 'candidate recovery exact bridge command' "${candidate_recovery}" \
-    'sudo /usr/lib/howy/howy-config-bridge complete-release-n'
-assert_contains 'candidate recovery exact reconcile command' "${candidate_recovery}" \
-    'sudo howy package reconcile --allow-legacy-candidate-mode0 --normalize-legacy-candidate-mode0'
-assert_contains 'candidate recovery atomic publication caveat' "${candidate_recovery}" \
-    'successful atomic publication may already have normalized Mode 0'
-assert_contains 'candidate recovery idempotent state scope' "${candidate_recovery}" \
-    'idempotent for explicit Mode 0, Mode 1, and bootstrap state'
-assert_contains 'candidate recovery restores unit intent' "${candidate_recovery}" \
-    'review and restore saved unit intent'
-assert_contains 'candidate recovery removes exact backup files' "${candidate_recovery}" \
-    'remove only the exact reviewed backup files'
+assert_contains 'candidate recovery exact-archive resume guidance' "${candidate_recovery}" \
+    'rerunning the updater with the exact archive resumes finalization'
+assert_contains 'candidate recovery admission caveat' "${candidate_recovery}" \
+    'retained metadata and installed source or target state are admissible'
 
 for transition in stable release-n; do
     TRANSITION_KIND=${transition}
     if generic_recovery=$(retain_failure "${transition} mock failure" 2>&1); then
         fail "${transition} retain_failure unexpectedly succeeded"
     fi
-    assert_contains "${transition} retains generic rerun guidance" "${generic_recovery}" \
-        'before rerunning, explicitly remove only the reviewed backup files'
-    assert_not_contains "${transition} omits candidate bridge recovery" "${generic_recovery}" \
-        'sudo /usr/lib/howy/howy-config-bridge complete-release-n'
-    assert_not_contains "${transition} omits candidate reconcile recovery" "${generic_recovery}" \
-        '--normalize-legacy-candidate-mode0'
+    assert_contains "${transition} retains exact-archive resume guidance" \
+        "${generic_recovery}" \
+        'rerunning the updater with the exact archive resumes finalization'
 done
 
 pkgbuild_text=$(<"${PKGBUILD_PATH}")
@@ -1007,10 +1622,10 @@ assert_contains 'removal hook package path and mode' "${pkgbuild_text}" \
     'install -Dm644 packaging/10-howy-remove-prepare.hook "${pkgdir}/usr/share/libalpm/hooks/10-howy-remove-prepare.hook"'
 assert_count 'config backup declarations' "${pkgbuild_text}" \
     "backup=('etc/howy/config.toml')" 3
-assert_count 'PKGBUILD virtual ONNX Runtime build dependency' "${pkgbuild_text}" \
-    "  'onnxruntime'" 1
-assert_count 'PKGBUILD virtual ONNX Runtime runtime dependencies' "${pkgbuild_text}" \
-    "  depends=('diffutils' 'onnxruntime' 'pam' 'systemd>=261')" 3
+assert_count 'PKGBUILD ABI-pinned virtual ONNX Runtime build dependency' "${pkgbuild_text}" \
+    "  'onnxruntime=1.28.0'" 1
+assert_count 'PKGBUILD ABI-pinned virtual ONNX Runtime runtime dependencies' "${pkgbuild_text}" \
+    "  depends=('diffutils' 'onnxruntime=1.28.0' 'pam' 'systemd>=261')" 3
 assert_count 'PKGBUILD direct diffutils runtime dependencies' "${pkgbuild_text}" \
     "'diffutils'" 3
 for concrete_runtime in onnxruntime-cpu onnxruntime-rocm onnxruntime-cuda; do
@@ -1026,10 +1641,10 @@ assert_not_contains '.SRCINFO old split identity' "${srcinfo_text}" 'pkgname = h
 assert_count '.SRCINFO config backup declarations' "${srcinfo_text}" \
     $'\tbackup = etc/howy/config.toml' 3
 assert_count '.SRCINFO has zero automatic replacements' "${srcinfo_text}" $'\treplaces = ' 0
-assert_count '.SRCINFO virtual ONNX Runtime build dependency' "${srcinfo_text}" \
-    $'\tmakedepends = onnxruntime' 1
-assert_count '.SRCINFO virtual ONNX Runtime runtime dependencies' "${srcinfo_text}" \
-    $'\tdepends = onnxruntime' 3
+assert_count '.SRCINFO ABI-pinned virtual ONNX Runtime build dependency' "${srcinfo_text}" \
+    $'\tmakedepends = onnxruntime=1.28.0' 1
+assert_count '.SRCINFO ABI-pinned virtual ONNX Runtime runtime dependencies' "${srcinfo_text}" \
+    $'\tdepends = onnxruntime=1.28.0' 3
 assert_count '.SRCINFO direct diffutils runtime dependencies' "${srcinfo_text}" \
     $'\tdepends = diffutils' 3
 for concrete_runtime in onnxruntime-cpu onnxruntime-rocm onnxruntime-cuda; do

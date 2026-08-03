@@ -93,6 +93,7 @@ struct FakeRuntime {
     namespace_nonempty: bool,
     readiness_error: Option<SecurityError>,
     malformed_readiness: bool,
+    readiness_config_hash_mismatch: bool,
     encrypt_error: Option<SecurityError>,
     rng_error: bool,
     root: bool,
@@ -114,8 +115,10 @@ struct FakeRuntime {
     effective_units: EffectiveUnitSetV1,
     effective_override: Option<EffectiveUnitSetV1>,
     daemon_identity: DaemonVerifierIdentityV1,
+    daemon_identity_reads: usize,
+    mutate_daemon_after_read: Option<usize>,
     package_marker: FakePackageMarkerState,
-    mutate_marker_after_package_publication: bool,
+    mutate_receipt_bytes_after_package_publication: bool,
     mutate_effective_after_package_mode0_publication: bool,
     package_mode0_target_occupancy: Option<Vec<u8>>,
     last_package_mode0_publication: Option<AtomicWriteObservationV1>,
@@ -151,6 +154,7 @@ impl FakeRuntime {
             namespace_nonempty: false,
             readiness_error: None,
             malformed_readiness: false,
+            readiness_config_hash_mismatch: false,
             encrypt_error: None,
             rng_error: false,
             root: true,
@@ -172,8 +176,10 @@ impl FakeRuntime {
             effective_units: base_effective_units(),
             effective_override: None,
             daemon_identity: fake_daemon_identity(),
+            daemon_identity_reads: 0,
+            mutate_daemon_after_read: None,
             package_marker: FakePackageMarkerState::Valid,
-            mutate_marker_after_package_publication: false,
+            mutate_receipt_bytes_after_package_publication: false,
             mutate_effective_after_package_mode0_publication: false,
             package_mode0_target_occupancy: None,
             last_package_mode0_publication: None,
@@ -272,6 +278,29 @@ impl FakeRuntime {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    fn apply_live_mutation(&mut self, mutation: &'static str) {
+        match mutation {
+            "artifact" => self.put(MODE1_CREDENTIAL_PATH, b"changed", 0o600),
+            "config" => self.put(howy_common::paths::CONFIG_FILE, b"changed", 0o600),
+            "dropin" => self.put(MODE1_DROPIN_PATH, b"[Service]\n", 0o600),
+            "namespace" => self.namespace_nonempty = !self.namespace_nonempty,
+            "receipt" => {
+                let receipt = self.files.get_mut(SECURITY_RECEIPT_PATH).unwrap();
+                receipt.bytes.push(b'\n');
+                receipt.metadata.byte_length += 1;
+            }
+            "daemon" => {
+                self.daemon_identity.binary_sha256 = Sha256Digest::from_bytes(b"replacement-howyd")
+            }
+            "marker" => self.package_marker = FakePackageMarkerState::Drifted,
+            "journal" => self.put(SECURITY_JOURNAL_PATH, b"{active", 0o600),
+            "guard" => self.put(SECURITY_TRANSACTION_GUARD_PATH, b"{active", 0o600),
+            "service" => self.service = unit(UnitKind::Service, true),
+            "socket" => self.socket = unit(UnitKind::Socket, true),
+            _ => unreachable!(),
+        }
     }
 
     fn status(&mut self) -> Option<SecurityInfoResult> {
@@ -626,9 +655,11 @@ impl SecurityRuntime for FakeRuntime {
             } else {
                 self.fail_after("receipt-write")?;
             }
-            if self.mutate_marker_after_package_publication {
-                self.mutate_marker_after_package_publication = false;
-                self.package_marker = FakePackageMarkerState::Drifted;
+            if self.mutate_receipt_bytes_after_package_publication {
+                self.mutate_receipt_bytes_after_package_publication = false;
+                let receipt = self.files.get_mut(SECURITY_RECEIPT_PATH).unwrap();
+                receipt.bytes.push(b'\n');
+                receipt.metadata.byte_length += 1;
             }
         } else if package_mode0 {
             self.last_package_mode0_publication = Some(observation.clone());
@@ -1063,7 +1094,13 @@ impl SecurityRuntime for FakeRuntime {
     }
 
     fn daemon_verifier_identity(&mut self) -> SecurityResult<DaemonVerifierIdentityV1> {
-        Ok(self.daemon_identity.clone())
+        self.daemon_identity_reads += 1;
+        let observed = self.daemon_identity.clone();
+        if self.mutate_daemon_after_read == Some(self.daemon_identity_reads) {
+            self.daemon_identity.binary_sha256 =
+                Sha256Digest::from_bytes(b"replacement-howyd-after-observation");
+        }
+        Ok(observed)
     }
 
     fn monotonic_millis(&mut self) -> u64 {
@@ -1193,7 +1230,11 @@ impl SecurityRuntime for FakeRuntime {
             .get(&config_path)
             .ok_or_else(|| SecurityError::operation("candidate config missing"))?;
         let output = self
-            .verifier_for(&config.bytes)
+            .verifier_for(if self.readiness_config_hash_mismatch {
+                b"mismatched-readiness-config"
+            } else {
+                &config.bytes
+            })
             .deterministic_bytes()
             .map_err(|error| SecurityError::operation(error.to_string()))?;
         let mutation = self.mutate_after_readiness.take().or_else(|| {
@@ -1203,13 +1244,7 @@ impl SecurityRuntime for FakeRuntime {
         });
         if let Some(mutation) = mutation {
             self.mutate_on_readiness_call = None;
-            match mutation {
-                "artifact" => self.put(MODE1_CREDENTIAL_PATH, b"changed", 0o600),
-                "config" => self.put(howy_common::paths::CONFIG_FILE, b"changed", 0o600),
-                "dropin" => self.put(MODE1_DROPIN_PATH, b"[Service]\n", 0o600),
-                "namespace" => self.namespace_nonempty = !self.namespace_nonempty,
-                _ => unreachable!(),
-            }
+            self.apply_live_mutation(mutation);
         }
         Ok(output)
     }
@@ -1604,6 +1639,17 @@ fn host_envelope_text() -> Vec<u8> {
         .chunks_exact(2)
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect();
+    base64_encode(&bytes)
+}
+
+fn host_envelope_text_with_extra_ciphertext() -> Vec<u8> {
+    let hex = include_str!("../../../howy-common/testdata/systemd-v261/host.hex").trim();
+    let mut bytes: Vec<u8> = hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    bytes.extend_from_slice(&[0x5a; 8]);
     base64_encode(&bytes)
 }
 
@@ -3834,6 +3880,22 @@ fn mode0_clears_credentials_without_parsing_or_deleting_a_corrupt_mode1_artifact
 fn package_reconcile_rebinds_disabled_receipt_and_preserves_immutable_fields() {
     let mut runtime = FakeRuntime::fresh();
     provision(&mut runtime).unwrap();
+    let standard_readiness: Vec<_> = runtime
+        .commands
+        .iter()
+        .filter(|command| command.executable == "/usr/bin/systemd-run")
+        .collect();
+    assert!(!standard_readiness.is_empty());
+    assert!(standard_readiness.iter().all(|command| {
+        command
+            .arguments
+            .iter()
+            .any(|argument| argument == "--property=ProtectHome=yes")
+            && command
+                .arguments
+                .iter()
+                .all(|argument| argument != "--property=ProtectHome=read-only")
+    }));
     let mut old_dropin_bytes = MODE1_DROPIN_BYTES.to_vec();
     old_dropin_bytes.extend_from_slice(b"# old-package-policy\n");
     let old_dropin_sha256 = Sha256Digest::from_bytes(&old_dropin_bytes);
@@ -3860,11 +3922,51 @@ fn package_reconcile_rebinds_disabled_receipt_and_preserves_immutable_fields() {
     let artifact = runtime.files[MODE1_CREDENTIAL_PATH].observed();
     assert!(!receipt_matches_live(&old_receipt, &config, &artifact, &mut runtime).unwrap());
 
+    runtime.events.clear();
+    runtime.commands.clear();
+    runtime.readiness_calls = 0;
     let outcome = SecurityEngine::new(&mut runtime)
         .package_reconcile(false, false)
         .unwrap();
     assert!(outcome.messages[0].contains("provisioned-disabled"));
+    assert_eq!(runtime.readiness_calls, 0);
+    assert_eq!(
+        runtime
+            .commands
+            .iter()
+            .filter(|command| command.executable == "/usr/bin/systemd-run")
+            .count(),
+        0
+    );
+    assert_eq!(
+        runtime
+            .events
+            .iter()
+            .filter(|event| event.as_str() == "preview-verifier")
+            .count(),
+        0
+    );
+    assert_eq!(
+        runtime
+            .events
+            .iter()
+            .filter(|event| event.as_str() == "effective:Service")
+            .count(),
+        2
+    );
+    assert_eq!(
+        runtime
+            .events
+            .iter()
+            .filter(|event| event.as_str() == "effective:Socket")
+            .count(),
+        2
+    );
     let rebuilt = runtime.receipt();
+    let published = &runtime.files[SECURITY_RECEIPT_PATH];
+    assert_eq!(published.metadata.uid, 0);
+    assert_eq!(published.metadata.gid, 0);
+    assert_eq!(published.metadata.permissions, 0o600);
     assert_eq!(rebuilt.state, ReceiptState::ProvisionedDisabled);
     assert_eq!(rebuilt.schema_version, old_receipt.schema_version);
     assert_eq!(rebuilt.transaction_id, old_receipt.transaction_id);
@@ -3915,6 +4017,10 @@ fn package_reconcile_rebinds_disabled_receipt_and_preserves_immutable_fields() {
     );
     assert_eq!(rebuilt.verifier.output.daemon, runtime.daemon_identity);
     assert_eq!(
+        rebuilt.verifier.output.readiness,
+        old_receipt.verifier.output.readiness
+    );
+    assert_eq!(
         rebuilt.verifier.output.config_sha256,
         rebuilt.config_patch.disabled_sha256
     );
@@ -3942,14 +4048,26 @@ fn package_reconcile_rebinds_disabled_receipt_and_preserves_immutable_fields() {
         .filter(|(_, event)| *event == "package-marker")
         .map(|(index, _)| index)
         .collect();
-    assert!(markers.len() >= 4);
+    assert_eq!(markers.len(), 2);
     assert!(lock < markers[0]);
     let stable_config = runtime.files[howy_common::paths::CONFIG_FILE].observed();
     let stable_artifact = runtime.files[MODE1_CREDENTIAL_PATH].observed();
     let stable_dropin = runtime.files[MODE1_DROPIN_PATH].observed();
+    runtime.events.clear();
+    runtime.commands.clear();
+    runtime.readiness_calls = 0;
     SecurityEngine::new(&mut runtime)
         .package_reconcile(true, true)
         .unwrap();
+    assert_eq!(runtime.readiness_calls, 0);
+    assert_eq!(
+        runtime
+            .events
+            .iter()
+            .filter(|event| event.as_str() == "preview-verifier")
+            .count(),
+        0
+    );
     assert_eq!(
         runtime.files[howy_common::paths::CONFIG_FILE].observed(),
         stable_config
@@ -3974,9 +4092,21 @@ fn package_reconcile_retains_enabled_state_and_enabled_config_binding() {
     runtime.status_available = false;
     install_changed_package_state(&mut runtime);
 
+    runtime.events.clear();
+    runtime.commands.clear();
+    runtime.readiness_calls = 0;
     SecurityEngine::new(&mut runtime)
         .package_reconcile(false, false)
         .unwrap();
+    assert_eq!(runtime.readiness_calls, 0);
+    assert_eq!(
+        runtime
+            .events
+            .iter()
+            .filter(|event| event.as_str() == "preview-verifier")
+            .count(),
+        0
+    );
     let rebuilt = runtime.receipt();
     assert_eq!(rebuilt.state, ReceiptState::Enabled);
     assert_eq!(rebuilt.artifact, old_receipt.artifact);
@@ -3990,6 +4120,10 @@ fn package_reconcile_retains_enabled_state_and_enabled_config_binding() {
         rebuilt.config_patch.enabled_sha256
     );
     assert_eq!(rebuilt.verifier.output.daemon, runtime.daemon_identity);
+    assert_eq!(
+        rebuilt.verifier.output.readiness,
+        old_receipt.verifier.output.readiness
+    );
 }
 
 #[test]
@@ -4008,13 +4142,15 @@ fn package_reconcile_refuses_tampering_controls_running_readiness_and_publicatio
         "guard",
         "running-service",
         "running-socket",
-        "readiness",
-        "post-readiness-artifact",
-        "transient",
+        "credential-policy",
+        "daemon-drift",
         "marker-missing",
         "marker-drifted",
     ] {
         let mut runtime = baseline.clone();
+        runtime.events.clear();
+        runtime.commands.clear();
+        runtime.readiness_calls = 0;
         match failure {
             "config" => runtime.put(howy_common::paths::CONFIG_FILE, b"tampered", 0o600),
             "artifact" => runtime.put(MODE1_CREDENTIAL_PATH, b"tampered", 0o600),
@@ -4025,11 +4161,28 @@ fn package_reconcile_refuses_tampering_controls_running_readiness_and_publicatio
             "guard" => runtime.put(SECURITY_TRANSACTION_GUARD_PATH, b"{active", 0o600),
             "running-service" => runtime.service = unit(UnitKind::Service, true),
             "running-socket" => runtime.socket = unit(UnitKind::Socket, true),
-            "readiness" => {
-                runtime.readiness_error = Some(SecurityError::operation("readiness failed"))
+            "credential-policy" => {
+                let artifact = host_envelope_text_with_extra_ciphertext();
+                let inspected =
+                    howy_common::provisioning::inspect_systemd_credential_envelope(&artifact)
+                        .unwrap();
+                let mut receipt = runtime.receipt();
+                receipt.artifact.sha256 = Sha256Digest::from_bytes(&artifact);
+                receipt.artifact.size = artifact.len() as u64;
+                receipt.artifact.credential_policy.envelope_sha256 = inspected.envelope_sha256;
+                receipt.artifact.credential_policy.envelope_size = inspected.envelope_size;
+                receipt.validate().unwrap();
+                runtime.put(MODE1_CREDENTIAL_PATH, &artifact, 0o600);
+                runtime.put(
+                    SECURITY_RECEIPT_PATH,
+                    &receipt.deterministic_bytes().unwrap(),
+                    0o600,
+                );
             }
-            "post-readiness-artifact" => runtime.mutate_after_readiness = Some("artifact"),
-            "transient" => runtime.transient_exists = true,
+            "daemon-drift" => {
+                runtime.daemon_identity_reads = 0;
+                runtime.mutate_daemon_after_read = Some(1);
+            }
             "marker-missing" => runtime.package_marker = FakePackageMarkerState::Missing,
             "marker-drifted" => runtime.package_marker = FakePackageMarkerState::Drifted,
             _ => unreachable!(),
@@ -4045,9 +4198,16 @@ fn package_reconcile_refuses_tampering_controls_running_readiness_and_publicatio
             runtime.files[SECURITY_RECEIPT_PATH].bytes, before,
             "{failure}"
         );
-        if matches!(failure, "marker-missing" | "marker-drifted") {
-            assert_eq!(runtime.readiness_calls, baseline.readiness_calls);
-        }
+        assert_eq!(runtime.readiness_calls, 0, "{failure}");
+        assert!(
+            runtime
+                .events
+                .iter()
+                .filter(|event| event.as_str() == "preview-verifier")
+                .count()
+                == 0,
+            "{failure}"
+        );
     }
 
     let mut non_root = baseline;
@@ -4077,7 +4237,7 @@ fn package_reconcile_publication_uncertainty_and_validation_failures_retain_exac
         match failure {
             "post-rename" => runtime.fail_after = Some("package-receipt-post-rename"),
             "directory-fsync" => runtime.fail_after = Some("package-receipt-directory-fsync"),
-            "validation" => runtime.mutate_marker_after_package_publication = true,
+            "validation" => runtime.mutate_receipt_bytes_after_package_publication = true,
             "backup-cleanup" => runtime.fail_after = Some("package-receipt-backup-cleanup"),
             _ => unreachable!(),
         }
@@ -4099,6 +4259,10 @@ fn package_reconcile_publication_uncertainty_and_validation_failures_retain_exac
         assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
 
         let candidate = runtime.files[SECURITY_RECEIPT_PATH].observed();
+        let published_bytes = ProvisioningReceiptV1::parse(&candidate.bytes)
+            .unwrap()
+            .deterministic_bytes()
+            .unwrap();
         let target = runtime
             .observe_atomic_target(SECURITY_RECEIPT_PATH, MAX_RECEIPT_BYTES)
             .unwrap();
@@ -4111,7 +4275,7 @@ fn package_reconcile_publication_uncertainty_and_validation_failures_retain_exac
             0,
             0o600,
             None,
-            &candidate.bytes,
+            &published_bytes,
             AtomicWriteKindV1::Exchange,
         )
         .unwrap();
@@ -4120,9 +4284,11 @@ fn package_reconcile_publication_uncertainty_and_validation_failures_retain_exac
             target: candidate.atomic_identity(),
             backup: Some(old_receipt_file.atomic_identity()),
         };
-        runtime.package_marker = FakePackageMarkerState::Valid;
         runtime.remove_atomic_backup(&plan, &observation).unwrap();
         assert!(!runtime.files.contains_key(&plan.staging_path));
+        if failure == "validation" {
+            runtime.put(SECURITY_RECEIPT_PATH, &published_bytes, 0o600);
+        }
         SecurityEngine::new(&mut runtime)
             .package_reconcile(false, false)
             .unwrap_or_else(|error| panic!("{failure} retry failed: {error}"));

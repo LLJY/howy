@@ -28,11 +28,31 @@ ARCHIVE_SHA256=''
 ARCHIVE_SIZE=''
 SERVICE_ENABLED=''
 SERVICE_ACTIVE=''
+SERVICE_ACTIVE_RAW=''
+SERVICE_SUBSTATE_RAW=''
 SOCKET_ENABLED=''
 SOCKET_ACTIVE=''
+SOCKET_ACTIVE_RAW=''
+SOCKET_SUBSTATE_RAW=''
 RECEIPT_EXISTED=0
 MARKER_EXISTED=0
 SENTINEL_CREATED=0
+STORED_SOCKET_ENABLED=''
+STORED_SOCKET_ACTIVE=''
+STORED_SERVICE_ENABLED=''
+STORED_SERVICE_ACTIVE=''
+STORED_SOCKET_ACTIVE_RAW=''
+STORED_SOCKET_SUBSTATE_RAW=''
+STORED_SERVICE_ACTIVE_RAW=''
+STORED_SERVICE_SUBSTATE_RAW=''
+RETAINED_ARCHIVE_PATH=''
+RETAINED_ARCHIVE_SHA256=''
+RETAINED_SOURCE_PACKAGE=''
+RETAINED_SOURCE_VERSION=''
+RETAINED_TARGET_PACKAGE=''
+RETAINED_TARGET_VERSION=''
+RETAINED_TRANSITION_KIND=''
+RESUME_INSTALLED_STATE=''
 
 refuse() {
     printf 'howy-v2-update: refusal: %s\n' "$*" >&2
@@ -519,19 +539,105 @@ unit_property() {
     printf '%s\n' "${value}"
 }
 
+unit_snapshot_output() {
+    /usr/bin/systemctl show \
+        --property=UnitFileState \
+        --property=ActiveState \
+        --property=SubState \
+        --no-pager \
+        "$1"
+}
+
+capture_unit_snapshot() {
+    local unit="$1"
+    local output line value
+    local enabled_count=0 active_count=0 substate_count=0
+
+    CAPTURED_UNIT_ENABLED=''
+    CAPTURED_UNIT_ACTIVE=''
+    CAPTURED_UNIT_SUBSTATE=''
+    output=$(unit_snapshot_output "${unit}") || return 1
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        case "${line}" in
+            UnitFileState=*)
+                value=${line#UnitFileState=}
+                enabled_count=$((enabled_count + 1))
+                CAPTURED_UNIT_ENABLED=${value}
+                ;;
+            ActiveState=*)
+                value=${line#ActiveState=}
+                active_count=$((active_count + 1))
+                CAPTURED_UNIT_ACTIVE=${value}
+                ;;
+            SubState=*)
+                value=${line#SubState=}
+                substate_count=$((substate_count + 1))
+                CAPTURED_UNIT_SUBSTATE=${value}
+                ;;
+            *) return 1 ;;
+        esac
+    done <<< "${output}"
+    [[ "${enabled_count}:${active_count}:${substate_count}" == '1:1:1' ]] || return 1
+    [[ -n "${CAPTURED_UNIT_ENABLED}" \
+        && -n "${CAPTURED_UNIT_ACTIVE}" \
+        && -n "${CAPTURED_UNIT_SUBSTATE}" ]]
+}
+
+normalize_unit_active_state() {
+    case "$1" in
+        active|activating|reloading|refreshing) printf '%s\n' active ;;
+        inactive|failed|deactivating|maintenance) printf '%s\n' inactive ;;
+        *) return 1 ;;
+    esac
+}
+
+unit_enablement_is_supported() {
+    [[ "$1" == enabled || "$1" == disabled ]]
+}
+
 capture_unit_intent() {
-    SOCKET_ENABLED=$(unit_property howy.socket UnitFileState) || return 1
-    SOCKET_ACTIVE=$(unit_property howy.socket ActiveState) || return 1
-    SERVICE_ENABLED=$(unit_property howy.service UnitFileState) || return 1
-    SERVICE_ACTIVE=$(unit_property howy.service ActiveState) || return 1
-    case "${SOCKET_ENABLED}:${SERVICE_ENABLED}" in
-        enabled:enabled|enabled:disabled|disabled:enabled|disabled:disabled) ;;
-        *) return 1 ;;
-    esac
-    case "${SOCKET_ACTIVE}:${SERVICE_ACTIVE}" in
-        active:active|active:inactive|inactive:active|inactive:inactive) ;;
-        *) return 1 ;;
-    esac
+    SOCKET_ACTIVE=''
+    SOCKET_ACTIVE_RAW=''
+    SOCKET_SUBSTATE_RAW=''
+    SERVICE_ACTIVE=''
+    SERVICE_ACTIVE_RAW=''
+    SERVICE_SUBSTATE_RAW=''
+
+    capture_unit_snapshot howy.socket || return 1
+    SOCKET_ENABLED=${CAPTURED_UNIT_ENABLED}
+    SOCKET_ACTIVE_RAW=${CAPTURED_UNIT_ACTIVE}
+    SOCKET_SUBSTATE_RAW=${CAPTURED_UNIT_SUBSTATE}
+    capture_unit_snapshot howy.service || return 1
+    SERVICE_ENABLED=${CAPTURED_UNIT_ENABLED}
+    SERVICE_ACTIVE_RAW=${CAPTURED_UNIT_ACTIVE}
+    SERVICE_SUBSTATE_RAW=${CAPTURED_UNIT_SUBSTATE}
+    unit_enablement_is_supported "${SOCKET_ENABLED}" || return 1
+    unit_enablement_is_supported "${SERVICE_ENABLED}" || return 1
+    SOCKET_ACTIVE=$(normalize_unit_active_state "${SOCKET_ACTIVE_RAW}") || return 1
+    SERVICE_ACTIVE=$(normalize_unit_active_state "${SERVICE_ACTIVE_RAW}") || return 1
+}
+
+current_unit_state_is_controllable() {
+    local socket_enabled socket_active service_enabled service_active
+
+    capture_unit_snapshot howy.socket || return 1
+    socket_enabled=${CAPTURED_UNIT_ENABLED}
+    socket_active=${CAPTURED_UNIT_ACTIVE}
+    capture_unit_snapshot howy.service || return 1
+    service_enabled=${CAPTURED_UNIT_ENABLED}
+    service_active=${CAPTURED_UNIT_ACTIVE}
+
+    unit_enablement_is_supported "${socket_enabled}" || return 1
+    unit_enablement_is_supported "${service_enabled}" || return 1
+    normalize_unit_active_state "${socket_active}" >/dev/null || return 1
+    normalize_unit_active_state "${service_active}" >/dev/null
+}
+
+load_stored_unit_intent() {
+    SOCKET_ENABLED=${STORED_SOCKET_ENABLED}
+    SOCKET_ACTIVE=${STORED_SOCKET_ACTIVE}
+    SERVICE_ENABLED=${STORED_SERVICE_ENABLED}
+    SERVICE_ACTIVE=${STORED_SERVICE_ACTIVE}
 }
 
 copy_snapshot() {
@@ -570,6 +676,10 @@ create_backup() {
         printf 'socket_active=%s\n' "${SOCKET_ACTIVE}"
         printf 'service_enabled=%s\n' "${SERVICE_ENABLED}"
         printf 'service_active=%s\n' "${SERVICE_ACTIVE}"
+        printf 'socket_active_raw=%s\n' "${SOCKET_ACTIVE_RAW}"
+        printf 'socket_substate_raw=%s\n' "${SOCKET_SUBSTATE_RAW}"
+        printf 'service_active_raw=%s\n' "${SERVICE_ACTIVE_RAW}"
+        printf 'service_substate_raw=%s\n' "${SERVICE_SUBSTATE_RAW}"
     } > "${BACKUP_PATH}/metadata" || return 1
     [[ "$(/usr/bin/stat -c '%u:%g:%a' -- "${BACKUP_PATH}")" == '0:0:700' ]] \
         || return 1
@@ -616,6 +726,163 @@ backup_contents_are_expected() (
         [[ -f "${entry}" && ! -L "${entry}" ]] || return 1
     done
 )
+
+infer_backup_snapshot_presence() {
+    local receipt marker
+    local matches=0
+
+    RECEIPT_EXISTED=0
+    MARKER_EXISTED=0
+    for receipt in 0 1; do
+        for marker in 0 1; do
+            if backup_contents_are_expected "${BACKUP_PATH}" "${receipt}" "${marker}"; then
+                matches=$((matches + 1))
+                RECEIPT_EXISTED=${receipt}
+                MARKER_EXISTED=${marker}
+            fi
+        done
+    done
+    [[ "${matches}" -eq 1 ]]
+}
+
+parse_retained_backup_metadata() {
+    local path="$1"
+    local -a lines=()
+
+    SOURCE_PACKAGE=''
+    SOURCE_VERSION=''
+    STORED_SOCKET_ENABLED=''
+    STORED_SOCKET_ACTIVE=''
+    STORED_SERVICE_ENABLED=''
+    STORED_SERVICE_ACTIVE=''
+    STORED_SOCKET_ACTIVE_RAW=''
+    STORED_SOCKET_SUBSTATE_RAW=''
+    STORED_SERVICE_ACTIVE_RAW=''
+    STORED_SERVICE_SUBSTATE_RAW=''
+    RETAINED_ARCHIVE_PATH=''
+    RETAINED_ARCHIVE_SHA256=''
+    RETAINED_SOURCE_PACKAGE=''
+    RETAINED_SOURCE_VERSION=''
+    RETAINED_TARGET_PACKAGE=''
+    RETAINED_TARGET_VERSION=''
+
+    mapfile -t lines < "${path}" || return 1
+    case "${#lines[@]}" in
+        11|15) ;;
+        *) return 1 ;;
+    esac
+    [[ "${lines[0]}" == "format=${UPDATE_FORMAT}" ]] || return 1
+    case "${lines[1]}" in archive=/*) ;; *) return 1 ;; esac
+    case "${lines[2]}" in archive_sha256=*) ;; *) return 1 ;; esac
+    case "${lines[3]}" in source_package=*) ;; *) return 1 ;; esac
+    case "${lines[4]}" in source_version=*) ;; *) return 1 ;; esac
+    case "${lines[5]}" in target_package=*) ;; *) return 1 ;; esac
+    case "${lines[6]}" in target_version=*) ;; *) return 1 ;; esac
+    case "${lines[7]}" in socket_enabled=*) ;; *) return 1 ;; esac
+    case "${lines[8]}" in socket_active=*) ;; *) return 1 ;; esac
+    case "${lines[9]}" in service_enabled=*) ;; *) return 1 ;; esac
+    case "${lines[10]}" in service_active=*) ;; *) return 1 ;; esac
+    if [[ "${#lines[@]}" -eq 15 ]]; then
+        case "${lines[11]}" in socket_active_raw=*) ;; *) return 1 ;; esac
+        case "${lines[12]}" in socket_substate_raw=*) ;; *) return 1 ;; esac
+        case "${lines[13]}" in service_active_raw=*) ;; *) return 1 ;; esac
+        case "${lines[14]}" in service_substate_raw=*) ;; *) return 1 ;; esac
+        STORED_SOCKET_ACTIVE_RAW=${lines[11]#socket_active_raw=}
+        STORED_SOCKET_SUBSTATE_RAW=${lines[12]#socket_substate_raw=}
+        STORED_SERVICE_ACTIVE_RAW=${lines[13]#service_active_raw=}
+        STORED_SERVICE_SUBSTATE_RAW=${lines[14]#service_substate_raw=}
+    fi
+
+    RETAINED_ARCHIVE_PATH=${lines[1]#archive=}
+    RETAINED_ARCHIVE_SHA256=${lines[2]#archive_sha256=}
+    RETAINED_SOURCE_PACKAGE=${lines[3]#source_package=}
+    RETAINED_SOURCE_VERSION=${lines[4]#source_version=}
+    RETAINED_TARGET_PACKAGE=${lines[5]#target_package=}
+    RETAINED_TARGET_VERSION=${lines[6]#target_version=}
+    STORED_SOCKET_ENABLED=${lines[7]#socket_enabled=}
+    STORED_SOCKET_ACTIVE=${lines[8]#socket_active=}
+    STORED_SERVICE_ENABLED=${lines[9]#service_enabled=}
+    STORED_SERVICE_ACTIVE=${lines[10]#service_active=}
+
+    unit_enablement_is_supported "${STORED_SOCKET_ENABLED}" || return 1
+    unit_enablement_is_supported "${STORED_SERVICE_ENABLED}" || return 1
+    case "${STORED_SOCKET_ACTIVE}:${STORED_SERVICE_ACTIVE}" in
+        active:active|active:inactive|inactive:active|inactive:inactive) ;;
+        *) return 1 ;;
+    esac
+}
+
+classify_retained_resume_state() {
+    local installed_package installed_version
+
+    RESUME_INSTALLED_STATE=''
+    SOURCE_PACKAGE=''
+    SOURCE_VERSION=''
+    query_single_provider || return 1
+    installed_package=${SOURCE_PACKAGE}
+    installed_version=${SOURCE_VERSION}
+
+    if [[ "${RETAINED_SOURCE_PACKAGE}" == "${ARCHIVE_PKGNAME}" ]]; then
+        [[ "${installed_package}:${installed_version}" == \
+            "${ARCHIVE_PKGNAME}:${ARCHIVE_PKGVER}" ]] || return 1
+        RESUME_INSTALLED_STATE=target
+    elif [[ "${installed_package}:${installed_version}" == \
+        "${RETAINED_SOURCE_PACKAGE}:${RETAINED_SOURCE_VERSION}" ]]; then
+        RESUME_INSTALLED_STATE=source
+    elif [[ "${installed_package}:${installed_version}" == \
+        "${ARCHIVE_PKGNAME}:${ARCHIVE_PKGVER}" ]]; then
+        RESUME_INSTALLED_STATE=target
+    else
+        return 1
+    fi
+
+    case "${RESUME_INSTALLED_STATE}" in
+        source)
+            SOURCE_PACKAGE=${RETAINED_SOURCE_PACKAGE}
+            SOURCE_VERSION=${RETAINED_SOURCE_VERSION}
+            ;;
+        target)
+            SOURCE_PACKAGE=${ARCHIVE_PKGNAME}
+            SOURCE_VERSION=${ARCHIVE_PKGVER}
+            ;;
+        *) return 1 ;;
+    esac
+    transition_allowed "${SOURCE_PACKAGE}" "${SOURCE_VERSION}" "${ARCHIVE_PKGNAME}"
+}
+
+admit_retained_backup_resume() {
+    if ! infer_backup_snapshot_presence; then
+        refuse 'the retained backup does not match the exact updater backup allowlist'
+        return 1
+    fi
+    if ! parse_retained_backup_metadata "${BACKUP_PATH}/metadata"; then
+        refuse 'the retained backup metadata is not legacy or additive-raw-field howy-v2-update-v1 data'
+        return 1
+    fi
+    if [[ "${RETAINED_ARCHIVE_PATH}" != "${ARCHIVE_PATH}" \
+        || "${RETAINED_ARCHIVE_SHA256}" != "${ARCHIVE_SHA256}" \
+        || "${RETAINED_TARGET_PACKAGE}" != "${ARCHIVE_PKGNAME}" \
+        || "${RETAINED_TARGET_VERSION}" != "${ARCHIVE_PKGVER}" ]]; then
+        refuse 'the retained backup is not bound to this exact validated target archive'
+        return 1
+    fi
+    if ! transition_allowed \
+        "${RETAINED_SOURCE_PACKAGE}" "${RETAINED_SOURCE_VERSION}" \
+        "${ARCHIVE_PKGNAME}"; then
+        refuse 'the retained backup describes an unsupported package transition'
+        return 1
+    fi
+    RETAINED_TRANSITION_KIND=${TRANSITION_KIND}
+    if ! classify_retained_resume_state; then
+        refuse 'the installed Howy state is not exactly the retained source or target package/version'
+        return 1
+    fi
+    if ! current_unit_state_is_controllable; then
+        refuse 'current units must use enabled/disabled, a known active state, and a nonempty substate'
+        return 1
+    fi
+    load_stored_unit_intent
+}
 
 remove_completed_backup() {
     local metadata file
@@ -687,16 +954,7 @@ retain_failure() {
     printf 'howy-v2-update: update failed: %s\n' "${reason}" >&2
     printf 'howy-v2-update: backup retained at %s; package bytes were not rolled back.\n' "${BACKUP_PATH}" >&2
     printf '%s\n' 'howy-v2-update: inspect and preserve any needed backup files before recovery.' >&2
-    printf '%s\n' 'howy-v2-update: the retained backup blocks a new updater run.' >&2
-    if [[ "${TRANSITION_KIND}" == candidate ]]; then
-        printf '%s\n' 'howy-v2-update: candidate recovery: after inspecting the retained backup and confirming installed stable v2 and /etc/howy/config.toml, run:' >&2
-        printf '%s\n' 'sudo /usr/lib/howy/howy-config-bridge complete-release-n' >&2
-        printf '%s\n' 'sudo howy package reconcile --allow-legacy-candidate-mode0 --normalize-legacy-candidate-mode0' >&2
-        printf '%s\n' 'howy-v2-update: successful atomic publication may already have normalized Mode 0; the reconcile command is idempotent for explicit Mode 0, Mode 1, and bootstrap state.' >&2
-        printf '%s\n' 'howy-v2-update: then review and restore saved unit intent, remove only the exact reviewed backup files and its empty directory, and perform a normal updater rerun.' >&2
-    else
-        printf '%s\n' 'howy-v2-update: before rerunning, explicitly remove only the reviewed backup files and then its empty directory; this updater will not resume or remove the retained backup automatically.' >&2
-    fi
+    printf '%s\n' 'howy-v2-update: rerunning the updater with the exact archive resumes finalization when the retained metadata and installed source or target state are admissible.' >&2
     return 1
 }
 
@@ -803,25 +1061,81 @@ verify_unit_intent() {
 }
 
 post_pacman_steps() {
-    verify_installed_result || return 1
-    if [[ "${TRANSITION_KIND}" == candidate ]]; then
-        path_is_absent "${MARKER_PATH}" || return 1
-    fi
-    restore_config || return 1
-    verify_receipt_preservation || return 1
+    local mode="${1:-normal}"
+    local reconcile_kind=${TRANSITION_KIND}
+
+    case "${mode}" in
+        normal|resume-source)
+            verify_installed_result || return 1
+            if [[ "${TRANSITION_KIND}" == candidate ]]; then
+                path_is_absent "${MARKER_PATH}" || return 1
+            fi
+            restore_config || return 1
+            verify_receipt_preservation || return 1
+            ;;
+        resume-target)
+            verify_installed_result || return 1
+            reconcile_kind=${RETAINED_TRANSITION_KIND}
+            ;;
+        *) return 1 ;;
+    esac
     /usr/lib/howy/howy-config-bridge complete-release-n || return 1
-    if [[ "${TRANSITION_KIND}" == candidate ]]; then
+    if [[ "${reconcile_kind}" == candidate ]]; then
         /usr/bin/howy package reconcile \
             --allow-legacy-candidate-mode0 \
             --normalize-legacy-candidate-mode0 || return 1
     else
         /usr/bin/howy package reconcile || return 1
     fi
-    if [[ "${RECEIPT_EXISTED}" -eq 0 ]]; then
+    if [[ "${mode}" != resume-target && "${RECEIPT_EXISTED}" -eq 0 ]]; then
         path_is_absent "${RECEIPT_PATH}" || return 1
     fi
     restore_unit_intent || return 1
     verify_unit_intent
+}
+
+resume_retained_update() {
+    if ! admit_retained_backup_resume; then
+        return 1
+    fi
+    if ! stop_units; then
+        retain_failure 'could not stop and prove both Howy units inactive during resumed finalization'
+        return 1
+    fi
+    if ! require_archive_unchanged; then
+        retain_failure 'the exact resume archive changed after admission'
+        return 1
+    fi
+    if ! write_sentinel; then
+        retain_failure 'could not create the root-only prepared sentinel for resume'
+        return 1
+    fi
+    if ! HOWY_V2_UPDATE_FORMAT="${UPDATE_FORMAT}" \
+        HOWY_V2_UPDATE_ARCHIVE="${ARCHIVE_PATH}" \
+        HOWY_V2_UPDATE_ARCHIVE_SHA256="${ARCHIVE_SHA256}" \
+        HOWY_V2_UPDATE_SOURCE_PACKAGE="${SOURCE_PACKAGE}" \
+        HOWY_V2_UPDATE_SOURCE_VERSION="${SOURCE_VERSION}" \
+        HOWY_V2_UPDATE_TARGET_PACKAGE="${ARCHIVE_PKGNAME}" \
+        HOWY_V2_UPDATE_TARGET_VERSION="${ARCHIVE_PKGVER}" \
+        /usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"; then
+        retain_failure 'pacman -U failed during resume'
+        return 1
+    fi
+    if ! /usr/bin/rm -f -- "${SENTINEL_PATH}"; then
+        retain_failure 'could not remove the prepared sentinel after resumed pacman'
+        return 1
+    fi
+    SENTINEL_CREATED=0
+    if ! post_pacman_steps "resume-${RESUME_INSTALLED_STATE}"; then
+        retain_failure 'resumed post-install verification, reconciliation, or unit restoration failed'
+        return 1
+    fi
+    if ! remove_completed_backup; then
+        retain_failure 'could not remove the completed updater backup'
+        return 1
+    fi
+    printf 'Howy update finalization resumed: package=%s version=%s archive_sha256=%s\n' \
+        "${ARCHIVE_PKGNAME}" "${ARCHIVE_PKGVER}" "${ARCHIVE_SHA256}"
 }
 
 main() {
@@ -848,6 +1162,12 @@ main() {
         refuse "prepared sentinel already exists at ${SENTINEL_PATH}"
         return 1
     fi
+    if [[ -d "${BACKUP_PATH}" && ! -L "${BACKUP_PATH}" ]]; then
+        if ! resume_retained_update; then
+            return 1
+        fi
+        return 0
+    fi
     if ! backup_path_available "${BACKUP_PATH}"; then
         refuse "backup already exists at ${BACKUP_PATH}"
         return 1
@@ -867,7 +1187,7 @@ main() {
         return 1
     fi
     if ! capture_unit_intent; then
-        refuse 'unit intent must be exactly enabled/disabled and active/inactive'
+        refuse 'unit intent must use enabled/disabled, a known active state, and a nonempty substate'
         return 1
     fi
     if ! create_backup; then

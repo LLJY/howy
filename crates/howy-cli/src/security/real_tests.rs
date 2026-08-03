@@ -1447,6 +1447,143 @@ fn rooted_security_paths_are_strict_and_keep_production_names_in_journals() {
 }
 
 #[test]
+fn rooted_real_directory_traversal_accepts_safe_root_owned_components() {
+    if !run_root_owned_branch(
+        "security::real::tests::rooted_real_directory_traversal_accepts_safe_root_owned_components",
+    ) {
+        return;
+    }
+    let root = AtomicTempDir::new();
+    prepare_rooted_production_parents(&root.0);
+    let directory = root.0.join("var/lib/howy");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let record_name = "private-reconciliation-record.json";
+    let record_contents = b"private-reconciliation-contents";
+    write_mode(&directory.join(record_name), record_contents, 0o600);
+
+    let runtime = RealSecurityRuntime::rooted(&root.0).unwrap();
+    let record = runtime
+        .read_exact_file(
+            &format!("/var/lib/howy/{record_name}"),
+            record_contents.len(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.bytes, record_contents);
+}
+
+#[test]
+fn rooted_real_directory_traversal_reports_only_logical_writable_component() {
+    if !run_root_owned_branch(
+        "security::real::tests::rooted_real_directory_traversal_reports_only_logical_writable_component",
+    ) {
+        return;
+    }
+    let root = AtomicTempDir::new();
+    prepare_rooted_production_parents(&root.0);
+    let howy_directory = root.0.join("var/lib/howy");
+    fs::create_dir(&howy_directory).unwrap();
+    fs::set_permissions(&howy_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let record_name = "private-reconciliation-record.json";
+    let record_contents = b"private-reconciliation-contents";
+    write_mode(&howy_directory.join(record_name), record_contents, 0o600);
+    let record_path = format!("/var/lib/howy/{record_name}");
+    let runtime = RealSecurityRuntime::rooted(&root.0).unwrap();
+
+    for (relative, mode, logical_prefix, safe_mode) in [
+        ("var/lib", 0o775, "/var/lib", 0o755),
+        ("var/lib/howy", 0o702, "/var/lib/howy", 0o700),
+    ] {
+        let component = root.0.join(relative);
+        fs::set_permissions(&component, fs::Permissions::from_mode(mode)).unwrap();
+        let message = runtime
+            .read_exact_file(&record_path, record_contents.len())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            message,
+            format!("directory traversal rejected at {logical_prefix}: group-or-other-writable")
+        );
+        assert!(!message.contains(root.0.to_str().unwrap()));
+        assert!(!message.contains(record_name));
+        assert!(!message.contains(std::str::from_utf8(record_contents).unwrap()));
+        fs::set_permissions(&component, fs::Permissions::from_mode(safe_mode)).unwrap();
+    }
+}
+
+#[test]
+fn rooted_real_directory_traversal_reports_logical_root_metadata_violation() {
+    if !run_root_owned_branch(
+        "security::real::tests::rooted_real_directory_traversal_reports_logical_root_metadata_violation",
+    ) {
+        return;
+    }
+    let root = AtomicTempDir::new();
+    let record_name = "private-reconciliation-record.json";
+    fs::set_permissions(&root.0, fs::Permissions::from_mode(0o720)).unwrap();
+    let runtime = RealSecurityRuntime::rooted(&root.0).unwrap();
+    let message = runtime
+        .read_exact_file(&format!("/var/lib/howy/{record_name}"), 1)
+        .unwrap_err()
+        .to_string();
+
+    assert_eq!(
+        message,
+        "directory traversal rejected at /: group-or-other-writable"
+    );
+    assert!(!message.contains(root.0.to_str().unwrap()));
+    assert!(!message.contains(record_name));
+}
+
+#[test]
+fn rooted_real_directory_traversal_reports_bounded_no_follow_category() {
+    if !run_root_owned_branch(
+        "security::real::tests::rooted_real_directory_traversal_reports_bounded_no_follow_category",
+    ) {
+        return;
+    }
+    let root = AtomicTempDir::new();
+    let var = root.0.join("var");
+    fs::create_dir(&var).unwrap();
+    fs::set_permissions(&var, fs::Permissions::from_mode(0o755)).unwrap();
+    let symlink_target = "private-symlink-target";
+    symlink(symlink_target, var.join("lib")).unwrap();
+    let record_name = "private-reconciliation-record.json";
+    let runtime = RealSecurityRuntime::rooted(&root.0).unwrap();
+    let message = runtime
+        .read_exact_file(&format!("/var/lib/howy/{record_name}"), 1)
+        .unwrap_err()
+        .to_string();
+
+    assert_eq!(
+        message,
+        "directory traversal rejected at /var/lib: no-follow-open-failed"
+    );
+    assert!(!message.contains(root.0.to_str().unwrap()));
+    assert!(!message.contains(record_name));
+    assert!(!message.contains(symlink_target));
+}
+
+#[test]
+fn logical_directory_diagnostics_are_bounded_on_utf8_boundaries() {
+    let exact = format!("/{}", "a".repeat(DIRECTORY_DIAGNOSTIC_PREFIX_MAX - 1));
+    assert_eq!(bounded_logical_directory_prefix(Path::new(&exact)), exact);
+
+    let secret_suffix = "private-transaction-id-deadbeef";
+    let oversized = format!(
+        "/{}é{}",
+        "a".repeat(DIRECTORY_DIAGNOSTIC_PREFIX_MAX),
+        secret_suffix
+    );
+    let bounded = bounded_logical_directory_prefix(Path::new(&oversized));
+    assert!(bounded.len() <= DIRECTORY_DIAGNOSTIC_PREFIX_MAX);
+    assert!(bounded.ends_with("..."));
+    assert!(!bounded.contains(secret_suffix));
+    assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+}
+
+#[test]
 fn rooted_real_directory_lifecycle_uses_production_no_follow_methods() {
     if !run_root_owned_branch(
         "security::real::tests::rooted_real_directory_lifecycle_uses_production_no_follow_methods",

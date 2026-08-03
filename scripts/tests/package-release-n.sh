@@ -159,8 +159,8 @@ source "${REPO_ROOT}/PKGBUILD"
 [ "${pkgver}" = 2.0.0 ] || fail "root package version is not 2.0.0"
 [ "${pkgname[*]}" = "howy-cpu howy-rocm howy-cuda" ] \
     || fail "root split package names are not canonical"
-[[ " ${makedepends[*]} " == *" onnxruntime "* ]] \
-    || fail "root package lacks the virtual ONNX Runtime build dependency"
+[[ " ${makedepends[*]} " == *" onnxruntime=1.28.0 "* ]] \
+    || fail "root package lacks the ABI-pinned virtual ONNX Runtime build dependency"
 for concrete_runtime in onnxruntime-cpu onnxruntime-rocm onnxruntime-cuda; do
     [[ " ${makedepends[*]} " != *" ${concrete_runtime} "* ]] \
         || fail "root package retains concrete build dependency ${concrete_runtime}"
@@ -215,8 +215,8 @@ for variant in howy-cpu howy-rocm howy-cuda; do
                 || fail "${variant} does not conflict with ${other}"
         fi
     done
-    [[ " ${depends[*]} " == *" onnxruntime "* ]] \
-        || fail "${variant} lacks the virtual ONNX Runtime runtime dependency"
+    [[ " ${depends[*]} " == *" onnxruntime=1.28.0 "* ]] \
+        || fail "${variant} lacks the ABI-pinned virtual ONNX Runtime runtime dependency"
     for concrete_runtime in onnxruntime-cpu onnxruntime-rocm onnxruntime-cuda; do
         [[ " ${depends[*]} " != *" ${concrete_runtime} "* ]] \
             || fail "${variant} retains concrete runtime dependency ${concrete_runtime}"

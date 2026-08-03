@@ -75,10 +75,13 @@ The canonical release is the `2.0.0-1` Arch split package family:
 | CUDA | `howy-cuda-2.0.0-1-x86_64.pkg.tar.zst` |
 
 Install or choose the desired system ONNX Runtime provider first. Every Howy
-variant depends on the virtual `onnxruntime` package; for example, an installed
-`onnxruntime-opt-rocm` satisfies that dependency. The Howy variant name records
-the intended provider but does not install, switch, or override the provider in
-the installed ONNX Runtime library. Only one Howy variant can be installed.
+variant depends on the exact virtual capability `onnxruntime=1.28.0`; for
+example, `onnxruntime-opt-rocm` version 1.28.0 provides that capability. The
+exact dependency prevents a provider with incompatible versioned C API symbols
+from silently replacing the library used to build Howy. The Howy variant name
+records the intended provider but does not install, switch, or override the
+provider in the installed ONNX Runtime library. Only one Howy variant can be
+installed.
 
 To build all three archives from a v2 release checkout, first install the chosen
 ONNX Runtime provider and the build dependencies listed in `PKGBUILD`, then run
@@ -89,8 +92,9 @@ makepkg --cleanbuild --clean
 ```
 
 ```bash
-# Example: confirm the existing ROCm provider, then perform a fresh Howy install.
+# Example: confirm the ROCm provider and required virtual capability, then install.
 pacman -Q onnxruntime-opt-rocm
+pacman -T 'onnxruntime=1.28.0'
 sudo pacman -U ./howy-rocm-2.0.0-1-x86_64.pkg.tar.zst
 ```
 
@@ -130,14 +134,21 @@ states are refused before pacman runs.
 The helper verifies the package identity/version and archive SHA-256, preserves
 configuration, receipt, data, and unit intent, supplies the expected conflict
 answer to pacman, and reconciles security receipts against the installed v2
-bytes. Migrating legacy candidate Mode 0 atomically adds only the explicit
-empty-credential drop-in; it does not change embedding mode or migrate model or
-enrollment data. A failed candidate update reports the exact bridge and
-idempotent locked-reconciliation recovery commands because atomic publication
-may already have normalized Mode 0. Any failure after backup creation leaves the
-units stopped and retains `/var/lib/howy/v2-update-backup-v1`; inspect the
-package/config state, saved unit intent, and exact backup files before following
-the reported recovery and normal-rerun instructions.
+bytes. Transitional systemd states are normalized to stable active/inactive
+intent rather than blocking recovery. Mode 1 reconciliation preserves the
+existing authenticated AEAD evidence while rebinding package-derived daemon,
+unit, and drop-in identities. Migrating legacy candidate Mode 0 atomically adds
+only the explicit empty-credential drop-in; it does not change embedding mode or
+migrate model or enrollment data.
+
+Any failure after backup creation leaves the units stopped and retains
+`/var/lib/howy/v2-update-backup-v1`. After inspecting the reported state, rerun
+the updater with the exact same archive. The helper always reruns that exact
+archive through pacman. If the predecessor remains installed, it repeats the
+original transition and restores the backed-up config while verifying receipt
+preservation. If the target is installed, it reruns a same-name stable update
+and retains the live config and receipt rather than restoring stale snapshots.
+Successful finalization removes the exact retained backup.
 
 ### Initial setup and daemon activation
 
