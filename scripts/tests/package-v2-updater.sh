@@ -493,7 +493,9 @@ preflight_bridge_mock() {
                 && "${PREFLIGHT_BRIDGE_MODE}" != stable-invalid ]]
             ;;
         stash-release-n)
-            if [[ "${PREFLIGHT_BRIDGE_MODE}" != stash-retains ]]; then
+            if [[ "${PREFLIGHT_BRIDGE_MODE}" == stable-invalid ]]; then
+                return 1
+            elif [[ "${PREFLIGHT_BRIDGE_MODE}" != stash-retains ]]; then
                 /usr/bin/rm -- "${TEST_MARKER_PATH}"
             fi
             ;;
@@ -603,6 +605,7 @@ pass
 
 write_release_marker valid
 TRANSITION_KIND=stable
+SOURCE_VERSION=2.0.1-1
 PREFLIGHT_BRIDGE_MODE=stable-invalid
 : > "${PREFLIGHT_LOG}"
 expect_failure 'stable marker validator refusal stops before stash' preflight_transition_state
@@ -612,27 +615,54 @@ pass
 /usr/bin/rm -- "${TEST_MARKER_PATH}"
 
 write_release_marker valid
+SOURCE_VERSION=2.0.0-1
 PREFLIGHT_BRIDGE_MODE=stable-legacy-bridge
 : > "${PREFLIGHT_LOG}"
-expect_success 'stable predecessor bridge falls back to exact marker validation' \
+expect_success 'v2.0.0 predecessor bridge validates through transactional stash' \
     preflight_transition_state
-[[ "$(<"${PREFLIGHT_LOG}")" == $'validate-current-marker-structure\nvalidate-current-marker\nstash-release-n' ]] \
-    || fail 'stable predecessor bridge fallback sequence differs'
+[[ "$(<"${PREFLIGHT_LOG}")" == stash-release-n ]] \
+    || fail 'v2.0.0 predecessor bridge did not use only transactional stash validation'
 [[ ! -e "${TEST_MARKER_PATH}" && ! -L "${TEST_MARKER_PATH}" ]] \
     || fail 'stable predecessor bridge fallback retained its marker'
 pass
 
 write_release_marker valid
+SOURCE_VERSION=2.0.0-1
 PREFLIGHT_BRIDGE_MODE=stable-config-drift
 : > "${PREFLIGHT_LOG}"
 expect_failure 'stable exact marker validation would reject config drift' \
     preflight_bridge_mock validate-current-marker
 : > "${PREFLIGHT_LOG}"
-expect_success 'stable structural marker validation permits config drift' preflight_transition_state
-[[ "$(<"${PREFLIGHT_LOG}")" == $'validate-current-marker-structure\nstash-release-n' ]] \
-    || fail 'stable preflight did not structurally validate the marker before stash'
+expect_success 'v2.0.0 transactional stash preserves config drift' preflight_transition_state
+[[ "$(<"${PREFLIGHT_LOG}")" == stash-release-n ]] \
+    || fail 'v2.0.0 config drift did not use only transactional stash validation'
 [[ ! -e "${TEST_MARKER_PATH}" && ! -L "${TEST_MARKER_PATH}" ]] \
     || fail 'stable preflight retained its marker'
+pass
+
+write_release_marker valid
+SOURCE_VERSION=2.0.0-1
+PREFLIGHT_BRIDGE_MODE=stable-invalid
+: > "${PREFLIGHT_LOG}"
+expect_failure 'v2.0.0 transactional stash rejects invalid predecessor state' \
+    preflight_transition_state
+[[ "$(<"${PREFLIGHT_LOG}")" == stash-release-n ]] \
+    || fail 'v2.0.0 invalid predecessor continued beyond transactional stash'
+[[ -f "${TEST_MARKER_PATH}" ]] \
+    || fail 'v2.0.0 invalid predecessor marker was not retained'
+pass
+/usr/bin/rm -- "${TEST_MARKER_PATH}"
+
+write_release_marker valid
+SOURCE_VERSION=2.0.1-1
+PREFLIGHT_BRIDGE_MODE=stable-config-drift
+: > "${PREFLIGHT_LOG}"
+expect_success 'current stable structural marker validation permits config drift' \
+    preflight_transition_state
+[[ "$(<"${PREFLIGHT_LOG}")" == $'validate-current-marker-structure\nstash-release-n' ]] \
+    || fail 'current stable preflight did not structurally validate before stash'
+[[ ! -e "${TEST_MARKER_PATH}" && ! -L "${TEST_MARKER_PATH}" ]] \
+    || fail 'current stable preflight retained its marker'
 pass
 
 marker="${WORK}/candidate.marker"
