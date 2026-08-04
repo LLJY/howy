@@ -663,12 +663,16 @@ preflight_transition_state() {
             fi
             ;;
         stable)
-            if ! /usr/lib/howy/howy-config-bridge validate-current-marker-structure \
-                    2>/dev/null \
-                && ! /usr/lib/howy/howy-config-bridge validate-current-marker; then
-                refuse 'the installed stable config bridge could not validate the current marker structure and generation binding'
-                return 1
+            if [[ "${SOURCE_VERSION}" != "${PREVIOUS_STABLE_VERSION}" ]]; then
+                if ! /usr/lib/howy/howy-config-bridge validate-current-marker-structure \
+                        2>/dev/null \
+                    && ! /usr/lib/howy/howy-config-bridge validate-current-marker; then
+                    refuse 'the installed stable config bridge could not validate the current marker structure and generation binding'
+                    return 1
+                fi
             fi
+            # The immutable v2.0.0 bridge predates structural validation, but
+            # stash-release-n itself safely validates and captures config drift.
             if ! /usr/lib/howy/howy-config-bridge stash-release-n; then
                 refuse 'the installed config bridge could not stash the predecessor state'
                 return 1
