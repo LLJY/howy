@@ -6,12 +6,13 @@ checking the archive does not qualify an installation, authentication path,
 camera, model, inference provider, or provisioning transaction.
 
 One package supports explicit plaintext Mode 0 with presence off and receipted
-cached-AEAD Mode 1 provisioning. Mode 1 presence is selected at provision time
-with `howy security provision --mode 1 --presence off|confirm`; it is bound into
-the receipted configuration and is not a runtime toggle. Mode 2 remains
-unsupported. The installed default configuration remains explicit Mode 0 with
-presence off. Any current live modified configuration mode must be handled
-separately before provisioning.
+cached-AEAD Mode 1 provisioning. The historical candidate exposed Mode 1
+presence selection through
+`howy security provision --mode 1 --presence off|confirm`; current stable
+runtime behavior is documented in the root README. Mode 2 remains unsupported.
+The installed default configuration remains explicit Mode 0 with presence off.
+Any current live modified configuration mode must be handled separately before
+provisioning.
 
 The package owns `/etc/howy/config.toml` with pacman backup semantics. It never
 owns model files, embedding records, model directories, data directories, or

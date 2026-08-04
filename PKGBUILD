@@ -1,6 +1,6 @@
 pkgbase=howy
 pkgname=(howy-cpu howy-rocm howy-cuda)
-pkgver=2.0.0
+pkgver=2.0.1
 pkgrel=1
 pkgdesc='Linux face authentication daemon — a howdy replacement'
 arch=('x86_64')

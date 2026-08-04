@@ -226,10 +226,10 @@ expect_valid_pkginfo() {
     local name="$1"
     local text
 
-    text=$(pkginfo_text "${name}" howy 2.0.0-1 x86_64)
+    text=$(pkginfo_text "${name}" howy 2.0.1-1 x86_64)
     parse_pkginfo_text "${text}" || fail "valid ${name} metadata was rejected"
     [[ "${ARCHIVE_PKGNAME}:${ARCHIVE_PKGBASE}:${ARCHIVE_PKGVER}:${ARCHIVE_ARCH}" \
-        == "${name}:howy:2.0.0-1:x86_64" ]] \
+        == "${name}:howy:2.0.1-1:x86_64" ]] \
         || fail "valid ${name} metadata populated the wrong fields"
     pass
 }
@@ -238,19 +238,19 @@ for package in howy-cpu howy-rocm howy-cuda; do
     expect_valid_pkginfo "${package}"
 done
 
-valid_pkginfo=$(pkginfo_text howy-cpu howy 2.0.0-1 x86_64)
+valid_pkginfo=$(pkginfo_text howy-cpu howy 2.0.1-1 x86_64)
 for field in pkgname pkgbase pkgver arch; do
     duplicate="${valid_pkginfo}"$'\n'"${field} = duplicate"
     expect_failure "duplicate ${field}" parse_pkginfo_text "${duplicate}"
 done
-expect_failure 'missing pkgname' parse_pkginfo_text $'pkgbase = howy\npkgver = 2.0.0-1\narch = x86_64'
-expect_failure 'missing pkgbase' parse_pkginfo_text $'pkgname = howy-cpu\npkgver = 2.0.0-1\narch = x86_64'
+expect_failure 'missing pkgname' parse_pkginfo_text $'pkgbase = howy\npkgver = 2.0.1-1\narch = x86_64'
+expect_failure 'missing pkgbase' parse_pkginfo_text $'pkgname = howy-cpu\npkgver = 2.0.1-1\narch = x86_64'
 expect_failure 'missing pkgver' parse_pkginfo_text $'pkgname = howy-cpu\npkgbase = howy\narch = x86_64'
-expect_failure 'missing arch' parse_pkginfo_text $'pkgname = howy-cpu\npkgbase = howy\npkgver = 2.0.0-1'
-expect_failure 'wrong package name' parse_pkginfo_text "$(pkginfo_text howy-git howy 2.0.0-1 x86_64)"
-expect_failure 'wrong package base' parse_pkginfo_text "$(pkginfo_text howy-cpu howy-git 2.0.0-1 x86_64)"
-expect_failure 'wrong package version' parse_pkginfo_text "$(pkginfo_text howy-cpu howy 2.0.0-2 x86_64)"
-expect_failure 'wrong package architecture' parse_pkginfo_text "$(pkginfo_text howy-cpu howy 2.0.0-1 any)"
+expect_failure 'missing arch' parse_pkginfo_text $'pkgname = howy-cpu\npkgbase = howy\npkgver = 2.0.1-1'
+expect_failure 'wrong package name' parse_pkginfo_text "$(pkginfo_text howy-git howy 2.0.1-1 x86_64)"
+expect_failure 'wrong package base' parse_pkginfo_text "$(pkginfo_text howy-cpu howy-git 2.0.1-1 x86_64)"
+expect_failure 'wrong package version' parse_pkginfo_text "$(pkginfo_text howy-cpu howy 2.0.1-2 x86_64)"
+expect_failure 'wrong package architecture' parse_pkginfo_text "$(pkginfo_text howy-cpu howy 2.0.1-1 any)"
 expect_failure 'non-exact field whitespace' parse_pkginfo_text "${valid_pkginfo/pkgname = howy-cpu/pkgname = howy-cpu }"
 
 expect_transition() {
@@ -274,20 +274,23 @@ for release in 4 5 6 7; do
     expect_transition "candidate-rev${release}" howy-rocm-mode0 \
         "0.1.0.r27.g0b76fa2-${release}" howy-rocm candidate
 done
-expect_transition stable-cpu howy-cpu 2.0.0-1 howy-cpu stable
-expect_transition stable-rocm howy-rocm 2.0.0-1 howy-rocm stable
-expect_transition stable-cuda howy-cuda 2.0.0-1 howy-cuda stable
+for package in howy-cpu howy-rocm howy-cuda; do
+    expect_transition "stable-${package}-v2.0.0-to-v2.0.1" \
+        "${package}" 2.0.0-1 "${package}" stable
+    expect_transition "stable-${package}-v2.0.1-reinstall" \
+        "${package}" 2.0.1-1 "${package}" stable
+done
 
 expect_failure 'release cross-variant' transition_allowed \
     howy-cpu-git 0.1.0.r26.g2dfe39e-1 howy-rocm
 expect_failure 'candidate cross-variant' transition_allowed \
     howy-rocm-mode0 0.1.0.r27.g0b76fa2-7 howy-cpu
-expect_failure 'stable cross-variant' transition_allowed howy-cpu 2.0.0-1 howy-cuda
+expect_failure 'stable cross-variant' transition_allowed howy-cpu 2.0.1-1 howy-cuda
 expect_failure 'unknown predecessor' transition_allowed howdy-git 1-1 howy-cpu
 expect_failure 'wrong release-N version' transition_allowed howy-cpu-git 0.1.0-1 howy-cpu
 expect_failure 'skipped candidate version' transition_allowed \
     howy-rocm-mode0 0.1.0.r27.g0b76fa2-8 howy-rocm
-expect_failure 'wrong stable version' transition_allowed howy-cpu 2.0.0-2 howy-cpu
+expect_failure 'wrong stable version' transition_allowed howy-cpu 2.0.1-2 howy-cpu
 expect_failure 'empty stable version' transition_allowed howy-cpu '' howy-cpu
 expect_failure 'unknown target package' transition_allowed \
     howy-cpu-git 0.1.0.r26.g2dfe39e-1 howy
@@ -302,18 +305,18 @@ trap cleanup EXIT INT TERM
 # status contexts, where Bash intentionally suppresses errexit for the entire
 # function body. These fixtures catch a refusal that accidentally continues.
 archive_tree="${WORK}/archive-tree"
-valid_archive="${WORK}/howy-cpu-2.0.0-1-x86_64.pkg.tar"
+valid_archive="${WORK}/howy-cpu-2.0.1-1-x86_64.pkg.tar"
 /usr/bin/mkdir "${archive_tree}"
 printf '%s\n' \
     'pkgname = howy-cpu' \
     'pkgbase = howy' \
-    'pkgver = 2.0.0-1' \
+    'pkgver = 2.0.1-1' \
     'arch = x86_64' > "${archive_tree}/.PKGINFO"
 /usr/bin/bsdtar -cf "${valid_archive}" -C "${archive_tree}" .PKGINFO
 expect_success 'complete valid archive validation' validate_archive "${valid_archive}"
 [[ "${ARCHIVE_PATH}" == "${valid_archive}" \
     && "${ARCHIVE_PKGNAME}:${ARCHIVE_PKGBASE}:${ARCHIVE_PKGVER}:${ARCHIVE_ARCH}" \
-        == 'howy-cpu:howy:2.0.0-1:x86_64' \
+        == 'howy-cpu:howy:2.0.1-1:x86_64' \
     && "${ARCHIVE_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
     || fail 'complete archive validation populated incorrect evidence'
 pass
@@ -322,7 +325,7 @@ invalid_archive="${WORK}/howy-invalid.pkg.tar"
 printf '%s\n' \
     'pkgname = howy-git' \
     'pkgbase = howy' \
-    'pkgver = 2.0.0-1' \
+    'pkgver = 2.0.1-1' \
     'arch = x86_64' > "${archive_tree}/.PKGINFO"
 /usr/bin/bsdtar -cf "${invalid_archive}" -C "${archive_tree}" .PKGINFO
 expect_failure 'complete invalid archive metadata validation' validate_archive "${invalid_archive}"
@@ -481,8 +484,13 @@ preflight_bridge_mock() {
                 *) return 99 ;;
             esac
             ;;
+        validate-current-marker-structure)
+            [[ "${PREFLIGHT_BRIDGE_MODE}" != stable-invalid \
+                && "${PREFLIGHT_BRIDGE_MODE}" != stable-legacy-bridge ]]
+            ;;
         validate-current-marker)
-            [[ "${PREFLIGHT_BRIDGE_MODE}" != stable-invalid ]]
+            [[ "${PREFLIGHT_BRIDGE_MODE}" != stable-config-drift \
+                && "${PREFLIGHT_BRIDGE_MODE}" != stable-invalid ]]
             ;;
         stash-release-n)
             if [[ "${PREFLIGHT_BRIDGE_MODE}" != stash-retains ]]; then
@@ -598,17 +606,31 @@ TRANSITION_KIND=stable
 PREFLIGHT_BRIDGE_MODE=stable-invalid
 : > "${PREFLIGHT_LOG}"
 expect_failure 'stable marker validator refusal stops before stash' preflight_transition_state
-[[ "$(<"${PREFLIGHT_LOG}")" == validate-current-marker ]] \
-    || fail 'stable validator refusal continued to another bridge command'
+[[ "$(<"${PREFLIGHT_LOG}")" == $'validate-current-marker-structure\nvalidate-current-marker' ]] \
+    || fail 'stable validator refusal did not try only structural and predecessor-compatible exact validation'
 pass
 /usr/bin/rm -- "${TEST_MARKER_PATH}"
 
 write_release_marker valid
-PREFLIGHT_BRIDGE_MODE=valid
+PREFLIGHT_BRIDGE_MODE=stable-legacy-bridge
 : > "${PREFLIGHT_LOG}"
-expect_success 'stable read-only marker validation preflight' preflight_transition_state
-[[ "$(<"${PREFLIGHT_LOG}")" == $'validate-current-marker\nstash-release-n' ]] \
-    || fail 'stable preflight did not validate-current-marker before stash'
+expect_success 'stable predecessor bridge falls back to exact marker validation' \
+    preflight_transition_state
+[[ "$(<"${PREFLIGHT_LOG}")" == $'validate-current-marker-structure\nvalidate-current-marker\nstash-release-n' ]] \
+    || fail 'stable predecessor bridge fallback sequence differs'
+[[ ! -e "${TEST_MARKER_PATH}" && ! -L "${TEST_MARKER_PATH}" ]] \
+    || fail 'stable predecessor bridge fallback retained its marker'
+pass
+
+write_release_marker valid
+PREFLIGHT_BRIDGE_MODE=stable-config-drift
+: > "${PREFLIGHT_LOG}"
+expect_failure 'stable exact marker validation would reject config drift' \
+    preflight_bridge_mock validate-current-marker
+: > "${PREFLIGHT_LOG}"
+expect_success 'stable structural marker validation permits config drift' preflight_transition_state
+[[ "$(<"${PREFLIGHT_LOG}")" == $'validate-current-marker-structure\nstash-release-n' ]] \
+    || fail 'stable preflight did not structurally validate the marker before stash'
 [[ ! -e "${TEST_MARKER_PATH}" && ! -L "${TEST_MARKER_PATH}" ]] \
     || fail 'stable preflight retained its marker'
 pass
@@ -673,12 +695,12 @@ expect_failure 'symlinked expected backup entry is refused' backup_contents_are_
 printf 'config\n' > "${backup}/config.toml"
 
 resume_archive_tree="${WORK}/resume-archive-tree"
-resume_archive="${WORK}/howy-rocm-2.0.0-1-x86_64.pkg.tar"
+resume_archive="${WORK}/howy-rocm-2.0.1-1-x86_64.pkg.tar"
 /usr/bin/mkdir "${resume_archive_tree}"
 printf '%s\n' \
     'pkgname = howy-rocm' \
     'pkgbase = howy' \
-    'pkgver = 2.0.0-1' \
+    'pkgver = 2.0.1-1' \
     'arch = x86_64' > "${resume_archive_tree}/.PKGINFO"
 /usr/bin/bsdtar -cf "${resume_archive}" -C "${resume_archive_tree}" .PKGINFO
 resume_archive_digest=$(/usr/bin/sha256sum -- "${resume_archive}")
@@ -704,7 +726,7 @@ write_retained_metadata_fixture() {
             "source_package=${source_package}" \
             "source_version=${source_version}" \
             'target_package=howy-rocm' \
-            'target_version=2.0.0-1' \
+            'target_version=2.0.1-1' \
             "socket_enabled=${socket_enabled}" \
             "socket_active=${socket_active}" \
             "service_enabled=${service_enabled}" \
@@ -807,6 +829,17 @@ prepare_resume_case() {
         archive-hash-mismatch)
             metadata_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
             ;;
+        override-directory-collision)
+            /usr/bin/mkdir "${RESUME_CASE_ROOT}/hook-override"
+            ;;
+        override-directory-symlink)
+            /usr/bin/ln -s missing-override "${RESUME_CASE_ROOT}/hook-override"
+            ;;
+        override-hook-collision)
+            /usr/bin/mkdir "${RESUME_CASE_ROOT}/hook-override"
+            /usr/bin/ln -s /dev/null \
+                "${RESUME_CASE_ROOT}/hook-override/00-howy-update-admission.hook"
+            ;;
     esac
     write_retained_metadata_fixture \
         "${RESUME_CASE_ROOT}/backup/metadata" "${schema}" \
@@ -828,6 +861,7 @@ run_resume_main_case() (
     transformed=${transformed//\/var\/lib\/howy-package-bootstrap.complete/${RESUME_CASE_ROOT}\/live-marker}
     transformed=${transformed//\/var\/lib\/howy\/v2-update-backup-v1/${RESUME_CASE_ROOT}\/backup}
     transformed=${transformed//\/run\/howy-v2-update-v1.prepared/${RESUME_CASE_ROOT}\/prepared}
+    transformed=${transformed//\/run\/howy-v2-update-hook-override/${RESUME_CASE_ROOT}\/hook-override}
     transformed=${transformed//\/usr\/lib\/howy\/howy-config-bridge/resume_bridge_mock}
     transformed=${transformed//\/usr\/bin\/systemctl/resume_systemctl_mock}
     transformed=${transformed//\/usr\/bin\/pacman/resume_pacman_mock}
@@ -835,6 +869,9 @@ run_resume_main_case() (
     transformed=${transformed//\/usr\/bin\/install/resume_install_mock}
     transformed=${transformed//\/usr\/bin\/howy/resume_howy_mock}
     transformed=${transformed//\/usr\/bin\/id/resume_id_mock}
+    transformed=${transformed//\/usr\/bin\/chown/resume_chown_mock}
+    transformed=${transformed//\/usr\/bin\/rmdir/resume_rmdir_mock}
+    transformed=${transformed//\/usr\/bin\/rm/resume_rm_mock}
 
     RESUME_CASE_ROOT="${RESUME_CASE_ROOT}" \
     RESUME_SOURCE_PACKAGE="${RESUME_SOURCE_PACKAGE}" \
@@ -860,6 +897,19 @@ run_resume_main_case() (
     resume_id_mock() {
         printf '0\n'
     }
+    resume_chown_mock() {
+        return 0
+    }
+    resume_rm_mock() {
+        if [[ "${RESUME_BEHAVIOR}" == override-cleanup-failure \
+            && "${!#}" == "${HOOK_OVERRIDE_PATH}" ]]; then
+            return 1
+        fi
+        /usr/bin/rm "$@"
+    }
+    resume_rmdir_mock() {
+        /usr/bin/rmdir "$@"
+    }
     resume_stat_mock() {
         local path=${!#}
 
@@ -874,6 +924,17 @@ run_resume_main_case() (
         elif [[ "${path}" == "${SENTINEL_PATH}" ]]; then
             case "$1:$2" in
                 '-c:%u:%g:%a') printf '0:0:600\n'; return 0 ;;
+            esac
+        elif [[ "${path}" == "${HOOK_OVERRIDE_DIR}" ]]; then
+            case "$1:$2" in
+                '-c:%u:%g:%a')
+                    printf '0:0:%s\n' "$(/usr/bin/stat -c '%a' -- "${path}")"
+                    return 0
+                    ;;
+            esac
+        elif [[ "${path}" == "${HOOK_OVERRIDE_PATH}" ]]; then
+            case "$1:$2" in
+                '-c:%u:%g') printf '0:0\n'; return 0 ;;
             esac
         elif [[ "${path}" == "${CONFIG_PATH}" ]]; then
             case "$1:$2" in
@@ -896,7 +957,7 @@ run_resume_main_case() (
         case "$1" in
             -Qq)
                 case "${RESUME_INSTALLED_FIXTURE}" in
-                    source|source-version-mismatch) printf '%s\n' howy-rocm-mode0 ;;
+                    source|source-version-mismatch) printf '%s\n' "${RESUME_SOURCE_PACKAGE}" ;;
                     target|target-version-mismatch) printf '%s\n' howy-rocm ;;
                     ambiguous) printf '%s\n' howy-rocm-mode0 howy-rocm ;;
                     absent) : ;;
@@ -905,26 +966,39 @@ run_resume_main_case() (
                 ;;
             -Qqo)
                 case "${RESUME_INSTALLED_FIXTURE}" in
-                    source|source-version-mismatch) printf '%s\n' howy-rocm-mode0 ;;
+                    source|source-version-mismatch) printf '%s\n' "${RESUME_SOURCE_PACKAGE}" ;;
                     target|target-version-mismatch) printf '%s\n' howy-rocm ;;
                     *) return 97 ;;
                 esac
                 ;;
             -Q)
                 case "$3:${RESUME_INSTALLED_FIXTURE}" in
-                    howy-rocm-mode0:source)
-                        printf 'howy-rocm-mode0 %s\n' "${RESUME_SOURCE_VERSION}"
+                    "${RESUME_SOURCE_PACKAGE}":source)
+                        printf '%s %s\n' "${RESUME_SOURCE_PACKAGE}" "${RESUME_SOURCE_VERSION}"
                         ;;
-                    howy-rocm-mode0:source-version-mismatch)
-                        printf 'howy-rocm-mode0 0.1.0.r27.g0b76fa2-5\n'
+                    "${RESUME_SOURCE_PACKAGE}":source-version-mismatch)
+                        printf '%s 9.9.9-1\n' "${RESUME_SOURCE_PACKAGE}"
                         ;;
-                    howy-rocm:target) printf 'howy-rocm 2.0.0-1\n' ;;
-                    howy-rocm:target-version-mismatch) printf 'howy-rocm 2.0.0-2\n' ;;
+                    howy-rocm:target) printf 'howy-rocm 2.0.1-1\n' ;;
+                    howy-rocm:target-version-mismatch) printf 'howy-rocm 2.0.1-2\n' ;;
                     *) return 1 ;;
                 esac
                 ;;
-            --ask=4)
-                [[ "$*" == "--ask=4 -U --noconfirm -- ${ARCHIVE_PATH}" ]] || return 96
+            --hookdir|--ask=4)
+                if hook_override_required; then
+                    [[ "$*" == "--hookdir ${HOOK_OVERRIDE_DIR} --ask=4 -U --noconfirm -- ${ARCHIVE_PATH}" ]] \
+                        || return 96
+                    hook_override_state_is_exact || return 89
+                    printf 'hook-override:metadata=%s:target=%s\n' \
+                        "$(resume_stat_mock -c '%u:%g:%a' -- "${HOOK_OVERRIDE_DIR}")" \
+                        "$(/usr/bin/readlink -- "${HOOK_OVERRIDE_PATH}")" \
+                        >> "${RESUME_LOG}"
+                else
+                    [[ "$*" == "--ask=4 -U --noconfirm -- ${ARCHIVE_PATH}" ]] \
+                        || return 96
+                    [[ ! -e "${HOOK_OVERRIDE_DIR}" && ! -L "${HOOK_OVERRIDE_DIR}" ]] \
+                        || return 88
+                fi
                 [[ -f "${SENTINEL_PATH}" && ! -L "${SENTINEL_PATH}" ]] || return 95
                 mapfile -t resume_sentinel_lines < "${SENTINEL_PATH}" || return 94
                 [[ "${#resume_sentinel_lines[@]}" -eq 7 ]] || return 93
@@ -1049,15 +1123,17 @@ else
 fi
 source_resume_log=$(<"${RESUME_LOG}")
 assert_contains 'source-state resume completion output' "${source_resume_output}" \
-    'Howy update finalization resumed: package=howy-rocm version=2.0.0-1'
+    'Howy update finalization resumed: package=howy-rocm version=2.0.1-1'
 assert_count 'resume captures one coherent snapshot per unit' \
     "${source_resume_log}" \
     'systemctl:show --property=UnitFileState --property=ActiveState --property=SubState --no-pager' 2
 assert_count 'source-state resume reruns pacman exactly once' \
     "${source_resume_log}" 'pacman:--ask=4 -U --noconfirm --' 1
+assert_not_contains 'candidate source-state resume does not pass a hook override' \
+    "${source_resume_log}" 'pacman:--hookdir'
 assert_contains 'source-state pacman keeps candidate transaction binding' \
     "${source_resume_log}" \
-    'pacman-binding:source=howy-rocm-mode0:0.1.0.r27.g0b76fa2-6:target=howy-rocm:2.0.0-1:sentinel-source=howy-rocm-mode0:0.1.0.r27.g0b76fa2-6'
+    'pacman-binding:source=howy-rocm-mode0:0.1.0.r27.g0b76fa2-6:target=howy-rocm:2.0.1-1:sentinel-source=howy-rocm-mode0:0.1.0.r27.g0b76fa2-6'
 assert_order 'source-state sentinel-backed pacman precedes bridge' \
     "${source_resume_log}" 'pacman-binding:' \
     'bridge:complete-release-n:marker-absent:sentinel-absent'
@@ -1095,9 +1171,11 @@ fi
 target_resume_log=$(<"${RESUME_LOG}")
 assert_count 'target-state resume reruns pacman exactly once' \
     "${target_resume_log}" 'pacman:--ask=4 -U --noconfirm --' 1
+assert_not_contains 'candidate-origin target-state resume does not pass a hook override' \
+    "${target_resume_log}" 'pacman:--hookdir'
 assert_contains 'target-state resume rewrites transaction as stable same-name update' \
     "${target_resume_log}" \
-    'pacman-binding:source=howy-rocm:2.0.0-1:target=howy-rocm:2.0.0-1:sentinel-source=howy-rocm:2.0.0-1'
+    'pacman-binding:source=howy-rocm:2.0.1-1:target=howy-rocm:2.0.1-1:sentinel-source=howy-rocm:2.0.1-1'
 assert_contains 'candidate-origin target resume retains normalization reconcile' \
     "${target_resume_log}" \
     'howy:package reconcile --allow-legacy-candidate-mode0 --normalize-legacy-candidate-mode0'
@@ -1121,6 +1199,122 @@ pass
 pass
 [[ ! -e "${RESUME_CASE_ROOT}/prepared" && ! -L "${RESUME_CASE_ROOT}/prepared" ]] \
     || fail 'target-state resume left a prepared sentinel'
+pass
+
+prepare_resume_case stable-v2.0.0-source current \
+    howy-rocm 2.0.0-1 source success
+if stable_source_resume_output=$(run_resume_main_case 2>&1); then
+    pass
+else
+    fail "v2.0.0 stable source resume failed: ${stable_source_resume_output}"
+fi
+stable_source_resume_log=$(<"${RESUME_LOG}")
+assert_contains 'v2.0.0 stable source resume keeps predecessor binding' \
+    "${stable_source_resume_log}" \
+    'pacman-binding:source=howy-rocm:2.0.0-1:target=howy-rocm:2.0.1-1:sentinel-source=howy-rocm:2.0.0-1'
+assert_contains 'v2.0.0 stable source resume passes the one-transaction hook directory' \
+    "${stable_source_resume_log}" \
+    "pacman:--hookdir ${RESUME_CASE_ROOT}/hook-override --ask=4 -U --noconfirm -- ${resume_archive}"
+assert_contains 'v2.0.0 stable source resume creates exact override metadata and target' \
+    "${stable_source_resume_log}" 'hook-override:metadata=0:0:700:target=/dev/null'
+assert_contains 'v2.0.0 stable source resume uses strict reconciliation' \
+    "${stable_source_resume_log}" 'howy:package reconcile'
+[[ "$(<"${RESUME_CASE_ROOT}/config.toml")" == 'saved config' ]] \
+    || fail 'v2.0.0 stable source resume did not restore its saved config'
+pass
+[[ ! -e "${RESUME_CASE_ROOT}/hook-override" \
+    && ! -L "${RESUME_CASE_ROOT}/hook-override" ]] \
+    || fail 'v2.0.0 stable source resume retained the compatibility override after success'
+pass
+
+prepare_resume_case stable-v2.0.0-target current \
+    howy-rocm 2.0.0-1 target success
+if stable_target_resume_output=$(run_resume_main_case 2>&1); then
+    pass
+else
+    fail "v2.0.0-origin stable target resume failed: ${stable_target_resume_output}"
+fi
+stable_target_resume_log=$(<"${RESUME_LOG}")
+assert_contains 'v2.0.0-origin target resume advances to current stable binding' \
+    "${stable_target_resume_log}" \
+    'pacman-binding:source=howy-rocm:2.0.1-1:target=howy-rocm:2.0.1-1:sentinel-source=howy-rocm:2.0.1-1'
+assert_not_contains 'v2.0.0-origin target-state resume does not pass a hook override' \
+    "${stable_target_resume_log}" 'pacman:--hookdir'
+[[ "$(<"${RESUME_CASE_ROOT}/config.toml")" == \
+    'live config from completed pacman' ]] \
+    || fail 'v2.0.0-origin stable target resume restored a stale config'
+pass
+
+prepare_resume_case stable-v2.0.1-target current \
+    howy-rocm 2.0.1-1 target success
+if stable_current_resume_output=$(run_resume_main_case 2>&1); then
+    pass
+else
+    fail "v2.0.1 same-release stable resume failed: ${stable_current_resume_output}"
+fi
+stable_current_resume_log=$(<"${RESUME_LOG}")
+assert_contains 'v2.0.1 same-release resume remains a stable binding' \
+    "${stable_current_resume_log}" \
+    'pacman-binding:source=howy-rocm:2.0.1-1:target=howy-rocm:2.0.1-1:sentinel-source=howy-rocm:2.0.1-1'
+assert_not_contains 'v2.0.1 same-release resume does not pass a hook override' \
+    "${stable_current_resume_log}" 'pacman:--hookdir'
+
+prepare_resume_case release-n-source current \
+    howy-rocm-git 0.1.0.r26.g2dfe39e-1 source success
+if release_n_resume_output=$(run_resume_main_case 2>&1); then
+    pass
+else
+    fail "release-N source resume failed: ${release_n_resume_output}"
+fi
+release_n_resume_log=$(<"${RESUME_LOG}")
+assert_not_contains 'release-N source-state resume does not pass a hook override' \
+    "${release_n_resume_log}" 'pacman:--hookdir'
+
+for collision in \
+    override-directory-collision \
+    override-directory-symlink \
+    override-hook-collision; do
+    prepare_resume_case "${collision}" current \
+        howy-rocm 2.0.0-1 source "${collision}"
+    expect_failure "v2.0.0 source resume refuses ${collision}" run_resume_main_case
+    override_collision_log=$(<"${RESUME_LOG}")
+    assert_not_contains "${collision} refuses before unit stop" \
+        "${override_collision_log}" 'systemctl:stop'
+    assert_not_contains "${collision} refuses before pacman" \
+        "${override_collision_log}" 'pacman:--hookdir'
+    [[ -e "${RESUME_CASE_ROOT}/hook-override" \
+        || -L "${RESUME_CASE_ROOT}/hook-override" ]] \
+        || fail "${collision} refusal removed pre-existing override state"
+    pass
+done
+
+prepare_resume_case override-cleanup-failure current \
+    howy-rocm 2.0.0-1 source override-cleanup-failure
+if override_cleanup_output=$(run_resume_main_case 2>&1); then
+    fail 'v2.0.0 source resume succeeded despite arranged override cleanup failure'
+fi
+override_cleanup_log=$(<"${RESUME_LOG}")
+assert_contains 'override cleanup failure occurs after exact prepared pacman argv' \
+    "${override_cleanup_log}" \
+    "pacman:--hookdir ${RESUME_CASE_ROOT}/hook-override --ask=4 -U --noconfirm -- ${resume_archive}"
+assert_contains 'override cleanup failure is reported' "${override_cleanup_output}" \
+    'one-transaction hook override cleanup is incomplete'
+[[ -L "${RESUME_CASE_ROOT}/hook-override/00-howy-update-admission.hook" \
+    && "$(/usr/bin/readlink -- \
+        "${RESUME_CASE_ROOT}/hook-override/00-howy-update-admission.hook")" == /dev/null ]] \
+    || fail 'override cleanup failure did not retain the exact symlink for inspection'
+pass
+
+prepare_resume_case override-pacman-failure current \
+    howy-rocm 2.0.0-1 source pacman-failure
+expect_failure 'v2.0.0 source resume pacman failure uses trap cleanup' run_resume_main_case
+override_pacman_failure_log=$(<"${RESUME_LOG}")
+assert_contains 'v2.0.0 source resume failure passed the hook override' \
+    "${override_pacman_failure_log}" \
+    "pacman:--hookdir ${RESUME_CASE_ROOT}/hook-override --ask=4 -U --noconfirm -- ${resume_archive}"
+[[ ! -e "${RESUME_CASE_ROOT}/hook-override" \
+    && ! -L "${RESUME_CASE_ROOT}/hook-override" ]] \
+    || fail 'trap cleanup retained the compatibility override after pacman failure'
 pass
 
 prepare_resume_case archive-mismatch legacy \
@@ -1167,7 +1361,7 @@ expect_failure 'resumed pacman failure retains exact backup' run_resume_main_cas
 pacman_failure_log=$(<"${RESUME_LOG}")
 assert_contains 'resumed pacman failure saw its prepared sentinel' \
     "${pacman_failure_log}" \
-    'pacman-binding:source=howy-rocm-mode0:0.1.0.r27.g0b76fa2-6:target=howy-rocm:2.0.0-1:sentinel-source=howy-rocm-mode0:0.1.0.r27.g0b76fa2-6'
+    'pacman-binding:source=howy-rocm-mode0:0.1.0.r27.g0b76fa2-6:target=howy-rocm:2.0.1-1:sentinel-source=howy-rocm-mode0:0.1.0.r27.g0b76fa2-6'
 [[ -d "${RESUME_CASE_ROOT}/backup" ]] \
     || fail 'resumed pacman failure removed the retained backup'
 pass
@@ -1204,6 +1398,7 @@ run_update_admission_case() (
 
     transformed=${transformed//SENTINEL_PATH/ADMISSION_SENTINEL_PATH}
     transformed=${transformed//TARGET_VERSION/ADMISSION_TARGET_VERSION}
+    transformed=${transformed//PREVIOUS_STABLE_VERSION/ADMISSION_PREVIOUS_STABLE_VERSION}
     transformed=${transformed//\/run\/howy-v2-update-v1.prepared/${ADMISSION_SENTINEL_PATH}}
     transformed=${transformed//\/usr\/bin\/id/admission_id_mock}
     transformed=${transformed//\/usr\/bin\/stat/admission_stat_mock}
@@ -1258,12 +1453,12 @@ eval "${sentinel_writer_function}"
 updater_sentinel_stat_mock() {
     printf '0:0:600\n'
 }
-ARCHIVE_PATH='/tmp/howy-cpu-2.0.0-1-x86_64.pkg.tar.zst'
+ARCHIVE_PATH='/tmp/howy-cpu-2.0.1-1-x86_64.pkg.tar.zst'
 ARCHIVE_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 SOURCE_PACKAGE=howy-cpu
 SOURCE_VERSION=2.0.0-1
 ARCHIVE_PKGNAME=howy-cpu
-ARCHIVE_PKGVER=2.0.0-1
+ARCHIVE_PKGVER=2.0.1-1
 SENTINEL_CREATED=0
 expect_success 'updater writes same-name prepared sentinel' write_sentinel
 mapfile -t updater_sentinel_lines < "${ADMISSION_SENTINEL_PATH}"
@@ -1297,6 +1492,13 @@ sentinel_hash_after=$(/usr/bin/sha256sum -- "${ADMISSION_SENTINEL_PATH}")
     || fail 'valid update admission mutated the prepared sentinel'
 pass
 
+write_admission_fixture \
+    /tmp/howy-current.pkg.tar.zst \
+    bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    howy-cpu 2.0.1-1 howy-cpu 2.0.1-1
+expect_success 'same-release v2.0.1 sentinel is admitted' \
+    run_update_admission_case root $'howy-cpu\n'
+
 expect_failure 'update-admission helper rejects unreadable metadata' \
     run_update_admission_case stat-failure $'howy-cpu\n'
 expect_failure 'update-admission helper rejects non-root sentinel ownership' \
@@ -1315,14 +1517,14 @@ expect_failure 'update-admission helper rejects a sentinel symlink' \
 write_admission_fixture \
     /tmp/howy.pkg.tar.zst \
     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-    howy-cpu 2.0.0-1 howy-cpu 2.0.0-1
+    howy-cpu 2.0.0-1 howy-cpu 2.0.1-1
 printf 'extra=field\n' >> "${ADMISSION_SENTINEL_PATH}"
 expect_failure 'update-admission helper rejects an eighth schema line' \
     run_update_admission_case root $'howy-cpu\n'
 write_admission_fixture \
     /tmp/howy.pkg.tar.zst \
     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-    howy-cpu 2.0.0-1 howy-cpu 2.0.0-1
+    howy-cpu 2.0.0-1 howy-cpu 2.0.1-1
 printf '%s' "$(<"${ADMISSION_SENTINEL_PATH}")" > "${ADMISSION_SENTINEL_PATH}"
 expect_failure 'update-admission helper rejects a noncanonical final line' \
     run_update_admission_case root $'howy-cpu\n'
@@ -1330,48 +1532,53 @@ expect_failure 'update-admission helper rejects a noncanonical final line' \
 write_admission_fixture \
     relative/howy.pkg.tar.zst \
     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-    howy-cpu 2.0.0-1 howy-cpu 2.0.0-1
+    howy-cpu 2.0.0-1 howy-cpu 2.0.1-1
 expect_failure 'update-admission helper requires an absolute archive' \
     run_update_admission_case root $'howy-cpu\n'
 write_admission_fixture \
     /tmp/howy.pkg.tar.zst \
     Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-    howy-cpu 2.0.0-1 howy-cpu 2.0.0-1
+    howy-cpu 2.0.0-1 howy-cpu 2.0.1-1
 expect_failure 'update-admission helper rejects a non-lowercase hash' \
     run_update_admission_case root $'howy-cpu\n'
 write_admission_fixture \
     /tmp/howy.pkg.tar.zst \
     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-    howy-cpu 2.0.0-1 howy-cpu 2.0.0-1
+    howy-cpu 2.0.0-1 howy-cpu 2.0.1-1
 expect_failure 'update-admission helper rejects a non-64-character hash' \
     run_update_admission_case root $'howy-cpu\n'
 write_admission_fixture \
     /tmp/howy.pkg.tar.zst \
     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-    howy-rocm 2.0.0-1 howy-cpu 2.0.0-1
+    howy-rocm 2.0.0-1 howy-cpu 2.0.1-1
 expect_failure 'update-admission helper rejects source-target mismatch' \
     run_update_admission_case root $'howy-cpu\n'
 write_admission_fixture \
     /tmp/howy.pkg.tar.zst \
     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-    howy-cpu 2.0.0-1 howy-cpu 2.0.0-1
+    howy-cpu 2.0.0-1 howy-cpu 2.0.1-1
 expect_failure 'update-admission helper rejects trigger-target mismatch' \
     run_update_admission_case root $'howy-rocm\n'
 write_admission_fixture \
     /tmp/howy.pkg.tar.zst \
     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-    howy-cpu 1.9.0-1 howy-cpu 2.0.0-1
+    howy-cpu 1.9.0-1 howy-cpu 2.0.1-1
 expect_failure 'update-admission helper rejects source-version mismatch' \
     run_update_admission_case root $'howy-cpu\n'
 write_admission_fixture \
     /tmp/howy.pkg.tar.zst \
     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-    howy-cpu 2.0.0-1 howy-cpu 2.0.0-2
+    howy-cpu 2.0.0-1 howy-cpu 2.0.0-1
 expect_failure 'update-admission helper rejects target-version mismatch' \
     run_update_admission_case root $'howy-cpu\n'
 
 main_function=$(declare -f main)
 resume_function=$(declare -f resume_retained_update)
+pacman_function=$(declare -f run_pacman_update)
+override_required_function=$(declare -f hook_override_required)
+override_create_function=$(declare -f create_hook_override_if_required)
+override_cleanup_function=$(declare -f cleanup_hook_override)
+runtime_cleanup_function=$(declare -f cleanup_runtime_state)
 stop_function=$(declare -f stop_units)
 post_function=$(declare -f post_pacman_steps)
 restore_config_function=$(declare -f restore_config)
@@ -1398,9 +1605,9 @@ assert_order 'release post-completion identity proof before stash' \
 assert_order 'release stash before absent-marker proof' \
     "${production_transition_preflight_function}" \
     '/usr/lib/howy/howy-config-bridge stash-release-n' 'path_is_absent "${MARKER_PATH}"'
-assert_order 'stable read-only validator before stash' \
+assert_order 'stable structural validator before stash' \
     "${production_transition_preflight_function}" \
-    '/usr/lib/howy/howy-config-bridge validate-current-marker' \
+    '/usr/lib/howy/howy-config-bridge validate-current-marker-structure' \
     '/usr/lib/howy/howy-config-bridge stash-release-n'
 assert_contains 'generated release-N marker refusal' \
     "${production_transition_preflight_function}" \
@@ -1412,16 +1619,20 @@ assert_order 'candidate marker precedes exact mode 0600 config preflight' \
     'candidate_marker_is_exact "${MARKER_PATH}"' 'require_candidate_config'
 assert_order 'transition preflight before backup' "${main_function}" \
     'preflight_transition_state' 'create_backup'
+assert_order 'hook override collision preflight precedes transition side effects' \
+    "${main_function}" 'preflight_hook_override_if_required' 'preflight_transition_state'
 assert_order 'backup before stop' "${main_function}" 'create_backup' 'stop_units'
 assert_order 'socket before service stop' "${stop_function}" \
     'stop howy.socket' 'stop howy.service'
 assert_order 'archive revalidation before pacman' "${main_function}" \
-    'require_archive_unchanged' '/usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"'
+    'require_archive_unchanged' 'run_pacman_update'
 assert_order 'prepared sentinel before transaction bindings' "${main_function}" \
     'write_sentinel' 'HOWY_V2_UPDATE_FORMAT="${UPDATE_FORMAT}"'
+assert_order 'prepared sentinel before conditional override creation' "${main_function}" \
+    'write_sentinel' 'create_hook_override_if_required'
 assert_order 'transaction bindings before pacman' "${main_function}" \
     'HOWY_V2_UPDATE_FORMAT="${UPDATE_FORMAT}"' \
-    '/usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"'
+    'run_pacman_update'
 assert_count 'exact inline transaction binding count' "${main_function}" \
     'HOWY_V2_UPDATE_' 7
 assert_order 'resume archive revalidation before sentinel' "${resume_function}" \
@@ -1430,12 +1641,14 @@ assert_order 'resume sentinel before transaction bindings' "${resume_function}" 
     'write_sentinel' 'HOWY_V2_UPDATE_FORMAT="${UPDATE_FORMAT}"'
 assert_order 'resume transaction bindings before pacman' "${resume_function}" \
     'HOWY_V2_UPDATE_FORMAT="${UPDATE_FORMAT}"' \
-    '/usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"'
+    'run_pacman_update'
 assert_count 'exact resumed transaction binding count' "${resume_function}" \
     'HOWY_V2_UPDATE_' 7
 assert_order 'resumed pacman before sentinel removal' "${resume_function}" \
-    '/usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"' \
+    'run_pacman_update' \
     '/usr/bin/rm -f -- "${SENTINEL_PATH}"'
+assert_order 'resumed pacman success removes override before sentinel' "${resume_function}" \
+    'run_pacman_update' 'cleanup_hook_override'
 assert_order 'resume sentinel removal before post-pacman work' "${resume_function}" \
     '/usr/bin/rm -f -- "${SENTINEL_PATH}"' 'post_pacman_steps'
 assert_order 'resume post-pacman work before backup cleanup' "${resume_function}" \
@@ -1456,6 +1669,8 @@ assert_order 'socket start before service start' "${restore_units_function}" \
     '/usr/bin/systemctl start howy.socket' '/usr/bin/systemctl start howy.service'
 assert_order 'post-pacman success before backup cleanup' "${main_function}" \
     'post_pacman_steps' 'remove_completed_backup'
+assert_order 'pacman success removes override before post-pacman work' "${main_function}" \
+    'run_pacman_update' 'cleanup_hook_override'
 assert_contains 'pacman failure contract' "${main_function}" "retain_failure 'pacman -U failed'"
 assert_contains 'reconcile failure is nonzero' "${post_function}" \
     '/usr/bin/howy package reconcile || return 1'
@@ -1477,14 +1692,42 @@ assert_order 'cleanup validates before removal' "${cleanup_function}" \
     'backup_contents_are_expected' '/usr/bin/rm -- "${files[@]}"'
 assert_contains 'cleanup exact directory removal' "${cleanup_function}" \
     '/usr/bin/rmdir -- "${BACKUP_PATH}"'
+assert_contains 'override applies only to exact previous stable version' \
+    "${override_required_function}" \
+    '"${SOURCE_VERSION}" == "${PREVIOUS_STABLE_VERSION}"'
+assert_contains 'override applies only to same stable package' \
+    "${override_required_function}" \
+    '"${SOURCE_PACKAGE}" == "${ARCHIVE_PKGNAME}"'
+assert_contains 'override directory is created with exact mode' \
+    "${override_create_function}" \
+    '/usr/bin/mkdir -m 0700 -- "${HOOK_OVERRIDE_DIR}"'
+assert_contains 'override symlink has exact target' "${override_create_function}" \
+    '/usr/bin/ln -s -- /dev/null "${HOOK_OVERRIDE_PATH}"'
+assert_contains 'pacman receives additive compatibility HookDir' "${pacman_function}" \
+    'hookdir_args=(--hookdir "${HOOK_OVERRIDE_DIR}")'
+assert_contains 'pacman keeps exact update argument sequence' "${pacman_function}" \
+    '--ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"'
+assert_order 'override cleanup removes exact symlink before exact directory' \
+    "${override_cleanup_function}" \
+    '/usr/bin/rm -- "${HOOK_OVERRIDE_PATH}"' \
+    '/usr/bin/rmdir -- "${HOOK_OVERRIDE_DIR}"'
+assert_not_contains 'override cleanup never recursively removes state' \
+    "${override_cleanup_function}" '/usr/bin/rm -r'
+assert_not_contains 'override cleanup never force-removes the symlink' \
+    "${override_cleanup_function}" '/usr/bin/rm -f'
+assert_contains 'override cleanup failure reports retained state' \
+    "${override_cleanup_function}" \
+    'one-transaction hook override cleanup is incomplete; inspect retained state'
+assert_contains 'exit trap runs override cleanup' "${runtime_cleanup_function}" \
+    'cleanup_hook_override'
 assert_not_contains 'updater success cleanup' "${updater_text}" '/usr/bin/rm -rf'
 assert_not_contains 'validation refusals never rely on OR-list control flow' \
     "${updater_text}" '|| refuse'
 assert_not_contains 'release-N preflight does not parse bridge manifests' \
     "${updater_text}" 'manifest'
 assert_contains 'strict shell mode' "${updater_text}" 'set -euo pipefail'
-assert_order 'sentinel trap precedes side effects' "${main_function}" \
-    'trap cleanup_sentinel EXIT' 'validate_archive'
+assert_order 'runtime cleanup trap precedes side effects' "${main_function}" \
+    'trap cleanup_runtime_state EXIT' 'validate_archive'
 
 POST_PACMAN_LOG="${WORK}/post-pacman.log"
 run_post_pacman_reconcile_sequence() (
@@ -1606,7 +1849,7 @@ remove_helper_text=$(<"${REMOVE_HELPER}")
 assert_contains 'PKGBUILD canonical base' "${pkgbuild_text}" 'pkgbase=howy'
 assert_contains 'PKGBUILD canonical variants' "${pkgbuild_text}" \
     'pkgname=(howy-cpu howy-rocm howy-cuda)'
-assert_contains 'PKGBUILD exact version' "${pkgbuild_text}" 'pkgver=2.0.0'
+assert_contains 'PKGBUILD exact version' "${pkgbuild_text}" 'pkgver=2.0.1'
 assert_not_contains 'PKGBUILD has zero automatic replacements' "${pkgbuild_text}" 'replaces='
 assert_contains 'relative PAM compatibility alias' "${pkgbuild_text}" \
     'ln -s pam_howy.so "${pkgdir}/usr/lib/security/pam_howdy.so"'
@@ -1752,7 +1995,7 @@ expect_failure 'removal helper inactive verification failure' run_remove_helper_
 MOCK_DIR="${WORK}/install-script"
 /usr/bin/mkdir "${MOCK_DIR}"
 prepared_path="${MOCK_DIR}/prepared"
-prepared_archive="${MOCK_DIR}/howy-rocm-2.0.0-1-x86_64.pkg.tar.zst"
+prepared_archive="${MOCK_DIR}/howy-rocm-2.0.1-1-x86_64.pkg.tar.zst"
 prepared_archive_sha=''
 marker_path="${MOCK_DIR}/marker"
 install_text=$(<"${INSTALL_SCRIPT}")
@@ -1808,7 +2051,7 @@ write_install_prepared_fixture() {
         'source_package=howy-rocm-mode0' \
         'source_version=0.1.0.r27.g0b76fa2-6' \
         'target_package=howy-rocm' \
-        'target_version=2.0.0-1' > "${prepared_path}"
+        'target_version=2.0.1-1' > "${prepared_path}"
 }
 run_bound_post_install() {
     local target_package="${1:-howy-rocm}"
@@ -1819,7 +2062,7 @@ run_bound_post_install() {
     HOWY_V2_UPDATE_SOURCE_PACKAGE=howy-rocm-mode0 \
     HOWY_V2_UPDATE_SOURCE_VERSION=0.1.0.r27.g0b76fa2-6 \
     HOWY_V2_UPDATE_TARGET_PACKAGE="${target_package}" \
-    HOWY_V2_UPDATE_TARGET_VERSION=2.0.0-1 \
+    HOWY_V2_UPDATE_TARGET_VERSION=2.0.1-1 \
         post_install
 }
 # shellcheck source=/dev/null

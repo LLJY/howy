@@ -2,6 +2,8 @@ use std::ffi::OsStr;
 
 use howy_config_bridge::{BootstrapOutcome, ConfigBridge, CreateOutcome, StashOutcome};
 
+const COMMAND_GRAMMAR: &str = "expected one command: ensure-layout, bootstrap-release-n, complete-release-n, complete-local-install, create-if-absent, stash-release-n, recover, validate-current-marker, or validate-current-marker-structure";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BridgeCommand {
     EnsureLayout,
@@ -12,6 +14,7 @@ enum BridgeCommand {
     StashReleaseN,
     Recover,
     ValidateCurrentMarker,
+    ValidateCurrentMarkerStructure,
 }
 
 impl BridgeCommand {
@@ -25,6 +28,7 @@ impl BridgeCommand {
             Some("stash-release-n") => Some(Self::StashReleaseN),
             Some("recover") => Some(Self::Recover),
             Some("validate-current-marker") => Some(Self::ValidateCurrentMarker),
+            Some("validate-current-marker-structure") => Some(Self::ValidateCurrentMarkerStructure),
             _ => None,
         }
     }
@@ -34,9 +38,7 @@ fn main() {
     let mut arguments = std::env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
-        fail(
-            "expected one command: ensure-layout, bootstrap-release-n, complete-release-n, complete-local-install, create-if-absent, stash-release-n, recover, or validate-current-marker",
-        );
+        fail(COMMAND_GRAMMAR);
     };
     if arguments.next().is_some() {
         fail("bridge commands accept no additional arguments");
@@ -80,6 +82,9 @@ fn main() {
         BridgeCommand::ValidateCurrentMarker => bridge
             .validate_current_marker()
             .map(|()| "HOWY_MARKER_RESULT=Valid"),
+        BridgeCommand::ValidateCurrentMarkerStructure => bridge
+            .validate_current_marker_structure()
+            .map(|()| "HOWY_MARKER_STRUCTURE_RESULT=Valid"),
     };
 
     match result {
@@ -97,10 +102,10 @@ fn fail(message: &str) -> ! {
 mod tests {
     use std::ffi::OsStr;
 
-    use super::BridgeCommand;
+    use super::{BridgeCommand, COMMAND_GRAMMAR};
 
     #[test]
-    fn command_surface_includes_exact_read_only_marker_validator() {
+    fn command_surface_includes_both_read_only_marker_validators() {
         for (name, expected) in [
             ("ensure-layout", BridgeCommand::EnsureLayout),
             ("bootstrap-release-n", BridgeCommand::BootstrapReleaseN),
@@ -116,6 +121,10 @@ mod tests {
                 "validate-current-marker",
                 BridgeCommand::ValidateCurrentMarker,
             ),
+            (
+                "validate-current-marker-structure",
+                BridgeCommand::ValidateCurrentMarkerStructure,
+            ),
         ] {
             assert_eq!(BridgeCommand::parse(OsStr::new(name)), Some(expected));
         }
@@ -125,8 +134,15 @@ mod tests {
             "validate-marker",
             "current-marker",
             "recover-current-marker",
+            "validate_current_marker_structure",
         ] {
             assert_eq!(BridgeCommand::parse(OsStr::new(unknown)), None);
         }
+    }
+
+    #[test]
+    fn missing_command_help_lists_both_marker_validators() {
+        assert!(COMMAND_GRAMMAR.contains("validate-current-marker,"));
+        assert!(COMMAND_GRAMMAR.ends_with("validate-current-marker-structure"));
     }
 }

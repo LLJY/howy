@@ -1816,7 +1816,7 @@ impl SecurityRuntime for RealSecurityRuntime {
 
     fn validate_package_marker(&mut self) -> SecurityResult<()> {
         howy_config_bridge::ConfigBridge::new()
-            .validate_current_marker()
+            .validate_current_marker_structure()
             .map_err(|error| {
                 SecurityError::Refused(format!("package marker validation failed: {error}"))
             })
@@ -1995,18 +1995,9 @@ impl SecurityRuntime for RealSecurityRuntime {
         observation
             .validate_for_plan(plan)
             .map_err(|error| SecurityError::operation(error.to_string()))?;
-        let backup = observation.backup.as_ref().ok_or_else(|| {
-            SecurityError::operation("atomic observation has no backup to remove")
-        })?;
         let parent_fd = self.atomic_parent_fd(plan)?;
         let (_, target_name) = split_absolute(&plan.target_path)?;
-        let (_, backup_name) = split_absolute(
-            plan.backup_path
-                .as_deref()
-                .ok_or_else(|| SecurityError::operation("atomic backup path is missing"))?,
-        )?;
         let target_name = cstring(target_name.as_bytes())?;
-        let backup_name = cstring(backup_name.as_bytes())?;
         let target = observe_atomic_at(
             parent_fd.as_raw_fd(),
             &target_name,
@@ -2016,17 +2007,39 @@ impl SecurityRuntime for RealSecurityRuntime {
         .ok_or_else(|| {
             SecurityError::Uncertain("atomic target disappeared before cleanup".into())
         })?;
+        if target.atomic_identity() != observation.target {
+            return Err(SecurityError::Uncertain(
+                "atomic target changed before cleanup".into(),
+            ));
+        }
+        if plan.operation == AtomicWriteKindV1::NoReplace {
+            if observation.backup.is_some() || plan.backup_path.is_some() {
+                return Err(SecurityError::operation(
+                    "no-replace atomic publication unexpectedly has a backup",
+                ));
+            }
+            return fsync_directory(parent_fd.as_raw_fd()).map_err(|_| {
+                SecurityError::Uncertain(
+                    "no-replace atomic publication directory fsync failed".into(),
+                )
+            });
+        }
+
+        let backup = observation.backup.as_ref().ok_or_else(|| {
+            SecurityError::operation("atomic observation has no backup to remove")
+        })?;
+        let (_, backup_name) = split_absolute(
+            plan.backup_path
+                .as_deref()
+                .ok_or_else(|| SecurityError::operation("atomic backup path is missing"))?,
+        )?;
+        let backup_name = cstring(backup_name.as_bytes())?;
         let live_backup = observe_atomic_at(
             parent_fd.as_raw_fd(),
             &backup_name,
             backup.byte_length as usize,
             &plan.parent_directory,
         )?;
-        if target.atomic_identity() != observation.target {
-            return Err(SecurityError::Uncertain(
-                "atomic target changed before cleanup".into(),
-            ));
-        }
         let Some(live_backup) = live_backup else {
             return fsync_directory(parent_fd.as_raw_fd()).map_err(|_| {
                 SecurityError::Uncertain(
@@ -2544,6 +2557,10 @@ impl SecurityRuntime for RealSecurityRuntime {
                 Err(error)
             }
         }
+    }
+
+    fn run_checked_command(&mut self, command: &CommandSpec) -> SecurityResult<Vec<u8>> {
+        self.run(command, &[]).map(ProcessOutput::into_stdout)
     }
 
     fn preview_verifier(&mut self, config_bytes: &[u8]) -> SecurityResult<VerifierResultV1> {
@@ -3226,7 +3243,11 @@ fn observe_atomic_at(
         libc::openat(
             parent_fd,
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            libc::O_RDONLY
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK
+                | libc::O_NOATIME,
         )
     };
     if fd < 0 {

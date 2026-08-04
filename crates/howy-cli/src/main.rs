@@ -70,6 +70,11 @@ enum SecurityCommands {
     },
     /// Activate an exact receipted disabled Mode-1 candidate.
     Enable,
+    /// Set the runtime presence policy without reprovisioning storage.
+    SetPresence {
+        #[arg(value_enum)]
+        presence: CliProvisionPresence,
+    },
     /// Deterministically recover the durable security transaction journal.
     Recover,
     /// Remove an exact unadopted artifact after reference-safe revalidation.
@@ -175,7 +180,7 @@ enum Commands {
         stdout: bool,
     },
 
-    /// Provision, activate, recover, or clean up storage security state.
+    /// Provision or manage storage and presence security state.
     Security {
         #[command(subcommand)]
         command: SecurityCommands,
@@ -297,6 +302,7 @@ fn cmd_security(command: SecurityCommands, assume_yes: bool) -> Result<()> {
             })
         }
         SecurityCommands::Enable => engine.enable(),
+        SecurityCommands::SetPresence { presence } => engine.set_presence(presence.into()),
         SecurityCommands::Recover => engine.recover(),
         SecurityCommands::CleanupUnadopted {
             transaction,
@@ -1080,6 +1086,33 @@ mod tests {
         ] {
             assert_eq!(resolve_provision_presence(mode, Some(presence)), presence);
         }
+    }
+
+    #[test]
+    fn security_set_presence_accepts_exact_positional_values_and_global_yes() {
+        for (value, expected) in [
+            ("off", CliProvisionPresence::Off),
+            ("confirm", CliProvisionPresence::Confirm),
+        ] {
+            let cli =
+                Cli::try_parse_from(["howy", "--yes", "security", "set-presence", value]).unwrap();
+            assert!(cli.yes);
+            let Commands::Security {
+                command: SecurityCommands::SetPresence { presence },
+            } = cli.command
+            else {
+                panic!("expected security set-presence")
+            };
+            assert_eq!(presence, expected);
+        }
+
+        assert!(Cli::try_parse_from(["howy", "security", "set-presence"]).is_err());
+        assert!(Cli::try_parse_from(["howy", "security", "set-presence", "off", "--yes"]).is_ok());
+        assert!(Cli::try_parse_from(["howy", "security", "set-presence", "prompt"]).is_err());
+        assert!(
+            Cli::try_parse_from(["howy", "security", "set-presence", "--presence", "off",])
+                .is_err()
+        );
     }
 
     #[test]

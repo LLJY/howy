@@ -6,6 +6,7 @@ pub const SYSTEMD_CREDS: &str = "/usr/bin/systemd-creds";
 pub const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
 pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
 pub const HOWYD: &str = "/usr/bin/howyd";
+pub const VISUDO: &str = "/usr/bin/visudo";
 
 pub const CHILD_STDOUT_CAP: usize = 16_384;
 pub const CHILD_STDERR_CAP: usize = 16_384;
@@ -13,6 +14,7 @@ pub const CREDENTIAL_DEADLINE: Duration = Duration::from_secs(30);
 pub const READINESS_DEADLINE: Duration = Duration::from_secs(135);
 pub const SYSTEMCTL_DEADLINE: Duration = Duration::from_secs(15);
 pub const TPM2_PROBE_DEADLINE: Duration = Duration::from_secs(10);
+pub const VISUDO_DEADLINE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySelection {
@@ -175,6 +177,18 @@ pub fn tpm2_probe_command() -> CommandSpec {
     }
 }
 
+pub fn visudo_validation_command() -> CommandSpec {
+    CommandSpec {
+        executable: VISUDO.into(),
+        arguments: vec!["-cf".into(), "/etc/sudoers".into()],
+        clear_environment: true,
+        stdin_bytes: 0,
+        stdout_cap: CHILD_STDOUT_CAP,
+        stderr_cap: CHILD_STDERR_CAP,
+        deadline: VISUDO_DEADLINE,
+    }
+}
+
 pub fn effective_unit_show_command(unit: &str) -> CommandSpec {
     let mut properties = vec![
         "FragmentPath",
@@ -278,5 +292,17 @@ mod tests {
             ]
         );
         assert!(spec.clear_environment);
+    }
+
+    #[test]
+    fn visudo_validation_argv_is_exact_environment_free_and_bounded() {
+        let spec = visudo_validation_command();
+        assert_eq!(spec.executable, "/usr/bin/visudo");
+        assert_eq!(spec.arguments, ["-cf", "/etc/sudoers"]);
+        assert!(spec.clear_environment);
+        assert_eq!(spec.stdin_bytes, 0);
+        assert_eq!(spec.stdout_cap, CHILD_STDOUT_CAP);
+        assert_eq!(spec.stderr_cap, CHILD_STDERR_CAP);
+        assert_eq!(spec.deadline, VISUDO_DEADLINE);
     }
 }

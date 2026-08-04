@@ -156,7 +156,7 @@ srcinfo_text=$(<"${REPO_ROOT}/.SRCINFO")
     || fail "generated .SRCINFO retains automatic predecessor replacement"
 source "${REPO_ROOT}/PKGBUILD"
 [ "${pkgbase}" = howy ] || fail "root package base is not canonical howy"
-[ "${pkgver}" = 2.0.0 ] || fail "root package version is not 2.0.0"
+[ "${pkgver}" = 2.0.1 ] || fail "root package version is not 2.0.1"
 [ "${pkgname[*]}" = "howy-cpu howy-rocm howy-cuda" ] \
     || fail "root split package names are not canonical"
 [[ " ${makedepends[*]} " == *" onnxruntime=1.28.0 "* ]] \
@@ -200,8 +200,8 @@ for variant in howy-cpu howy-rocm howy-cuda; do
     [[ " ${depends[*]} " == *" systemd>=261 "* ]] || fail "${variant} lacks systemd>=261"
     [[ " ${optdepends[*]} " == *" tpm2-tss: TPM-backed systemd credential provisioning "* ]] \
         || fail "${variant} lacks reviewed TPM optional dependency"
-    [[ " ${provides[*]} " == *" howy=2.0.0 "* ]] || fail "${variant} lacks stable howy provide"
-    [[ " ${provides[*]} " == *" howdy=2.0.0 "* ]] || fail "${variant} lacks stable howdy provide"
+    [[ " ${provides[*]} " == *" howy=2.0.1 "* ]] || fail "${variant} lacks stable howy provide"
+    [[ " ${provides[*]} " == *" howdy=2.0.1 "* ]] || fail "${variant} lacks stable howdy provide"
     [[ ! -v replaces ]] || fail "${variant} declares automatic predecessor replacement"
     [[ " ${conflicts[*]} " != *" ${variant} "* ]] || fail "${variant} conflicts with itself"
     for legacy in howy howy-git howy-cpu-git howy-rocm-git howy-cuda-git \

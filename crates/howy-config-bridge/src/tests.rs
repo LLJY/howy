@@ -335,6 +335,9 @@ fn current_marker_validation_accepts_exact_null_and_restored_generation_bindings
         .unwrap();
     let null_marker = fs::read(null_root.path(MARKER_PATH)).unwrap();
     ConfigBridge::rooted(&null_root.0)
+        .validate_current_marker_structure()
+        .unwrap();
+    ConfigBridge::rooted(&null_root.0)
         .validate_current_marker()
         .unwrap();
     assert_eq!(fs::read(null_root.path(MARKER_PATH)).unwrap(), null_marker);
@@ -357,6 +360,9 @@ fn current_marker_validation_accepts_exact_null_and_restored_generation_bindings
     let marker = fs::read(generation_root.path(MARKER_PATH)).unwrap();
     let manifest = fs::read(generation_root.path(MANIFEST_PATH)).unwrap();
     ConfigBridge::rooted(&generation_root.0)
+        .validate_current_marker_structure()
+        .unwrap();
+    ConfigBridge::rooted(&generation_root.0)
         .validate_current_marker()
         .unwrap();
     assert_eq!(fs::read(generation_root.path(MARKER_PATH)).unwrap(), marker);
@@ -367,15 +373,49 @@ fn current_marker_validation_accepts_exact_null_and_restored_generation_bindings
 }
 
 #[test]
-fn current_marker_validation_refuses_missing_static_malformed_unsafe_and_config_drift() {
+fn exact_marker_validation_rejects_live_drift_while_structural_validation_accepts_it() {
+    for generated in [false, true] {
+        let root = TestRoot::new();
+        write_mode(&root.path(CONFIG_PATH), b"administrator=original\n", 0o600);
+        if generated {
+            ConfigBridge::rooted(&root.0).stash_release_n().unwrap();
+            fs::remove_file(root.path(CONFIG_PATH)).unwrap();
+            root.install_legacy();
+            ConfigBridge::rooted(&root.0).bootstrap_release_n().unwrap();
+        } else {
+            ConfigBridge::rooted(&root.0).complete_release_n().unwrap();
+        }
+
+        let marker = fs::read(root.path(MARKER_PATH)).unwrap();
+        let manifest = fs::read(root.path(MANIFEST_PATH)).ok();
+        write_mode(&root.path(CONFIG_PATH), b"administrator=changed\n", 0o600);
+
+        ConfigBridge::rooted(&root.0)
+            .validate_current_marker_structure()
+            .unwrap_or_else(|error| panic!("generated={generated}: {error}"));
+        assert!(
+            ConfigBridge::rooted(&root.0)
+                .validate_current_marker()
+                .is_err(),
+            "generated={generated} exact validation unexpectedly accepted drift"
+        );
+        assert_eq!(fs::read(root.path(MARKER_PATH)).unwrap(), marker);
+        assert_eq!(fs::read(root.path(MANIFEST_PATH)).ok(), manifest);
+    }
+}
+
+#[test]
+fn both_marker_validators_refuse_missing_malformed_and_conflicting_controls() {
     for failure in [
         "missing",
         "candidate-static",
         "malformed",
         "unsafe",
         "wrong-release",
-        "wrong-config",
         "active-journal",
+        "malformed-journal",
+        "orphan-stage",
+        "unexpected-manifest",
     ] {
         let root = TestRoot::new();
         write_mode(&root.path(CONFIG_PATH), b"administrator=true\n", 0o600);
@@ -402,7 +442,6 @@ fn current_marker_validation_refuses_missing_static_malformed_unsafe_and_config_
                     0o600,
                 );
             }
-            "wrong-config" => write_mode(&root.path(CONFIG_PATH), b"changed=true\n", 0o600),
             "active-journal" => {
                 let marker: BootstrapMarker =
                     serde_json::from_slice(&fs::read(root.path(MARKER_PATH)).unwrap()).unwrap();
@@ -444,26 +483,57 @@ fn current_marker_validation_refuses_missing_static_malformed_unsafe_and_config_
                     0o600,
                 );
             }
+            "malformed-journal" => {
+                write_mode(&root.path(JOURNAL_PATH), b"{malformed", 0o600);
+            }
+            "orphan-stage" => write_mode(
+                &root.path("/etc/howy/.howy-config-bridge-v2-deadbeef-orphan"),
+                b"retained\n",
+                0o600,
+            ),
+            "unexpected-manifest" => {
+                let marker = fs::read(root.path(MARKER_PATH)).unwrap();
+                ConfigBridge::rooted(&root.0).stash_release_n().unwrap();
+                write_mode(&root.path(MARKER_PATH), &marker, 0o600);
+            }
             _ => unreachable!(),
         }
         let marker_before = fs::read(root.path(MARKER_PATH)).ok();
         let config_before = fs::read(root.path(CONFIG_PATH)).ok();
         let journal_before = fs::read(root.path(JOURNAL_PATH)).ok();
+        let manifest_before = fs::read(root.path(MANIFEST_PATH)).ok();
+        let orphan_path = root.path("/etc/howy/.howy-config-bridge-v2-deadbeef-orphan");
+        let orphan_before = fs::read(&orphan_path).ok();
         assert!(
             ConfigBridge::rooted(&root.0)
                 .validate_current_marker()
                 .is_err(),
             "{failure} unexpectedly validated"
         );
+        assert!(
+            ConfigBridge::rooted(&root.0)
+                .validate_current_marker_structure()
+                .is_err(),
+            "{failure} unexpectedly passed structural validation"
+        );
         assert_eq!(fs::read(root.path(MARKER_PATH)).ok(), marker_before);
         assert_eq!(fs::read(root.path(CONFIG_PATH)).ok(), config_before);
         assert_eq!(fs::read(root.path(JOURNAL_PATH)).ok(), journal_before);
+        assert_eq!(fs::read(root.path(MANIFEST_PATH)).ok(), manifest_before);
+        assert_eq!(fs::read(orphan_path).ok(), orphan_before);
     }
 }
 
 #[test]
-fn current_marker_validation_refuses_wrong_generation_transaction_and_restored_target() {
-    for failure in ["generation", "transaction", "restored-target"] {
+fn both_marker_validators_refuse_invalid_generation_and_manifest_bindings() {
+    for failure in [
+        "generation",
+        "transaction",
+        "restored-target",
+        "missing-manifest",
+        "malformed-manifest",
+        "unrestored-manifest",
+    ] {
         let root = TestRoot::new();
         write_mode(&root.path(CONFIG_PATH), b"administrator=restored\n", 0o600);
         ConfigBridge::rooted(&root.0).stash_release_n().unwrap();
@@ -501,18 +571,41 @@ fn current_marker_validation_refuses_wrong_generation_transaction_and_restored_t
                     0o600,
                 );
             }
+            "missing-manifest" => fs::remove_file(root.path(MANIFEST_PATH)).unwrap(),
+            "malformed-manifest" => {
+                write_mode(&root.path(MANIFEST_PATH), b"{malformed", 0o600);
+            }
+            "unrestored-manifest" => {
+                let mut manifest = root.manifest();
+                let captured = match &manifest.active.state {
+                    GenerationState::Restored { captured, .. } => captured.as_ref().clone(),
+                    _ => panic!("expected restored generation"),
+                };
+                manifest.active.state = captured;
+                write_mode(
+                    &root.path(MANIFEST_PATH),
+                    &serialize_control(&manifest, "test manifest").unwrap(),
+                    0o600,
+                );
+            }
             _ => unreachable!(),
         }
         let marker = fs::read(root.path(MARKER_PATH)).unwrap();
-        let manifest = fs::read(root.path(MANIFEST_PATH)).unwrap();
+        let manifest = fs::read(root.path(MANIFEST_PATH)).ok();
         assert!(
             ConfigBridge::rooted(&root.0)
                 .validate_current_marker()
                 .is_err(),
             "{failure} unexpectedly validated"
         );
+        assert!(
+            ConfigBridge::rooted(&root.0)
+                .validate_current_marker_structure()
+                .is_err(),
+            "{failure} unexpectedly passed structural validation"
+        );
         assert_eq!(fs::read(root.path(MARKER_PATH)).unwrap(), marker);
-        assert_eq!(fs::read(root.path(MANIFEST_PATH)).unwrap(), manifest);
+        assert_eq!(fs::read(root.path(MANIFEST_PATH)).ok(), manifest);
     }
 }
 

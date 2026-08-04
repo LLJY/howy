@@ -685,10 +685,29 @@ impl ConfigBridge {
         self.recover_locked(true)
     }
 
-    /// Validate the existing positive package marker without creating,
-    /// replacing, or refreshing any bridge control.
+    /// Validate the existing positive package marker and bridge controls without
+    /// binding them to the current live configuration identity.
+    pub fn validate_current_marker_structure(&mut self) -> Result<()> {
+        self.begin()?;
+        self.validate_current_marker_structure_locked().map(|_| ())
+    }
+
+    /// Validate the existing positive package marker and its exact live config
+    /// binding without creating, replacing, or refreshing any bridge control.
     pub fn validate_current_marker(&mut self) -> Result<()> {
         self.begin()?;
+        let marker = self.validate_current_marker_structure_locked()?;
+        let live = self.snapshot_config_state()?;
+        validate_safe_completion_state(&live, self.paths.expected_uid, self.paths.expected_gid)?;
+        if !config_states_exact_match(&marker.config, &live) {
+            return Err(BridgeError::refused(
+                "package bootstrap marker does not bind the current config identity",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_current_marker_structure_locked(&self) -> Result<BootstrapMarker> {
         if let Some(journal) = self.read_path(JOURNAL_PATH, MAX_CONTROL_BYTES)? {
             require_control_file(
                 &journal,
@@ -711,22 +730,19 @@ impl ConfigBridge {
         let marker: BootstrapMarker = serde_json::from_slice(&marker_snapshot.bytes)
             .map_err(|_| BridgeError::refused("package bootstrap marker is malformed"))?;
         validate_marker(&marker)?;
-        let live = self.snapshot_config_state()?;
-        validate_safe_completion_state(&live, self.paths.expected_uid, self.paths.expected_gid)?;
-        if !config_states_exact_match(&marker.config, &live) {
-            return Err(BridgeError::refused(
-                "package bootstrap marker does not bind the current config identity",
-            ));
-        }
 
         match (marker.generation, self.read_manifest()?) {
-            (None, None) => Ok(()),
-            (None, Some(_)) => Err(BridgeError::refused(
-                "generation-free marker conflicts with an active bridge manifest",
-            )),
-            (Some(_), None) => Err(BridgeError::refused(
-                "generated marker is missing its bridge manifest",
-            )),
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(BridgeError::refused(
+                    "generation-free marker conflicts with an active bridge manifest",
+                ));
+            }
+            (Some(_), None) => {
+                return Err(BridgeError::refused(
+                    "generated marker is missing its bridge manifest",
+                ));
+            }
             (Some(generation), Some((manifest, _))) => {
                 let GenerationState::Restored {
                     restored_target,
@@ -746,9 +762,9 @@ impl ConfigBridge {
                         "package marker generation or restored-target binding is invalid",
                     ));
                 }
-                Ok(())
             }
         }
+        Ok(marker)
     }
 
     fn require_identity(&self) -> Result<()> {

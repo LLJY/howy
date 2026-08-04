@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "howy-cli"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "bincode",
@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "howy-common"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -764,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "howy-config-bridge"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "howy-common",
  "libc",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "howy-daemon"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "howy-pam"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "howy-common",
  "libc",
