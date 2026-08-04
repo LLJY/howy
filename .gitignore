@@ -62,3 +62,6 @@ __pycache__/
 /fp16-result*.json
 /fp16-experiment-root/
 /fp16-diagnostics*.txt
+
+# Local OpenCode coordination state
+/.opencode/workplan/
