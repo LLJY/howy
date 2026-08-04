@@ -41,7 +41,7 @@ _howy_prepared_update_exists() {
   esac
   [ -n "${_howy_source_version}" ] || return 1
   case "${_howy_target_package}" in howy-cpu|howy-rocm|howy-cuda) ;; *) return 1 ;; esac
-  [ "${_howy_target_version}" = 2.0.0-1 ] || return 1
+  [ "${_howy_target_version}" = 2.0.1-1 ] || return 1
 
   [ "${HOWY_V2_UPDATE_FORMAT-}" = "${_howy_format}" ] || return 1
   [ "${HOWY_V2_UPDATE_ARCHIVE-}" = "${_howy_archive}" ] || return 1

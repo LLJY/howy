@@ -4,7 +4,8 @@ set -euo pipefail
 export LC_ALL=C
 
 readonly SENTINEL_PATH='/run/howy-v2-update-v1.prepared'
-readonly TARGET_VERSION='2.0.0-1'
+readonly TARGET_VERSION='2.0.1-1'
+readonly PREVIOUS_STABLE_VERSION='2.0.0-1'
 
 refuse() {
     printf 'howy-v2-update-admission: refusal: %s\n' "$*" >&2
@@ -76,9 +77,13 @@ validate_sentinel() {
         refuse 'the prepared target package differs from the triggering package'
         return 1
     fi
-    if [[ "${source_version}" != "${TARGET_VERSION}" \
-        || "${target_version}" != "${TARGET_VERSION}" ]]; then
-        refuse 'the prepared source and target versions must both be 2.0.0-1'
+    if [[ "${target_version}" != "${TARGET_VERSION}" ]]; then
+        refuse 'the prepared target version must be 2.0.1-1'
+        return 1
+    fi
+    if [[ "${source_version}" != "${PREVIOUS_STABLE_VERSION}" \
+        && "${source_version}" != "${TARGET_VERSION}" ]]; then
+        refuse 'the prepared source version must be 2.0.0-1 or 2.0.1-1'
         return 1
     fi
 

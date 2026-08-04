@@ -5,7 +5,8 @@ umask 077
 export LC_ALL=C
 
 readonly UPDATE_FORMAT='howy-v2-update-v1'
-readonly TARGET_VERSION='2.0.0-1'
+readonly TARGET_VERSION='2.0.1-1'
+readonly PREVIOUS_STABLE_VERSION='2.0.0-1'
 readonly RELEASE_N_VERSION='0.1.0.r26.g2dfe39e-1'
 readonly CANDIDATE_MARKER_SHA256='a64bd401c902bff59ef60e5364b16ab148a1642fdd5bde60824586a9520ca246'
 readonly MAX_ARCHIVE_BYTES=4294967296
@@ -15,6 +16,8 @@ readonly RECEIPT_PATH='/var/lib/howy/security-state/receipt-v1.json'
 readonly MARKER_PATH='/var/lib/howy-package-bootstrap.complete'
 readonly BACKUP_PATH='/var/lib/howy/v2-update-backup-v1'
 readonly SENTINEL_PATH='/run/howy-v2-update-v1.prepared'
+readonly HOOK_OVERRIDE_DIR='/run/howy-v2-update-hook-override'
+readonly HOOK_OVERRIDE_PATH="${HOOK_OVERRIDE_DIR}/00-howy-update-admission.hook"
 
 ARCHIVE_PKGNAME=''
 ARCHIVE_PKGBASE=''
@@ -53,6 +56,8 @@ RETAINED_TARGET_PACKAGE=''
 RETAINED_TARGET_VERSION=''
 RETAINED_TRANSITION_KIND=''
 RESUME_INSTALLED_STATE=''
+HOOK_OVERRIDE_DIR_CREATED=0
+HOOK_OVERRIDE_LINK_CREATED=0
 
 refuse() {
     printf 'howy-v2-update: refusal: %s\n' "$*" >&2
@@ -137,7 +142,8 @@ transition_allowed() {
             ;;
         howy-cpu|howy-rocm|howy-cuda)
             [[ "${source_package}" == "${target_package}" \
-                && "${source_version}" == "${TARGET_VERSION}" ]] \
+                && ( "${source_version}" == "${PREVIOUS_STABLE_VERSION}" \
+                    || "${source_version}" == "${TARGET_VERSION}" ) ]] \
                 || return 1
             TRANSITION_KIND=stable
             ;;
@@ -182,6 +188,175 @@ backup_path_available() {
 path_is_absent() {
     local path="$1"
     [[ ! -e "${path}" && ! -L "${path}" ]]
+}
+
+hook_override_required() {
+    case "${SOURCE_PACKAGE}" in
+        howy-cpu|howy-rocm|howy-cuda) ;;
+        *) return 1 ;;
+    esac
+    [[ "${SOURCE_PACKAGE}" == "${ARCHIVE_PKGNAME}" \
+        && "${SOURCE_VERSION}" == "${PREVIOUS_STABLE_VERSION}" \
+        && "${ARCHIVE_PKGVER}" == "${TARGET_VERSION}" ]]
+}
+
+require_hook_override_paths_absent() {
+    if ! path_is_absent "${HOOK_OVERRIDE_DIR}"; then
+        refuse "the one-transaction hook override path already exists at ${HOOK_OVERRIDE_DIR}"
+        return 1
+    fi
+    if ! path_is_absent "${HOOK_OVERRIDE_PATH}"; then
+        refuse "the one-transaction admission-hook override already exists at ${HOOK_OVERRIDE_PATH}"
+        return 1
+    fi
+}
+
+preflight_hook_override_if_required() {
+    if ! hook_override_required; then
+        return 0
+    fi
+    require_hook_override_paths_absent
+}
+
+hook_override_directory_is_exact() {
+    local metadata
+
+    [[ -d "${HOOK_OVERRIDE_DIR}" && ! -L "${HOOK_OVERRIDE_DIR}" ]] || return 1
+    metadata=$(/usr/bin/stat -c '%u:%g:%a' -- "${HOOK_OVERRIDE_DIR}") || return 1
+    [[ "${metadata}" == '0:0:700' ]]
+}
+
+hook_override_state_is_exact() (
+    local metadata target
+    local -a entries=()
+
+    hook_override_directory_is_exact || return 1
+    shopt -s dotglob nullglob
+    entries=("${HOOK_OVERRIDE_DIR}"/*)
+    [[ "${#entries[@]}" -eq 1 && "${entries[0]}" == "${HOOK_OVERRIDE_PATH}" ]] \
+        || return 1
+    [[ -L "${HOOK_OVERRIDE_PATH}" ]] || return 1
+    target=$(/usr/bin/readlink -- "${HOOK_OVERRIDE_PATH}") || return 1
+    [[ "${target}" == /dev/null ]] || return 1
+    metadata=$(/usr/bin/stat -c '%u:%g' -- "${HOOK_OVERRIDE_PATH}") || return 1
+    [[ "${metadata}" == '0:0' ]]
+)
+
+create_hook_override_if_required() {
+    if ! hook_override_required; then
+        return 0
+    fi
+    if ! require_hook_override_paths_absent; then
+        return 1
+    fi
+    if ! /usr/bin/mkdir -m 0700 -- "${HOOK_OVERRIDE_DIR}"; then
+        refuse 'could not create the one-transaction hook override directory'
+        return 1
+    fi
+    HOOK_OVERRIDE_DIR_CREATED=1
+    if ! /usr/bin/chown root:root -- "${HOOK_OVERRIDE_DIR}" \
+        || ! /usr/bin/chmod 0700 -- "${HOOK_OVERRIDE_DIR}"; then
+        refuse 'could not set exact root:root mode 0700 hook override directory metadata'
+        return 1
+    fi
+    if ! hook_override_directory_is_exact; then
+        refuse 'the created hook override directory is not exact root:root mode 0700 state'
+        return 1
+    fi
+    if ! path_is_absent "${HOOK_OVERRIDE_PATH}"; then
+        refuse 'the admission-hook override path collided during creation'
+        return 1
+    fi
+    if ! /usr/bin/ln -s -- /dev/null "${HOOK_OVERRIDE_PATH}"; then
+        refuse 'could not create the one-transaction admission-hook override symlink'
+        return 1
+    fi
+    HOOK_OVERRIDE_LINK_CREATED=1
+    if ! /usr/bin/chown -h root:root -- "${HOOK_OVERRIDE_PATH}"; then
+        refuse 'could not set root ownership on the admission-hook override symlink'
+        return 1
+    fi
+    if ! hook_override_state_is_exact; then
+        refuse 'the created admission-hook override is not the exact root-owned /dev/null symlink'
+        return 1
+    fi
+}
+
+cleanup_hook_override() {
+    local metadata target
+    local status=0 link_cleanup_complete=1
+
+    if [[ "${HOOK_OVERRIDE_LINK_CREATED}" -eq 1 ]]; then
+        if [[ ! -L "${HOOK_OVERRIDE_PATH}" ]]; then
+            printf 'howy-v2-update: warning: expected hook override symlink is missing or changed at %s; retaining override directory.\n' \
+                "${HOOK_OVERRIDE_PATH}" >&2
+            status=1
+            link_cleanup_complete=0
+        elif ! target=$(/usr/bin/readlink -- "${HOOK_OVERRIDE_PATH}") \
+            || [[ "${target}" != /dev/null ]]; then
+            printf 'howy-v2-update: warning: hook override symlink target changed at %s; refusing cleanup.\n' \
+                "${HOOK_OVERRIDE_PATH}" >&2
+            status=1
+            link_cleanup_complete=0
+        elif ! metadata=$(/usr/bin/stat -c '%u:%g' -- "${HOOK_OVERRIDE_PATH}") \
+            || [[ "${metadata}" != '0:0' ]]; then
+            printf 'howy-v2-update: warning: hook override symlink ownership changed at %s; refusing cleanup.\n' \
+                "${HOOK_OVERRIDE_PATH}" >&2
+            status=1
+            link_cleanup_complete=0
+        elif ! /usr/bin/rm -- "${HOOK_OVERRIDE_PATH}"; then
+            printf 'howy-v2-update: warning: could not remove exact hook override symlink at %s.\n' \
+                "${HOOK_OVERRIDE_PATH}" >&2
+            status=1
+            link_cleanup_complete=0
+        else
+            HOOK_OVERRIDE_LINK_CREATED=0
+        fi
+    fi
+
+    if [[ "${HOOK_OVERRIDE_DIR_CREATED}" -eq 1 \
+        && "${link_cleanup_complete}" -eq 1 ]]; then
+        if ! path_is_absent "${HOOK_OVERRIDE_PATH}"; then
+            printf 'howy-v2-update: warning: unexpected admission-hook override state remains at %s; refusing directory cleanup.\n' \
+                "${HOOK_OVERRIDE_PATH}" >&2
+            status=1
+        elif ! hook_override_directory_is_exact; then
+            printf 'howy-v2-update: warning: hook override directory metadata changed at %s; refusing cleanup.\n' \
+                "${HOOK_OVERRIDE_DIR}" >&2
+            status=1
+        elif ! /usr/bin/rmdir -- "${HOOK_OVERRIDE_DIR}"; then
+            printf 'howy-v2-update: warning: hook override directory is not empty or could not be removed at %s.\n' \
+                "${HOOK_OVERRIDE_DIR}" >&2
+            status=1
+        else
+            HOOK_OVERRIDE_DIR_CREATED=0
+        fi
+    fi
+
+    if [[ "${status}" -ne 0 ]]; then
+        printf 'howy-v2-update: warning: one-transaction hook override cleanup is incomplete; inspect retained state under %s.\n' \
+            "${HOOK_OVERRIDE_DIR}" >&2
+    fi
+    return "${status}"
+}
+
+run_pacman_update() {
+    local -a hookdir_args=()
+
+    if hook_override_required; then
+        if [[ "${HOOK_OVERRIDE_DIR_CREATED}:${HOOK_OVERRIDE_LINK_CREATED}" != '1:1' \
+            ]] || ! hook_override_state_is_exact; then
+            refuse 'the exact v2.0.0 compatibility hook override is not prepared'
+            return 1
+        fi
+        hookdir_args=(--hookdir "${HOOK_OVERRIDE_DIR}")
+    elif [[ "${HOOK_OVERRIDE_DIR_CREATED}:${HOOK_OVERRIDE_LINK_CREATED}" != '0:0' ]]; then
+        refuse 'a hook override was created for a transition that must use normal hooks'
+        return 1
+    fi
+
+    /usr/bin/pacman "${hookdir_args[@]}" \
+        --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"
 }
 
 require_snapshot_file() {
@@ -362,7 +537,7 @@ validate_archive() {
         return 1
     fi
     if ! parse_pkginfo_text "${pkginfo}"; then
-        refuse 'the archive metadata is not an exact stable Howy 2.0.0-1 x86_64 package'
+        refuse 'the archive metadata is not an exact stable Howy 2.0.1-1 x86_64 package'
         return 1
     fi
     if ! digest_output=$(/usr/bin/sha256sum -- "${canonical}"); then
@@ -488,8 +663,10 @@ preflight_transition_state() {
             fi
             ;;
         stable)
-            if ! /usr/lib/howy/howy-config-bridge validate-current-marker; then
-                refuse 'the installed stable config bridge could not validate the current marker, configuration, and generation binding'
+            if ! /usr/lib/howy/howy-config-bridge validate-current-marker-structure \
+                    2>/dev/null \
+                && ! /usr/lib/howy/howy-config-bridge validate-current-marker; then
+                refuse 'the installed stable config bridge could not validate the current marker structure and generation binding'
                 return 1
             fi
             if ! /usr/lib/howy/howy-config-bridge stash-release-n; then
@@ -822,7 +999,8 @@ classify_retained_resume_state() {
     installed_package=${SOURCE_PACKAGE}
     installed_version=${SOURCE_VERSION}
 
-    if [[ "${RETAINED_SOURCE_PACKAGE}" == "${ARCHIVE_PKGNAME}" ]]; then
+    if [[ "${RETAINED_SOURCE_PACKAGE}:${RETAINED_SOURCE_VERSION}" == \
+            "${ARCHIVE_PKGNAME}:${ARCHIVE_PKGVER}" ]]; then
         [[ "${installed_package}:${installed_version}" == \
             "${ARCHIVE_PKGNAME}:${ARCHIVE_PKGVER}" ]] || return 1
         RESUME_INSTALLED_STATE=target
@@ -979,6 +1157,17 @@ cleanup_sentinel() {
     fi
 }
 
+cleanup_runtime_state() {
+    local exit_status=$?
+
+    trap - EXIT
+    if ! cleanup_hook_override; then
+        exit_status=1
+    fi
+    cleanup_sentinel
+    exit "${exit_status}"
+}
+
 verify_installed_result() {
     local version installed_package installed_version
     local original_source_package="${SOURCE_PACKAGE}"
@@ -1098,6 +1287,9 @@ resume_retained_update() {
     if ! admit_retained_backup_resume; then
         return 1
     fi
+    if ! preflight_hook_override_if_required; then
+        return 1
+    fi
     if ! stop_units; then
         retain_failure 'could not stop and prove both Howy units inactive during resumed finalization'
         return 1
@@ -1110,6 +1302,10 @@ resume_retained_update() {
         retain_failure 'could not create the root-only prepared sentinel for resume'
         return 1
     fi
+    if ! create_hook_override_if_required; then
+        retain_failure 'could not create the exact v2.0.0 admission-hook compatibility override for resume'
+        return 1
+    fi
     if ! HOWY_V2_UPDATE_FORMAT="${UPDATE_FORMAT}" \
         HOWY_V2_UPDATE_ARCHIVE="${ARCHIVE_PATH}" \
         HOWY_V2_UPDATE_ARCHIVE_SHA256="${ARCHIVE_SHA256}" \
@@ -1117,8 +1313,12 @@ resume_retained_update() {
         HOWY_V2_UPDATE_SOURCE_VERSION="${SOURCE_VERSION}" \
         HOWY_V2_UPDATE_TARGET_PACKAGE="${ARCHIVE_PKGNAME}" \
         HOWY_V2_UPDATE_TARGET_VERSION="${ARCHIVE_PKGVER}" \
-        /usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"; then
+        run_pacman_update; then
         retain_failure 'pacman -U failed during resume'
+        return 1
+    fi
+    if ! cleanup_hook_override; then
+        retain_failure 'could not remove the exact v2.0.0 admission-hook compatibility override after resumed pacman'
         return 1
     fi
     if ! /usr/bin/rm -f -- "${SENTINEL_PATH}"; then
@@ -1153,7 +1353,7 @@ main() {
         refuse 'this updater must run as root'
         return 1
     fi
-    trap cleanup_sentinel EXIT
+    trap cleanup_runtime_state EXIT
 
     if ! validate_archive "$1"; then
         return 1
@@ -1177,6 +1377,9 @@ main() {
     fi
     if ! transition_allowed "${SOURCE_PACKAGE}" "${SOURCE_VERSION}" "${ARCHIVE_PKGNAME}"; then
         refuse "unsupported transition ${SOURCE_PACKAGE} ${SOURCE_VERSION} -> ${ARCHIVE_PKGNAME} ${ARCHIVE_PKGVER}"
+        return 1
+    fi
+    if ! preflight_hook_override_if_required; then
         return 1
     fi
     if ! preflight_transition_state; then
@@ -1206,6 +1409,10 @@ main() {
         retain_failure 'could not create the root-only prepared sentinel'
         return 1
     fi
+    if ! create_hook_override_if_required; then
+        retain_failure 'could not create the exact v2.0.0 admission-hook compatibility override'
+        return 1
+    fi
     if ! HOWY_V2_UPDATE_FORMAT="${UPDATE_FORMAT}" \
         HOWY_V2_UPDATE_ARCHIVE="${ARCHIVE_PATH}" \
         HOWY_V2_UPDATE_ARCHIVE_SHA256="${ARCHIVE_SHA256}" \
@@ -1213,8 +1420,12 @@ main() {
         HOWY_V2_UPDATE_SOURCE_VERSION="${SOURCE_VERSION}" \
         HOWY_V2_UPDATE_TARGET_PACKAGE="${ARCHIVE_PKGNAME}" \
         HOWY_V2_UPDATE_TARGET_VERSION="${ARCHIVE_PKGVER}" \
-        /usr/bin/pacman --ask=4 -U --noconfirm -- "${ARCHIVE_PATH}"; then
+        run_pacman_update; then
         retain_failure 'pacman -U failed'
+        return 1
+    fi
+    if ! cleanup_hook_override; then
+        retain_failure 'could not remove the exact v2.0.0 admission-hook compatibility override after pacman'
         return 1
     fi
     if ! post_pacman_steps; then

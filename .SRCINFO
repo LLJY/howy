@@ -1,6 +1,6 @@
 pkgbase = howy
 	pkgdesc = Linux face authentication daemon — a howdy replacement
-	pkgver = 2.0.0
+	pkgver = 2.0.1
 	pkgrel = 1
 	url = https://github.com/LLJY/howy
 	arch = x86_64
@@ -27,8 +27,8 @@ pkgname = howy-cpu
 	optdepends = uv: run the bundled howy-enroll helper
 	optdepends = v4l-utils: inspect and tune camera controls
 	optdepends = tpm2-tss: TPM-backed systemd credential provisioning
-	provides = howy=2.0.0
-	provides = howdy=2.0.0
+	provides = howy=2.0.1
+	provides = howdy=2.0.1
 	conflicts = howy
 	conflicts = howy-git
 	conflicts = howy-cpu-git
@@ -54,8 +54,8 @@ pkgname = howy-rocm
 	optdepends = uv: run the bundled howy-enroll helper
 	optdepends = v4l-utils: inspect and tune camera controls
 	optdepends = tpm2-tss: TPM-backed systemd credential provisioning
-	provides = howy=2.0.0
-	provides = howdy=2.0.0
+	provides = howy=2.0.1
+	provides = howdy=2.0.1
 	conflicts = howy
 	conflicts = howy-git
 	conflicts = howy-cpu-git
@@ -81,8 +81,8 @@ pkgname = howy-cuda
 	optdepends = uv: run the bundled howy-enroll helper
 	optdepends = v4l-utils: inspect and tune camera controls
 	optdepends = tpm2-tss: TPM-backed systemd credential provisioning
-	provides = howy=2.0.0
-	provides = howdy=2.0.0
+	provides = howy=2.0.1
+	provides = howdy=2.0.1
 	conflicts = howy
 	conflicts = howy-git
 	conflicts = howy-cpu-git

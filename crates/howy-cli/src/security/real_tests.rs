@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 use crate::security::engine::{
-    CleanupRequest, ProvisionMode, ProvisionPresence, ProvisionRequest, SecretKeyMaterial,
-    SecurityEngine, SecurityRuntime,
+    CleanupRequest, PAM_PROMPT_SUDOERS_BYTES, PAM_PROMPT_SUDOERS_PATH, ProvisionMode,
+    ProvisionPresence, ProvisionRequest, SecretKeyMaterial, SecurityEngine, SecurityRuntime,
 };
 use howy_common::config::EmbeddingSecurityMode;
 use howy_common::provisioning::{JournalPhase, MAX_RECEIPT_BYTES, SECURITY_RECEIPT_PATH};
@@ -168,7 +168,7 @@ fn transient_cleanup_does_not_hide_stop_failure_behind_loaded_dead_state() {
 #[test]
 fn child_transport_is_exact_concurrent_and_environment_free() {
     let input = b"credential-input";
-    let runtime = RealSecurityRuntime::new();
+    let mut runtime = RealSecurityRuntime::new();
     let output = runtime
         .run(
             &perl_spec(
@@ -192,6 +192,17 @@ fn child_transport_is_exact_concurrent_and_environment_free() {
         .unwrap()
         .into_stdout();
     assert_eq!(environment, b"0");
+
+    let checked = runtime
+        .run_checked_command(&perl_spec(
+            "print STDOUT qq(checked);",
+            0,
+            7,
+            0,
+            Duration::from_secs(2),
+        ))
+        .unwrap();
+    assert_eq!(checked, b"checked");
 }
 
 #[test]
@@ -1832,6 +1843,8 @@ struct RootedEngineRuntime {
     transient_present: bool,
     pre_guard_mutation: Option<&'static str>,
     fail_guard_transition_journal: bool,
+    checked_commands: Vec<CommandSpec>,
+    checked_command_failure: bool,
 }
 
 impl RootedEngineRuntime {
@@ -1851,6 +1864,8 @@ impl RootedEngineRuntime {
             transient_present: false,
             pre_guard_mutation: None,
             fail_guard_transition_journal: false,
+            checked_commands: Vec::new(),
+            checked_command_failure: false,
         }
     }
 
@@ -2319,6 +2334,16 @@ impl SecurityRuntime for RootedEngineRuntime {
             .map_err(|error| SecurityError::operation(error.to_string()))
     }
 
+    fn run_checked_command(&mut self, command: &CommandSpec) -> SecurityResult<Vec<u8>> {
+        self.events.push("checked-command".into());
+        self.checked_commands.push(command.clone());
+        if self.checked_command_failure {
+            Err(SecurityError::operation("rooted checked command failure"))
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     fn preview_verifier(&mut self, config: &[u8]) -> SecurityResult<VerifierResultV1> {
         self.fs.preview_verifier(config)
     }
@@ -2411,7 +2436,7 @@ impl SecurityRuntime for RootedEngineRuntime {
 
 fn prepare_rooted_engine(root: &Path) -> RootedEngineRuntime {
     prepare_rooted_production_parents(root);
-    for path in ["usr/bin", "var/lib/systemd"] {
+    for path in ["etc/sudoers.d", "usr/bin", "var/lib/systemd"] {
         let path = root.join(path);
         fs::create_dir_all(&path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2428,6 +2453,154 @@ fn prepare_rooted_engine(root: &Path) -> RootedEngineRuntime {
     );
     write_mode(&root.join("usr/bin/howyd"), b"rooted-fake-howyd", 0o755);
     RootedEngineRuntime::new(root)
+}
+
+#[test]
+fn rooted_set_presence_uses_real_atomic_exchange_without_journal_or_guard() {
+    if !run_root_owned_branch(
+        "security::real::tests::rooted_set_presence_uses_real_atomic_exchange_without_journal_or_guard",
+    ) {
+        return;
+    }
+    let root = AtomicTempDir::new();
+    let mut runtime = prepare_rooted_engine(&root.0);
+    fs::set_permissions(
+        root.0.join("etc/sudoers.d"),
+        fs::Permissions::from_mode(0o750),
+    )
+    .unwrap();
+    let config_directory = root.0.join("etc/howy");
+    fs::create_dir_all(&config_directory).unwrap();
+    fs::set_permissions(&config_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let config_path = config_directory.join("config.toml");
+    let mut config = HowyConfig::legacy_defaults();
+    config.presence.allowed_pam_services = vec!["login".into()];
+    write_mode(
+        &config_path,
+        toml::to_string_pretty(&config).unwrap().as_bytes(),
+        0o600,
+    );
+    runtime.service = rooted_unit(UnitKind::Service, true);
+    runtime.socket = rooted_unit(UnitKind::Socket, true);
+    let service = runtime.service;
+    let socket = runtime.socket;
+
+    SecurityEngine::new(&mut runtime)
+        .set_presence(ProvisionPresence::Confirm)
+        .unwrap();
+
+    let bytes = fs::read(&config_path).unwrap();
+    let config: HowyConfig = toml::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+    assert_eq!(
+        config.presence.mode,
+        howy_common::config::PresenceMode::Confirm
+    );
+    assert_eq!(config.presence.allowed_pam_services, ["login", "sudo"]);
+    assert_eq!(fs::metadata(&config_path).unwrap().mode() & 0o7777, 0o600);
+    let sudoers_path = root.0.join(PAM_PROMPT_SUDOERS_PATH.trim_start_matches('/'));
+    assert_eq!(fs::read(&sudoers_path).unwrap(), PAM_PROMPT_SUDOERS_BYTES);
+    let sudoers_metadata = fs::metadata(&sudoers_path).unwrap();
+    assert_eq!(sudoers_metadata.uid(), 0);
+    assert_eq!(sudoers_metadata.gid(), 0);
+    assert_eq!(sudoers_metadata.mode() & 0o7777, 0o440);
+    assert_eq!(sudoers_metadata.nlink(), 1);
+    let sudoers_inode = sudoers_metadata.ino();
+    assert_eq!(
+        runtime.checked_commands,
+        [command::visudo_validation_command()]
+    );
+
+    let outcome = SecurityEngine::new(&mut runtime)
+        .set_presence(ProvisionPresence::Confirm)
+        .unwrap();
+    assert!(outcome.messages[0].contains("retained and validated"));
+    assert_eq!(fs::metadata(&sudoers_path).unwrap().ino(), sudoers_inode);
+    assert_eq!(runtime.checked_commands.len(), 2);
+
+    let outcome = SecurityEngine::new(&mut runtime)
+        .set_presence(ProvisionPresence::Off)
+        .unwrap();
+    assert!(outcome.messages[0].contains("removed managed sudoers override"));
+    assert!(!sudoers_path.exists());
+    let outcome = SecurityEngine::new(&mut runtime)
+        .set_presence(ProvisionPresence::Off)
+        .unwrap();
+    assert!(outcome.messages[0].contains("no changes made"));
+    assert!(!sudoers_path.exists());
+    assert_eq!(runtime.service, service);
+    assert_eq!(runtime.socket, socket);
+    assert!(
+        !root
+            .0
+            .join(SECURITY_JOURNAL_PATH.trim_start_matches('/'))
+            .exists()
+    );
+    assert!(
+        !root
+            .0
+            .join(SECURITY_TRANSACTION_GUARD_PATH.trim_start_matches('/'))
+            .exists()
+    );
+    assert!(runtime.events.iter().all(|event| {
+        !matches!(
+            event.as_str(),
+            "journal-write-any" | "guard-create" | "transient-stop"
+        )
+    }));
+}
+
+#[test]
+fn rooted_set_presence_retains_drift_and_cleans_new_override_on_visudo_failure() {
+    if !run_root_owned_branch(
+        "security::real::tests::rooted_set_presence_retains_drift_and_cleans_new_override_on_visudo_failure",
+    ) {
+        return;
+    }
+
+    let failed_root = AtomicTempDir::new();
+    let mut failed = prepare_rooted_engine(&failed_root.0);
+    let config_directory = failed_root.0.join("etc/howy");
+    fs::create_dir_all(&config_directory).unwrap();
+    fs::set_permissions(&config_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let config_path = config_directory.join("config.toml");
+    let config_bytes = toml::to_string_pretty(&HowyConfig::legacy_defaults()).unwrap();
+    write_mode(&config_path, config_bytes.as_bytes(), 0o600);
+    let config_before = fs::read(&config_path).unwrap();
+    failed.checked_command_failure = true;
+    assert!(matches!(
+        SecurityEngine::new(&mut failed).set_presence(ProvisionPresence::Confirm),
+        Err(SecurityError::Refused(_))
+    ));
+    assert_eq!(fs::read(&config_path).unwrap(), config_before);
+    assert!(
+        !failed_root
+            .0
+            .join(PAM_PROMPT_SUDOERS_PATH.trim_start_matches('/'))
+            .exists()
+    );
+    assert_eq!(failed.checked_commands.len(), 1);
+
+    let drift_root = AtomicTempDir::new();
+    let mut drift = prepare_rooted_engine(&drift_root.0);
+    let config_directory = drift_root.0.join("etc/howy");
+    fs::create_dir_all(&config_directory).unwrap();
+    fs::set_permissions(&config_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let config_path = config_directory.join("config.toml");
+    write_mode(&config_path, config_bytes.as_bytes(), 0o600);
+    let sudoers_path = drift_root
+        .0
+        .join(PAM_PROMPT_SUDOERS_PATH.trim_start_matches('/'));
+    write_mode(&sudoers_path, PAM_PROMPT_SUDOERS_BYTES, 0o400);
+    let drift_inode = fs::metadata(&sudoers_path).unwrap().ino();
+    assert!(matches!(
+        SecurityEngine::new(&mut drift).set_presence(ProvisionPresence::Confirm),
+        Err(SecurityError::Refused(_))
+    ));
+    assert_eq!(fs::read(&config_path).unwrap(), config_before);
+    assert_eq!(fs::read(&sudoers_path).unwrap(), PAM_PROMPT_SUDOERS_BYTES);
+    assert_eq!(fs::metadata(&sudoers_path).unwrap().ino(), drift_inode);
+    assert_eq!(fs::metadata(&sudoers_path).unwrap().mode() & 0o7777, 0o400);
+    assert!(drift.checked_commands.is_empty());
 }
 
 fn prepare_rooted_unadopted(root: &Path) -> (RootedEngineRuntime, Sha256Digest) {

@@ -26,9 +26,9 @@ use howy_common::provisioning::{
 use super::command::{CommandSpec, KeySelection};
 use super::engine::{
     AtomicTargetObservation, AtomicWriteReconciliation, CleanupRequest, MODE0_DROPIN_BYTES,
-    MODE1_DROPIN_BYTES, ObservedFile, ProvisionMode, ProvisionPresence, ProvisionRequest,
-    SecretKeyMaterial, SecurityEngine, SecurityError, SecurityOutcome, SecurityResult,
-    SecurityRuntime, receipt_matches_live,
+    MODE1_DROPIN_BYTES, ObservedFile, PAM_PROMPT_SUDOERS_BYTES, PAM_PROMPT_SUDOERS_PATH,
+    ProvisionMode, ProvisionPresence, ProvisionRequest, SecretKeyMaterial, SecurityEngine,
+    SecurityError, SecurityOutcome, SecurityResult, SecurityRuntime, receipt_matches_live,
 };
 
 #[derive(Clone)]
@@ -88,6 +88,8 @@ struct FakeRuntime {
     socket: UnitObservation,
     events: Vec<String>,
     commands: Vec<CommandSpec>,
+    checked_command_output: Vec<u8>,
+    checked_command_error: Option<SecurityError>,
     credential_input_lengths: Vec<usize>,
     envelope: Vec<u8>,
     namespace_nonempty: bool,
@@ -149,6 +151,8 @@ impl FakeRuntime {
             socket: unit(UnitKind::Socket, false),
             events: Vec::new(),
             commands: Vec::new(),
+            checked_command_output: Vec::new(),
+            checked_command_error: None,
             credential_input_lengths: Vec::new(),
             envelope: host_envelope_text(),
             namespace_nonempty: false,
@@ -558,8 +562,24 @@ impl SecurityRuntime for FakeRuntime {
             && plan.gid == 0
             && plan.permissions == 0o600
             && bytes == MODE0_DROPIN_BYTES;
+        let managed_sudoers = plan.target_path == PAM_PROMPT_SUDOERS_PATH
+            && plan.operation == AtomicWriteKindV1::NoReplace
+            && matches!(plan.expected_target, AtomicExpectedTargetV1::Absent)
+            && plan.uid == 0
+            && plan.gid == 0
+            && plan.permissions == 0o440
+            && bytes == PAM_PROMPT_SUDOERS_BYTES;
+        let presence_config = plan.target_path == howy_common::paths::CONFIG_FILE
+            && plan.operation == AtomicWriteKindV1::Exchange
+            && matches!(plan.expected_target, AtomicExpectedTargetV1::Present(_))
+            && plan.uid == 0
+            && plan.gid == 0
+            && plan.permissions == 0o600
+            && !self.files.contains_key(SECURITY_JOURNAL_PATH);
         let journaled = package_receipt
             || package_mode0
+            || managed_sudoers
+            || presence_config
             || self
                 .files
                 .get(SECURITY_JOURNAL_PATH)
@@ -598,6 +618,13 @@ impl SecurityRuntime for FakeRuntime {
         let package_mode0 = plan.target_path == MODE1_DROPIN_PATH
             && plan.operation == AtomicWriteKindV1::NoReplace
             && matches!(plan.expected_target, AtomicExpectedTargetV1::Absent);
+        let unjournaled_receipt = plan.target_path == SECURITY_RECEIPT_PATH
+            && plan.operation == AtomicWriteKindV1::Exchange
+            && matches!(plan.expected_target, AtomicExpectedTargetV1::Present(_))
+            && !self.files.contains_key(SECURITY_JOURNAL_PATH);
+        if unjournaled_receipt {
+            self.fail_after("presence-receipt-before-rename")?;
+        }
         if package_mode0 {
             if let Some(bytes) = self.package_mode0_target_occupancy.take() {
                 self.put(&plan.target_path, &bytes, 0o600);
@@ -655,6 +682,11 @@ impl SecurityRuntime for FakeRuntime {
             } else {
                 self.fail_after("receipt-write")?;
             }
+            if self.fail_after == Some("presence-receipt-indeterminate") {
+                return Err(SecurityError::Uncertain(
+                    "injected indeterminate presence receipt publication".into(),
+                ));
+            }
             if self.mutate_receipt_bytes_after_package_publication {
                 self.mutate_receipt_bytes_after_package_publication = false;
                 let receipt = self.files.get_mut(SECURITY_RECEIPT_PATH).unwrap();
@@ -682,6 +714,12 @@ impl SecurityRuntime for FakeRuntime {
         plan: &AtomicWritePlanV1,
         staged: Option<&AtomicFileIdentityV1>,
     ) -> SecurityResult<AtomicWriteReconciliation> {
+        if self.fail_after == Some("presence-receipt-indeterminate") {
+            self.fail_after = None;
+            return Err(SecurityError::Uncertain(
+                "injected presence receipt reconciliation failure".into(),
+            ));
+        }
         let target = self
             .files
             .get(&plan.target_path)
@@ -745,6 +783,23 @@ impl SecurityRuntime for FakeRuntime {
         if plan.target_path == SECURITY_RECEIPT_PATH {
             self.fail_after("package-receipt-backup-cleanup")?;
         }
+        if plan.operation == AtomicWriteKindV1::NoReplace {
+            if observation.backup.is_some() || plan.backup_path.is_some() {
+                return Err(SecurityError::operation(
+                    "fake no-replace publication unexpectedly has backup",
+                ));
+            }
+            let target = self
+                .files
+                .get(&plan.target_path)
+                .ok_or_else(|| SecurityError::operation("fake target disappeared"))?
+                .observed()
+                .atomic_identity();
+            if target != observation.target {
+                return Err(SecurityError::Uncertain("fake target changed".into()));
+            }
+            return Ok(());
+        }
         let backup = observation
             .backup
             .as_ref()
@@ -768,6 +823,9 @@ impl SecurityRuntime for FakeRuntime {
         expected: &AtomicFileIdentityV1,
     ) -> SecurityResult<()> {
         self.events.push(format!("remove-exact:{path}"));
+        if path == PAM_PROMPT_SUDOERS_PATH {
+            self.fail_after("managed-sudoers-remove")?;
+        }
         let live = self
             .files
             .get(path)
@@ -1249,6 +1307,20 @@ impl SecurityRuntime for FakeRuntime {
         Ok(output)
     }
 
+    fn run_checked_command(&mut self, command: &CommandSpec) -> SecurityResult<Vec<u8>> {
+        self.events.push("checked-command".into());
+        self.commands.push(command.clone());
+        if let Some(error) = self.checked_command_error.clone() {
+            return Err(error);
+        }
+        if self.checked_command_output.len() > command.stdout_cap {
+            return Err(SecurityError::operation(
+                "fake checked command exceeded stdout cap",
+            ));
+        }
+        Ok(self.checked_command_output.clone())
+    }
+
     fn preview_verifier(&mut self, config: &[u8]) -> SecurityResult<VerifierResultV1> {
         self.events.push("preview-verifier".into());
         Ok(self.verifier_for(config))
@@ -1724,24 +1796,41 @@ fn mode2_refuses_before_lock_or_any_persistent_side_effect() {
 }
 
 #[test]
-fn mode0_confirm_refuses_before_any_durable_or_key_mutation() {
+fn fresh_mode0_confirm_provisions_without_key_mutation() {
     let mut runtime = FakeRuntime::fresh();
-    let result = SecurityEngine::new(&mut runtime).provision(ProvisionRequest {
-        mode: ProvisionMode::Plaintext,
-        presence: ProvisionPresence::Confirm,
-        with_key: KeySelection::Auto,
-        adopt_existing: false,
-        confirmed: true,
-    });
+    SecurityEngine::new(&mut runtime)
+        .provision(ProvisionRequest {
+            mode: ProvisionMode::Plaintext,
+            presence: ProvisionPresence::Confirm,
+            with_key: KeySelection::Auto,
+            adopt_existing: false,
+            confirmed: true,
+        })
+        .unwrap();
 
-    assert!(matches!(result, Err(SecurityError::Refused(_))));
-    assert_eq!(runtime.events, ["require-root"]);
-    assert!(!runtime.locked);
-    assert_eq!(runtime.transaction_id_counter, 0);
-    assert!(runtime.directories.is_empty());
+    let config: HowyConfig = toml::from_str(
+        std::str::from_utf8(&runtime.files[howy_common::paths::CONFIG_FILE].bytes).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        config.security.embedding_mode,
+        EmbeddingSecurityMode::Plaintext
+    );
+    assert_eq!(
+        config.presence.mode,
+        howy_common::config::PresenceMode::Confirm
+    );
+    assert_eq!(config.presence.allowed_pam_services, ["sudo"]);
+    assert!(runtime.locked);
     assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
     assert!(!runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
     assert!(!runtime.files.contains_key(MODE1_CREDENTIAL_PATH));
+    assert!(runtime.events.iter().all(|event| {
+        !matches!(
+            event.as_str(),
+            "rng-mlock" | "systemd-creds" | "systemd-run"
+        )
+    }));
 }
 
 #[test]
@@ -1864,7 +1953,7 @@ fn mode1_presence_controls_allowlist_and_receipts_disabled_and_enabled_configs()
 
     let mut confirm = FakeRuntime::fresh();
     let mut prior = HowyConfig::legacy_defaults();
-    prior.presence.allowed_pam_services.clear();
+    prior.presence.allowed_pam_services = vec!["login".into()];
     let prior = toml::to_string_pretty(&prior).unwrap();
     confirm.put(howy_common::paths::CONFIG_FILE, prior.as_bytes(), 0o600);
     provision_with_presence(&mut confirm, ProvisionPresence::Confirm).unwrap();
@@ -1876,7 +1965,698 @@ fn mode1_presence_controls_allowlist_and_receipts_disabled_and_enabled_configs()
         config.presence.mode,
         howy_common::config::PresenceMode::Confirm
     );
-    assert_eq!(config.presence.allowed_pam_services, ["sudo"]);
+    assert_eq!(config.presence.allowed_pam_services, ["login", "sudo"]);
+}
+
+#[test]
+fn set_presence_toggles_enabled_and_disabled_mode0_without_changing_other_fields() {
+    for disabled in [false, true] {
+        let mut runtime = FakeRuntime::fresh();
+        let mut config = HowyConfig::legacy_defaults();
+        config.core.disabled = disabled;
+        config.ml.provider = "cpu".into();
+        config.presence.allowed_pam_services = vec!["login".into()];
+        let original = config.clone();
+        let bytes = toml::to_string_pretty(&config).unwrap();
+        runtime.put(howy_common::paths::CONFIG_FILE, bytes.as_bytes(), 0o600);
+
+        let outcome = SecurityEngine::new(&mut runtime)
+            .set_presence(ProvisionPresence::Confirm)
+            .unwrap();
+        assert!(outcome.messages[0].contains("created managed sudoers override"));
+        let confirmed: HowyConfig = toml::from_str(
+            std::str::from_utf8(&runtime.files[howy_common::paths::CONFIG_FILE].bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(confirmed.core.disabled, disabled);
+        assert_eq!(confirmed.ml.provider, original.ml.provider);
+        assert_eq!(confirmed.security, original.security);
+        assert_eq!(confirmed.presence.allowed_pam_services, ["login", "sudo"]);
+
+        SecurityEngine::new(&mut runtime)
+            .set_presence(ProvisionPresence::Off)
+            .unwrap();
+        let off: HowyConfig = toml::from_str(
+            std::str::from_utf8(&runtime.files[howy_common::paths::CONFIG_FILE].bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(off.presence.mode, howy_common::config::PresenceMode::Off);
+        assert_eq!(off.presence.allowed_pam_services, ["login", "sudo"]);
+        assert_eq!(off.core.disabled, disabled);
+        assert!(!runtime.files.contains_key(SECURITY_RECEIPT_PATH));
+        assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+        assert!(!runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
+        assert!(runtime.files.keys().all(|path| !path.ends_with(".stage")));
+    }
+}
+
+#[test]
+fn set_presence_rebuilds_disabled_and_enabled_receipts_preserving_all_other_evidence() {
+    for enabled in [false, true] {
+        let mut runtime = FakeRuntime::fresh();
+        let mut config = HowyConfig::legacy_defaults();
+        config.presence.allowed_pam_services = vec!["login".into()];
+        let bytes = toml::to_string_pretty(&config).unwrap();
+        runtime.put(howy_common::paths::CONFIG_FILE, bytes.as_bytes(), 0o600);
+        provision_with_presence(&mut runtime, ProvisionPresence::Off).unwrap();
+        if enabled {
+            SecurityEngine::new(&mut runtime).enable().unwrap();
+        }
+        let old_receipt = runtime.receipt();
+        let old_artifact = runtime.files[MODE1_CREDENTIAL_PATH].observed();
+        let old_dropin = runtime.files[MODE1_DROPIN_PATH].observed();
+        runtime.events.clear();
+
+        SecurityEngine::new(&mut runtime)
+            .set_presence(ProvisionPresence::Confirm)
+            .unwrap();
+        let rebuilt = runtime.receipt();
+        assert_eq!(rebuilt.state, old_receipt.state);
+        assert_eq!(rebuilt.transaction_id, old_receipt.transaction_id);
+        assert_eq!(rebuilt.mode, old_receipt.mode);
+        assert_eq!(rebuilt.epoch, old_receipt.epoch);
+        assert_eq!(rebuilt.credential_name, old_receipt.credential_name);
+        assert_eq!(rebuilt.artifact, old_receipt.artifact);
+        assert_eq!(rebuilt.unit_credential, old_receipt.unit_credential);
+        assert_eq!(rebuilt.effective_units, old_receipt.effective_units);
+        assert_eq!(
+            rebuilt.verifier.output.daemon,
+            old_receipt.verifier.output.daemon
+        );
+        assert_eq!(
+            rebuilt.verifier.output.readiness,
+            old_receipt.verifier.output.readiness
+        );
+        assert_ne!(rebuilt.config_patch, old_receipt.config_patch);
+        assert_ne!(
+            rebuilt.verifier.output_sha256,
+            old_receipt.verifier.output_sha256
+        );
+        assert_eq!(
+            runtime.files[MODE1_CREDENTIAL_PATH].observed(),
+            old_artifact
+        );
+        assert_eq!(runtime.files[MODE1_DROPIN_PATH].observed(), old_dropin);
+
+        let live = &runtime.files[howy_common::paths::CONFIG_FILE].bytes;
+        let parsed: HowyConfig = toml::from_str(std::str::from_utf8(live).unwrap()).unwrap();
+        assert_eq!(parsed.core.disabled, !enabled);
+        assert_eq!(
+            parsed.presence.mode,
+            howy_common::config::PresenceMode::Confirm
+        );
+        assert_eq!(parsed.presence.allowed_pam_services, ["login", "sudo"]);
+        assert_eq!(
+            Sha256Digest::from_bytes(live),
+            if enabled {
+                rebuilt.config_patch.enabled_sha256.clone()
+            } else {
+                rebuilt.config_patch.disabled_sha256.clone()
+            }
+        );
+        assert!(runtime.events.iter().all(|event| {
+            !matches!(
+                event.as_str(),
+                "rng-mlock"
+                    | "systemd-creds"
+                    | "systemd-run"
+                    | "preview-verifier"
+                    | "namespace"
+                    | "security-info"
+                    | "daemon-info"
+            )
+        }));
+
+        SecurityEngine::new(&mut runtime)
+            .set_presence(ProvisionPresence::Off)
+            .unwrap();
+        let off: HowyConfig = toml::from_str(
+            std::str::from_utf8(&runtime.files[howy_common::paths::CONFIG_FILE].bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(off.presence.mode, howy_common::config::PresenceMode::Off);
+        assert_eq!(off.presence.allowed_pam_services, ["login", "sudo"]);
+        assert_eq!(runtime.receipt().state, old_receipt.state);
+    }
+}
+
+#[test]
+fn set_presence_accepts_exact_unreceipted_mode1_bootstrap_in_both_directions() {
+    let mut runtime = FakeRuntime::fresh();
+    let mut config = HowyConfig::secure_bootstrap_template();
+    config.ml.provider = "cpu".into();
+    config.presence.mode = howy_common::config::PresenceMode::Off;
+    config.presence.allowed_pam_services = vec!["login".into()];
+    let bytes = toml::to_string_pretty(&config).unwrap();
+    runtime.put(howy_common::paths::CONFIG_FILE, bytes.as_bytes(), 0o600);
+
+    SecurityEngine::new(&mut runtime)
+        .set_presence(ProvisionPresence::Confirm)
+        .unwrap();
+    let confirmed: HowyConfig = toml::from_str(
+        std::str::from_utf8(&runtime.files[howy_common::paths::CONFIG_FILE].bytes).unwrap(),
+    )
+    .unwrap();
+    assert!(confirmed.core.disabled);
+    assert_eq!(confirmed.ml.provider, "cpu");
+    assert_eq!(confirmed.presence.allowed_pam_services, ["login", "sudo"]);
+    SecurityEngine::new(&mut runtime)
+        .package_reconcile(false, false)
+        .unwrap();
+
+    SecurityEngine::new(&mut runtime)
+        .set_presence(ProvisionPresence::Off)
+        .unwrap();
+    let off: HowyConfig = toml::from_str(
+        std::str::from_utf8(&runtime.files[howy_common::paths::CONFIG_FILE].bytes).unwrap(),
+    )
+    .unwrap();
+    assert!(off.core.disabled);
+    assert_eq!(off.presence.mode, howy_common::config::PresenceMode::Off);
+    assert_eq!(off.presence.allowed_pam_services, ["login", "sudo"]);
+    SecurityEngine::new(&mut runtime)
+        .package_reconcile(false, false)
+        .unwrap();
+    assert!(!runtime.files.contains_key(SECURITY_RECEIPT_PATH));
+    assert!(!runtime.files.contains_key(MODE1_CREDENTIAL_PATH));
+    assert!(!runtime.files.contains_key(MODE1_DROPIN_PATH));
+}
+
+#[test]
+fn set_presence_idempotency_still_ensures_validates_and_removes_managed_sudoers() {
+    let mut mode0 = FakeRuntime::fresh();
+    let config = toml::to_string_pretty(&HowyConfig::legacy_defaults()).unwrap();
+    mode0.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+    mode0.events.clear();
+    let outcome = SecurityEngine::new(&mut mode0)
+        .set_presence(ProvisionPresence::Off)
+        .unwrap();
+    assert!(outcome.messages[0].contains("no changes made"));
+    assert!(mode0.events.iter().all(|event| {
+        !event.starts_with("stop:")
+            && !event.starts_with("start:")
+            && !event.starts_with("atomic-create:")
+    }));
+    assert_eq!(mode0.transaction_id_counter, 0);
+
+    let mut mode1 = FakeRuntime::fresh();
+    provision(&mut mode1).unwrap();
+    let transaction_count = mode1.transaction_id_counter;
+    mode1.events.clear();
+    let outcome = SecurityEngine::new(&mut mode1)
+        .set_presence(ProvisionPresence::Confirm)
+        .unwrap();
+    assert!(outcome.messages[0].contains("created managed sudoers override"));
+    assert_eq!(
+        mode1.files[PAM_PROMPT_SUDOERS_PATH].bytes,
+        PAM_PROMPT_SUDOERS_BYTES
+    );
+    assert_eq!(
+        mode1.files[PAM_PROMPT_SUDOERS_PATH].metadata.permissions,
+        0o440
+    );
+    assert!(mode1.events.iter().all(|event| {
+        !event.starts_with("stop:")
+            && !event.starts_with("start:")
+            && !(event.starts_with("atomic-create:")
+                && (event.contains("config.toml") || event.contains("receipt")))
+    }));
+    assert_eq!(mode1.transaction_id_counter, transaction_count + 1);
+
+    let identity = mode1.files[PAM_PROMPT_SUDOERS_PATH].observed();
+    mode1.events.clear();
+    let transaction_count = mode1.transaction_id_counter;
+    let outcome = SecurityEngine::new(&mut mode1)
+        .set_presence(ProvisionPresence::Confirm)
+        .unwrap();
+    assert!(outcome.messages[0].contains("retained and validated"));
+    assert_eq!(mode1.files[PAM_PROMPT_SUDOERS_PATH].observed(), identity);
+    assert_eq!(mode1.transaction_id_counter, transaction_count);
+    assert_eq!(
+        mode1
+            .events
+            .iter()
+            .filter(|event| event.as_str() == "checked-command")
+            .count(),
+        1
+    );
+
+    let mut off = FakeRuntime::fresh();
+    let config = toml::to_string_pretty(&HowyConfig::legacy_defaults()).unwrap();
+    off.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+    off.put(PAM_PROMPT_SUDOERS_PATH, PAM_PROMPT_SUDOERS_BYTES, 0o440);
+    let outcome = SecurityEngine::new(&mut off)
+        .set_presence(ProvisionPresence::Off)
+        .unwrap();
+    assert!(outcome.messages[0].contains("removed managed sudoers override"));
+    assert!(!off.files.contains_key(PAM_PROMPT_SUDOERS_PATH));
+    assert_eq!(off.transaction_id_counter, 0);
+}
+
+#[test]
+fn set_presence_confirm_orders_exact_sudoers_create_and_visudo_before_config_mutation() {
+    let mut runtime = FakeRuntime::fresh();
+    let config = toml::to_string_pretty(&HowyConfig::legacy_defaults()).unwrap();
+    runtime.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+    runtime.events.clear();
+
+    SecurityEngine::new(&mut runtime)
+        .set_presence(ProvisionPresence::Confirm)
+        .unwrap();
+
+    let managed = runtime.files[PAM_PROMPT_SUDOERS_PATH].observed();
+    assert_eq!(managed.bytes, PAM_PROMPT_SUDOERS_BYTES);
+    managed.validate_regular(0, 0, 0o440).unwrap();
+    assert_eq!(
+        runtime.commands,
+        [super::command::visudo_validation_command()]
+    );
+    let managed_create = runtime
+        .events
+        .iter()
+        .position(|event| {
+            event.starts_with("atomic-create:") && event.contains("90-howy-pam-prompt")
+        })
+        .unwrap();
+    let visudo = runtime
+        .events
+        .iter()
+        .position(|event| event == "checked-command")
+        .unwrap();
+    let config_create = runtime
+        .events
+        .iter()
+        .position(|event| event.starts_with("atomic-create:") && event.contains("config.toml"))
+        .unwrap();
+    assert!(managed_create < visudo && visudo < config_create);
+    assert!(runtime.events.iter().all(|event| {
+        !matches!(
+            event.as_str(),
+            "rng-mlock"
+                | "systemd-creds"
+                | "systemd-run"
+                | "preview-verifier"
+                | "namespace"
+                | "security-info"
+                | "daemon-info"
+                | "journal:sync"
+                | "journal:remove"
+                | "guard:create"
+                | "guard:remove"
+                | "daemon-reload"
+        )
+    }));
+}
+
+#[test]
+fn fake_checked_command_records_spec_and_enforces_bounded_result() {
+    let mut runtime = FakeRuntime::fresh();
+    let spec = super::command::visudo_validation_command();
+    runtime.checked_command_output = vec![b'x'; spec.stdout_cap + 1];
+    assert!(runtime.run_checked_command(&spec).is_err());
+    assert_eq!(runtime.commands, [spec]);
+}
+
+#[test]
+fn set_presence_confirm_visudo_failure_cleans_new_file_before_any_config_mutation() {
+    let mut runtime = FakeRuntime::fresh();
+    let config = toml::to_string_pretty(&HowyConfig::legacy_defaults()).unwrap();
+    runtime.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+    let original = runtime.files[howy_common::paths::CONFIG_FILE].observed();
+    runtime.checked_command_error = Some(SecurityError::operation("visudo rejected policy"));
+    runtime.events.clear();
+
+    assert!(matches!(
+        SecurityEngine::new(&mut runtime).set_presence(ProvisionPresence::Confirm),
+        Err(SecurityError::Refused(_))
+    ));
+    assert_eq!(
+        runtime.files[howy_common::paths::CONFIG_FILE].observed(),
+        original
+    );
+    assert!(!runtime.files.contains_key(PAM_PROMPT_SUDOERS_PATH));
+    assert!(runtime.events.iter().all(|event| {
+        !event.starts_with("stop:")
+            && !(event.starts_with("atomic-create:") && event.contains("config.toml"))
+    }));
+    assert_eq!(
+        runtime.commands,
+        [super::command::visudo_validation_command()]
+    );
+}
+
+#[test]
+fn set_presence_confirm_refuses_every_managed_path_drift_untouched() {
+    for drift in ["content", "mode", "uid", "gid", "link", "type"] {
+        let mut runtime = FakeRuntime::fresh();
+        let config = toml::to_string_pretty(&HowyConfig::legacy_defaults()).unwrap();
+        runtime.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+        runtime.put(PAM_PROMPT_SUDOERS_PATH, PAM_PROMPT_SUDOERS_BYTES, 0o440);
+        let file = runtime.files.get_mut(PAM_PROMPT_SUDOERS_PATH).unwrap();
+        match drift {
+            "content" => {
+                file.bytes = b"Defaults pam_silent\n".to_vec();
+                file.metadata.byte_length = file.bytes.len() as u64;
+            }
+            "mode" => file.metadata.permissions = 0o400,
+            "uid" => file.metadata.uid = 1,
+            "gid" => file.metadata.gid = 1,
+            "link" => file.metadata.link_count = 2,
+            "type" => file.metadata.object_type = FileObjectType::Directory,
+            _ => unreachable!(),
+        }
+        let original_config = runtime.files[howy_common::paths::CONFIG_FILE].observed();
+        let original_override = runtime.files[PAM_PROMPT_SUDOERS_PATH].observed();
+        runtime.events.clear();
+
+        assert!(matches!(
+            SecurityEngine::new(&mut runtime).set_presence(ProvisionPresence::Confirm),
+            Err(SecurityError::Refused(_))
+        ));
+        assert_eq!(
+            runtime.files[howy_common::paths::CONFIG_FILE].observed(),
+            original_config,
+            "{drift}"
+        );
+        assert_eq!(
+            runtime.files[PAM_PROMPT_SUDOERS_PATH].observed(),
+            original_override,
+            "{drift}"
+        );
+        assert!(runtime.commands.is_empty(), "{drift}");
+        assert!(
+            runtime.events.iter().all(|event| {
+                !event.starts_with("stop:") && !event.starts_with("atomic-create:")
+            })
+        );
+    }
+}
+
+#[test]
+fn set_presence_confirm_reports_visudo_and_exact_cleanup_failure_as_uncertain() {
+    let mut runtime = FakeRuntime::fresh();
+    let config = toml::to_string_pretty(&HowyConfig::legacy_defaults()).unwrap();
+    runtime.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+    let original = runtime.files[howy_common::paths::CONFIG_FILE].observed();
+    runtime.checked_command_error = Some(SecurityError::operation("visudo rejected policy"));
+    runtime.fail_after = Some("managed-sudoers-remove");
+
+    let error = SecurityEngine::new(&mut runtime)
+        .set_presence(ProvisionPresence::Confirm)
+        .unwrap_err();
+    assert!(matches!(error, SecurityError::Uncertain(_)));
+    assert!(error.to_string().contains("visudo rejected policy"));
+    assert!(error.to_string().contains("cleanup also failed"));
+    assert_eq!(
+        runtime.files[howy_common::paths::CONFIG_FILE].observed(),
+        original
+    );
+    assert_eq!(
+        runtime.files[PAM_PROMPT_SUDOERS_PATH].bytes,
+        PAM_PROMPT_SUDOERS_BYTES
+    );
+}
+
+#[test]
+fn set_presence_off_applies_config_first_then_removes_exact_or_retains_drift() {
+    let mut exact = FakeRuntime::fresh();
+    let mut config = HowyConfig::legacy_defaults();
+    config.presence.mode = howy_common::config::PresenceMode::Confirm;
+    config.presence.allowed_pam_services = vec!["sudo".into()];
+    let config = toml::to_string_pretty(&config).unwrap();
+    exact.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+    exact.put(PAM_PROMPT_SUDOERS_PATH, PAM_PROMPT_SUDOERS_BYTES, 0o440);
+    exact.events.clear();
+
+    SecurityEngine::new(&mut exact)
+        .set_presence(ProvisionPresence::Off)
+        .unwrap();
+    let config_create = exact
+        .events
+        .iter()
+        .position(|event| event.starts_with("atomic-create:") && event.contains("config.toml"))
+        .unwrap();
+    let removal = exact
+        .events
+        .iter()
+        .position(|event| event == &format!("remove-exact:{PAM_PROMPT_SUDOERS_PATH}"))
+        .unwrap();
+    assert!(config_create < removal);
+    assert!(!exact.files.contains_key(PAM_PROMPT_SUDOERS_PATH));
+    let off: HowyConfig = toml::from_str(
+        std::str::from_utf8(&exact.files[howy_common::paths::CONFIG_FILE].bytes).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(off.presence.mode, howy_common::config::PresenceMode::Off);
+
+    let mut drift = FakeRuntime::fresh();
+    let mut config = HowyConfig::legacy_defaults();
+    config.presence.mode = howy_common::config::PresenceMode::Confirm;
+    config.presence.allowed_pam_services = vec!["sudo".into()];
+    let config = toml::to_string_pretty(&config).unwrap();
+    drift.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+    drift.put(PAM_PROMPT_SUDOERS_PATH, b"Defaults pam_silent\n", 0o440);
+    let retained = drift.files[PAM_PROMPT_SUDOERS_PATH].observed();
+    assert!(matches!(
+        SecurityEngine::new(&mut drift).set_presence(ProvisionPresence::Off),
+        Err(SecurityError::Uncertain(_))
+    ));
+    let off: HowyConfig = toml::from_str(
+        std::str::from_utf8(&drift.files[howy_common::paths::CONFIG_FILE].bytes).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(off.presence.mode, howy_common::config::PresenceMode::Off);
+    assert_eq!(drift.files[PAM_PROMPT_SUDOERS_PATH].observed(), retained);
+}
+
+#[test]
+fn set_presence_preserves_unit_activity_and_enablement_without_unit_file_operations() {
+    for service_active in [false, true] {
+        let mut runtime = FakeRuntime::fresh();
+        let config = toml::to_string_pretty(&HowyConfig::legacy_defaults()).unwrap();
+        runtime.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+        runtime.service = unit(UnitKind::Service, service_active);
+        runtime.socket = unit(UnitKind::Socket, true);
+        runtime.service.unit_file_state = UnitFileState::Disabled;
+        runtime.socket.unit_file_state = UnitFileState::Disabled;
+        let service = runtime.service;
+        let socket = runtime.socket;
+
+        SecurityEngine::new(&mut runtime)
+            .set_presence(ProvisionPresence::Confirm)
+            .unwrap();
+        assert_eq!(runtime.service, service);
+        assert_eq!(runtime.socket, socket);
+        let socket_stop = runtime
+            .events
+            .iter()
+            .position(|event| event == "stop:Socket")
+            .unwrap();
+        let service_stop = runtime
+            .events
+            .iter()
+            .position(|event| event == "stop:Service")
+            .unwrap();
+        assert!(socket_stop < service_stop);
+        assert!(runtime.events.iter().all(|event| {
+            !event.starts_with("enable:")
+                && !event.starts_with("disable:")
+                && !event.starts_with("mask:")
+                && !event.starts_with("unmask:")
+        }));
+    }
+
+    let mut incoherent = FakeRuntime::fresh();
+    let config = toml::to_string_pretty(&HowyConfig::legacy_defaults()).unwrap();
+    incoherent.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+    incoherent.service = unit(UnitKind::Service, true);
+    assert!(matches!(
+        SecurityEngine::new(&mut incoherent).set_presence(ProvisionPresence::Confirm),
+        Err(SecurityError::Refused(_))
+    ));
+    assert!(
+        !incoherent
+            .events
+            .iter()
+            .any(|event| event.starts_with("stop:"))
+    );
+
+    let mut disabled_active = FakeRuntime::fresh();
+    let mut config = HowyConfig::legacy_defaults();
+    config.core.disabled = true;
+    let config = toml::to_string_pretty(&config).unwrap();
+    disabled_active.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+    disabled_active.service = unit(UnitKind::Service, true);
+    disabled_active.socket = unit(UnitKind::Socket, true);
+    assert!(matches!(
+        SecurityEngine::new(&mut disabled_active).set_presence(ProvisionPresence::Confirm),
+        Err(SecurityError::Refused(_))
+    ));
+    assert!(
+        !disabled_active
+            .events
+            .iter()
+            .any(|event| event.starts_with("stop:"))
+    );
+}
+
+#[test]
+fn set_presence_receipt_failure_atomically_restores_old_config_and_units() {
+    let mut runtime = FakeRuntime::fresh();
+    provision_with_presence(&mut runtime, ProvisionPresence::Off).unwrap();
+    SecurityEngine::new(&mut runtime).enable().unwrap();
+    let old_config = runtime.files[howy_common::paths::CONFIG_FILE].observed();
+    let old_receipt = runtime.files[SECURITY_RECEIPT_PATH].observed();
+    let service = runtime.service;
+    let socket = runtime.socket;
+    runtime.events.clear();
+    runtime.fail_after = Some("presence-receipt-before-rename");
+
+    assert!(
+        SecurityEngine::new(&mut runtime)
+            .set_presence(ProvisionPresence::Confirm)
+            .is_err()
+    );
+    assert_eq!(
+        runtime.files[howy_common::paths::CONFIG_FILE].bytes,
+        old_config.bytes
+    );
+    assert_eq!(
+        runtime.files[howy_common::paths::CONFIG_FILE].metadata,
+        old_config.metadata
+    );
+    assert_eq!(runtime.files[SECURITY_RECEIPT_PATH].observed(), old_receipt);
+    assert_eq!(runtime.service, service);
+    assert_eq!(runtime.socket, socket);
+    assert!(!runtime.files.contains_key(PAM_PROMPT_SUDOERS_PATH));
+    assert!(runtime.files.keys().all(|path| !path.ends_with(".stage")));
+    assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+    assert!(!runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
+
+    let mut preexisting = FakeRuntime::fresh();
+    provision_with_presence(&mut preexisting, ProvisionPresence::Off).unwrap();
+    SecurityEngine::new(&mut preexisting).enable().unwrap();
+    preexisting.put(PAM_PROMPT_SUDOERS_PATH, PAM_PROMPT_SUDOERS_BYTES, 0o440);
+    let override_before = preexisting.files[PAM_PROMPT_SUDOERS_PATH].observed();
+    preexisting.fail_after = Some("presence-receipt-before-rename");
+    assert!(
+        SecurityEngine::new(&mut preexisting)
+            .set_presence(ProvisionPresence::Confirm)
+            .is_err()
+    );
+    assert_eq!(
+        preexisting.files[PAM_PROMPT_SUDOERS_PATH].observed(),
+        override_before
+    );
+}
+
+#[test]
+fn set_presence_indeterminate_receipt_keeps_new_config_instead_of_reversing_binding() {
+    let mut runtime = FakeRuntime::fresh();
+    provision_with_presence(&mut runtime, ProvisionPresence::Off).unwrap();
+    SecurityEngine::new(&mut runtime).enable().unwrap();
+    runtime.fail_after = Some("presence-receipt-indeterminate");
+
+    let error = SecurityEngine::new(&mut runtime)
+        .set_presence(ProvisionPresence::Confirm)
+        .unwrap_err();
+    assert!(matches!(error, SecurityError::Uncertain(_)));
+
+    let config: HowyConfig = toml::from_str(
+        std::str::from_utf8(&runtime.files[howy_common::paths::CONFIG_FILE].bytes).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        config.presence.mode,
+        howy_common::config::PresenceMode::Confirm
+    );
+    let receipt =
+        ProvisioningReceiptV1::parse(&runtime.files[SECURITY_RECEIPT_PATH].bytes).unwrap();
+    assert_eq!(
+        receipt.verifier.output.config_sha256,
+        receipt.config_patch.enabled_sha256
+    );
+    assert!(runtime.files.keys().any(|path| path.ends_with(".stage")));
+}
+
+#[test]
+fn set_presence_refuses_nonroot_controls_and_ambiguous_security_states_before_mutation() {
+    fn assert_refused_without_mutation(runtime: &mut FakeRuntime) {
+        runtime.events.clear();
+        assert!(
+            SecurityEngine::new(runtime)
+                .set_presence(ProvisionPresence::Confirm)
+                .is_err()
+        );
+        assert!(runtime.events.iter().all(|event| {
+            !event.starts_with("stop:")
+                && !event.starts_with("start:")
+                && !event.starts_with("atomic-create:")
+        }));
+    }
+
+    let mut nonroot = FakeRuntime::fresh();
+    nonroot.root = false;
+    assert_refused_without_mutation(&mut nonroot);
+
+    for control in [SECURITY_JOURNAL_PATH, SECURITY_TRANSACTION_GUARD_PATH] {
+        let mut runtime = FakeRuntime::fresh();
+        let config = toml::to_string_pretty(&HowyConfig::legacy_defaults()).unwrap();
+        runtime.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+        runtime.put(control, b"active", 0o600);
+        assert_refused_without_mutation(&mut runtime);
+    }
+
+    let mut malformed_receipt = FakeRuntime::fresh();
+    let config = toml::to_string_pretty(&HowyConfig::legacy_defaults()).unwrap();
+    malformed_receipt.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+    malformed_receipt.put(SECURITY_RECEIPT_PATH, b"{malformed", 0o600);
+    assert_refused_without_mutation(&mut malformed_receipt);
+
+    let mut mode0_receipt = FakeRuntime::fresh();
+    provision_with_presence(&mut mode0_receipt, ProvisionPresence::Off).unwrap();
+    let config = toml::to_string_pretty(&HowyConfig::legacy_defaults()).unwrap();
+    mode0_receipt.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+    assert_refused_without_mutation(&mut mode0_receipt);
+
+    let mut mismatched_receipt = FakeRuntime::fresh();
+    provision_with_presence(&mut mismatched_receipt, ProvisionPresence::Off).unwrap();
+    let mut config: HowyConfig = toml::from_str(
+        std::str::from_utf8(&mismatched_receipt.files[howy_common::paths::CONFIG_FILE].bytes)
+            .unwrap(),
+    )
+    .unwrap();
+    config.ml.provider = "cpu".into();
+    let config = toml::to_string_pretty(&config).unwrap();
+    mismatched_receipt.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+    assert_refused_without_mutation(&mut mismatched_receipt);
+
+    let mut mode2 = FakeRuntime::fresh();
+    let mut config = HowyConfig::secure_bootstrap_template();
+    config.security.embedding_mode = EmbeddingSecurityMode::AeadEphemeral;
+    let config = toml::to_string_pretty(&config).unwrap();
+    mode2.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+    assert_refused_without_mutation(&mut mode2);
+
+    let mut enabled_bootstrap = FakeRuntime::fresh();
+    let mut config = HowyConfig::secure_bootstrap_template();
+    config.core.disabled = false;
+    let config = toml::to_string_pretty(&config).unwrap();
+    enabled_bootstrap.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+    assert_refused_without_mutation(&mut enabled_bootstrap);
+
+    for object in ["credential", "dropin", "namespace"] {
+        let mut runtime = FakeRuntime::fresh();
+        let config = toml::to_string_pretty(&HowyConfig::secure_bootstrap_template()).unwrap();
+        runtime.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
+        match object {
+            "credential" => runtime.put(MODE1_CREDENTIAL_PATH, b"object", 0o600),
+            "dropin" => runtime.put(MODE1_DROPIN_PATH, b"object", 0o600),
+            "namespace" => runtime.namespace_nonempty = true,
+            _ => unreachable!(),
+        }
+        assert_refused_without_mutation(&mut runtime);
+    }
 }
 
 #[test]
@@ -4371,6 +5151,9 @@ fn package_reconcile_accepts_bootstrap_and_engine_provisioned_mode0_without_muta
     mode0.service = unit(UnitKind::Service, false);
     mode0.socket = unit(UnitKind::Socket, false);
     mode0.status_available = false;
+    SecurityEngine::new(&mut mode0)
+        .set_presence(ProvisionPresence::Confirm)
+        .unwrap();
     let config = mode0.files[howy_common::paths::CONFIG_FILE].observed();
     let artifact = mode0.files[MODE1_CREDENTIAL_PATH].observed();
     let dropin = mode0.files[MODE1_DROPIN_PATH].observed();
@@ -4397,6 +5180,20 @@ fn package_reconcile_accepts_bootstrap_and_engine_provisioned_mode0_without_muta
     assert!(outcome.messages[0].contains("explicit provisioned Mode 0"));
     assert!(!outcome.messages[0].contains("legacy candidate"));
 
+    let mut disabled: HowyConfig = toml::from_str(
+        std::str::from_utf8(&mode0.files[howy_common::paths::CONFIG_FILE].bytes).unwrap(),
+    )
+    .unwrap();
+    disabled.core.disabled = true;
+    let disabled = toml::to_string_pretty(&disabled).unwrap();
+    mode0.put(howy_common::paths::CONFIG_FILE, disabled.as_bytes(), 0o600);
+    SecurityEngine::new(&mut mode0)
+        .set_presence(ProvisionPresence::Off)
+        .unwrap();
+    SecurityEngine::new(&mut mode0)
+        .package_reconcile(false, false)
+        .unwrap();
+
     let explicit_config = mode0.files[howy_common::paths::CONFIG_FILE].bytes.clone();
     mode0.put(howy_common::paths::CONFIG_FILE, &explicit_config, 0o644);
     assert!(
@@ -4422,10 +5219,14 @@ fn package_reconcile_refuses_partial_or_synthetic_no_receipt_states() {
     nonbootstrap_mode1.ml.provider = "cpu".into();
     let config = toml::to_string_pretty(&nonbootstrap_mode1).unwrap();
     mode1_config.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o600);
-    assert!(
-        SecurityEngine::new(&mut mode1_config)
-            .package_reconcile(false, false)
-            .is_err()
+    let config_before = mode1_config.files[howy_common::paths::CONFIG_FILE].observed();
+    let outcome = SecurityEngine::new(&mut mode1_config)
+        .package_reconcile(false, false)
+        .unwrap();
+    assert!(outcome.messages[0].contains("bootstrap"));
+    assert_eq!(
+        mode1_config.files[howy_common::paths::CONFIG_FILE].observed(),
+        config_before
     );
     assert!(!mode1_config.files.contains_key(SECURITY_RECEIPT_PATH));
 
@@ -4819,25 +5620,13 @@ fn package_reconcile_legacy_candidate_flag_refuses_objects_controls_and_drift() 
 
 #[test]
 fn package_reconcile_legacy_candidate_flag_refuses_invalid_mode0_config_semantics() {
-    for scenario in ["malformed", "mode1", "disabled-mode0", "presence-confirm"] {
+    for scenario in ["malformed", "mode1"] {
         let mut runtime = legacy_candidate_mode0_runtime();
         match scenario {
             "malformed" => runtime.put(howy_common::paths::CONFIG_FILE, b"not = [toml", 0o644),
             "mode1" => {
                 let mut config = HowyConfig::secure_bootstrap_template();
                 config.ml.provider = "cpu".into();
-                let config = toml::to_string_pretty(&config).unwrap();
-                runtime.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o644);
-            }
-            "disabled-mode0" => {
-                let mut config = HowyConfig::legacy_defaults();
-                config.core.disabled = true;
-                let config = toml::to_string_pretty(&config).unwrap();
-                runtime.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o644);
-            }
-            "presence-confirm" => {
-                let mut config = HowyConfig::legacy_defaults();
-                config.presence.mode = howy_common::config::PresenceMode::Confirm;
                 let config = toml::to_string_pretty(&config).unwrap();
                 runtime.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o644);
             }
@@ -4850,6 +5639,21 @@ fn package_reconcile_legacy_candidate_flag_refuses_invalid_mode0_config_semantic
             "{scenario} unexpectedly reconciled"
         );
         assert!(!runtime.files.contains_key(SECURITY_RECEIPT_PATH));
+    }
+
+    for (disabled, presence) in [
+        (true, howy_common::config::PresenceMode::Off),
+        (false, howy_common::config::PresenceMode::Confirm),
+    ] {
+        let mut runtime = legacy_candidate_mode0_runtime();
+        let mut config = HowyConfig::legacy_defaults();
+        config.core.disabled = disabled;
+        config.presence.mode = presence;
+        let config = toml::to_string_pretty(&config).unwrap();
+        runtime.put(howy_common::paths::CONFIG_FILE, config.as_bytes(), 0o644);
+        SecurityEngine::new(&mut runtime)
+            .package_reconcile(true, false)
+            .unwrap();
     }
 }
 

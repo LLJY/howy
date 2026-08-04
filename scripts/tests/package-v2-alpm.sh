@@ -12,6 +12,8 @@ REPO_ROOT=$(dirname "$(dirname "${TEST_DIR}")")
 PACMAN=/usr/bin/pacman
 UNSHARE=/usr/bin/unshare
 BSDTAR=/usr/bin/bsdtar
+GIT=/usr/bin/git
+OLD_STABLE_COMMIT=4dcdf14f742d510aa1d6c43026ff62e43e8596c6
 
 fail() {
     printf 'v2 isolated ALPM FAIL: %s\n' "$*" >&2
@@ -23,12 +25,23 @@ skip() {
     exit 0
 }
 
-for tool in "${PACMAN}" "${UNSHARE}" "${BSDTAR}" /usr/bin/ldd /usr/bin/true; do
+for tool in \
+    "${PACMAN}" \
+    "${UNSHARE}" \
+    "${BSDTAR}" \
+    "${GIT}" \
+    /usr/bin/ldd \
+    /usr/bin/true; do
     [[ -x "${tool}" ]] || skip "required isolation capability is unavailable: ${tool}"
 done
 
 if ! unshare_reason=$("${UNSHARE}" --user --map-root-user --mount -- /usr/bin/true 2>&1); then
     skip "the kernel/container blocked mapped-root user+mount namespaces: ${unshare_reason}"
+fi
+
+if [[ "$("${GIT}" -C "${REPO_ROOT}" rev-parse --verify \
+        "${OLD_STABLE_COMMIT}^{commit}")" != "${OLD_STABLE_COMMIT}" ]]; then
+    fail "immutable old stable commit is unavailable: ${OLD_STABLE_COMMIT}"
 fi
 
 WORK=$(/usr/bin/mktemp -d)
@@ -169,21 +182,34 @@ build_provider() {
 
 build_stable_update_fixture() {
     local label="$1"
-    local payload="$2"
+    local version="$2"
+    local payload="$3"
     local package_dir="${PACKAGES}/${label}"
     local tree="${WORK}/tree-stable-${label}"
-    local archive="${package_dir}/howy-cpu-2.0.0-1-x86_64.pkg.tar"
+    local archive="${package_dir}/howy-cpu-${version}-x86_64.pkg.tar"
 
     /usr/bin/mkdir -p \
         "${package_dir}" \
         "${tree}/usr/lib/howy" \
         "${tree}/usr/share/howy-v2-alpm" \
         "${tree}/usr/share/libalpm/hooks"
-    write_pkginfo "${tree}/.PKGINFO" howy-cpu 2.0.0-1
-    /usr/bin/install -m 0755 "${REPO_ROOT}/scripts/howy-v2-update-admission" \
-        "${tree}/usr/lib/howy/howy-v2-update-admission"
-    /usr/bin/install -m 0644 "${REPO_ROOT}/packaging/00-howy-update-admission.hook" \
-        "${tree}/usr/share/libalpm/hooks/00-howy-update-admission.hook"
+    write_pkginfo "${tree}/.PKGINFO" howy-cpu "${version}"
+    if [[ "${version}" == 2.0.0-1 ]]; then
+        "${GIT}" -C "${REPO_ROOT}" show \
+            "${OLD_STABLE_COMMIT}:scripts/howy-v2-update-admission" \
+            > "${tree}/usr/lib/howy/howy-v2-update-admission"
+        "${GIT}" -C "${REPO_ROOT}" show \
+            "${OLD_STABLE_COMMIT}:packaging/00-howy-update-admission.hook" \
+            > "${tree}/usr/share/libalpm/hooks/00-howy-update-admission.hook"
+        /usr/bin/chmod 0755 "${tree}/usr/lib/howy/howy-v2-update-admission"
+        /usr/bin/chmod 0644 \
+            "${tree}/usr/share/libalpm/hooks/00-howy-update-admission.hook"
+    else
+        /usr/bin/install -m 0755 "${REPO_ROOT}/scripts/howy-v2-update-admission" \
+            "${tree}/usr/lib/howy/howy-v2-update-admission"
+        /usr/bin/install -m 0644 "${REPO_ROOT}/packaging/00-howy-update-admission.hook" \
+            "${tree}/usr/share/libalpm/hooks/00-howy-update-admission.hook"
+    fi
     /usr/bin/install -m 0644 "${REPO_ROOT}/packaging/05-howy-config-stash.hook" \
         "${tree}/usr/share/libalpm/hooks/05-howy-config-stash.hook"
     {
@@ -192,6 +218,21 @@ build_stable_update_fixture() {
         printf 'exit 0\n'
     } > "${tree}/usr/lib/howy/howy-config-bridge"
     /usr/bin/chmod 0755 "${tree}/usr/lib/howy/howy-config-bridge"
+    {
+        printf '[Trigger]\n'
+        printf 'Operation = Upgrade\n'
+        printf 'Type = Package\n'
+        printf 'Target = howy-cpu\n\n'
+        printf '[Action]\n'
+        printf 'Description = Running benign Howy ALPM fixture hook\n'
+        printf 'When = PreTransaction\n'
+        printf 'Exec = /usr/lib/howy/howy-benign-update-hook\n'
+    } > "${tree}/usr/share/libalpm/hooks/50-howy-benign-update.hook"
+    {
+        printf '#!/bin/bash\n'
+        printf 'printf "benign-hook-ran\\n" >> /benign-hook.calls\n'
+    } > "${tree}/usr/lib/howy/howy-benign-update-hook"
+    /usr/bin/chmod 0755 "${tree}/usr/lib/howy/howy-benign-update-hook"
     printf '%s\n' "${payload}" > "${tree}/usr/share/howy-v2-alpm/stable-update-payload"
     archive_package "${tree}" "${archive}"
     printf '%s\n' "${archive}"
@@ -199,13 +240,15 @@ build_stable_update_fixture() {
 
 build_removal_fixture() {
     local tree="${WORK}/tree-removal"
-    local archive="${PACKAGES}/howy-cpu-2.0.0-2-x86_64.pkg.tar"
+    local package_dir="${PACKAGES}/removal"
+    local archive="${package_dir}/howy-cpu-2.0.1-1-x86_64.pkg.tar"
 
     /usr/bin/mkdir -p \
+        "${package_dir}" \
         "${tree}/usr/lib/howy" \
         "${tree}/usr/share/howy-v2-alpm" \
         "${tree}/usr/share/libalpm/hooks"
-    write_pkginfo "${tree}/.PKGINFO" howy-cpu 2.0.0-2
+    write_pkginfo "${tree}/.PKGINFO" howy-cpu 2.0.1-1
     /usr/bin/install -m 0755 "${REPO_ROOT}/scripts/howy-v2-remove-prepare" \
         "${tree}/usr/lib/howy/howy-v2-remove-prepare"
     /usr/bin/install -m 0644 "${REPO_ROOT}/packaging/10-howy-remove-prepare.hook" \
@@ -251,6 +294,24 @@ pacman_install() {
         --dbpath "${root}/var/lib/pacman" \
         --cachedir "${root}/var/cache/pacman/pkg" \
         --hookdir "${case_dir}/hooks" \
+        --logfile "${root}/var/log/pacman.log" \
+        -U --noconfirm -- "${archive}"
+}
+
+pacman_install_with_hook_override() {
+    local case_dir="$1"
+    local archive="$2"
+    local override_dir="$3"
+    local root="${case_dir}/root"
+
+    "${UNSHARE}" --user --map-root-user --mount -- \
+        "${PACMAN}" \
+        --config "${case_dir}/pacman.conf" \
+        --root "${root}" \
+        --dbpath "${root}/var/lib/pacman" \
+        --cachedir "${root}/var/cache/pacman/pkg" \
+        --hookdir "${case_dir}/hooks" \
+        --hookdir "${override_dir}" \
         --logfile "${root}/var/log/pacman.log" \
         -U --noconfirm -- "${archive}"
 }
@@ -317,18 +378,18 @@ assert_conflict_without_replaces() {
 }
 
 release_archive=$(build_provider howy-cpu-git 0.1.0.r26.g2dfe39e-1)
-stable_cpu_archive=$(build_provider howy-cpu 2.0.0-1 howy-cpu-git)
+stable_cpu_archive=$(build_provider howy-cpu 2.0.1-1 howy-cpu-git)
 candidate_archive=$(build_provider howy-rocm-mode0 0.1.0.r27.g0b76fa2-6)
-stable_rocm_archive=$(build_provider howy-rocm 2.0.0-1 howy-rocm-mode0)
+stable_rocm_archive=$(build_provider howy-rocm 2.0.1-1 howy-rocm-mode0)
 removal_archive=$(build_removal_fixture)
-stable_old_archive=$(build_stable_update_fixture old 'old stable bytes')
-stable_new_archive=$(build_stable_update_fixture new 'new stable bytes')
+stable_old_archive=$(build_stable_update_fixture old 2.0.0-1 'old stable bytes')
+stable_new_archive=$(build_stable_update_fixture new 2.0.1-1 'new stable bytes')
 runtime_old_archive=$(build_provider \
     onnxruntime-opt-rocm 1.24.4-9 '' '' 'onnxruntime=1.24.4')
 runtime_new_archive=$(build_provider \
     onnxruntime-opt-rocm 1.28.0-1 '' '' 'onnxruntime=1.28.0')
 runtime_dependent_archive=$(build_provider \
-    howy-runtime-probe 2.0.0-1 '' 'onnxruntime=1.28.0')
+    howy-runtime-probe 2.0.1-1 '' 'onnxruntime=1.28.0')
 
 assert_conflict_without_replaces "${stable_cpu_archive}" howy-cpu-git
 assert_conflict_without_replaces "${stable_rocm_archive}" howy-rocm-mode0
@@ -410,7 +471,7 @@ printf '%s\n' \
     'source_package=howy-rocm-mode0' \
     'source_version=0.1.0.r27.g0b76fa2-6' \
     'target_package=howy-rocm' \
-    'target_version=2.0.0-1' > "${root}/run/howy-v2-update-v1.prepared"
+    'target_version=2.0.1-1' > "${root}/run/howy-v2-update-v1.prepared"
 /usr/bin/chmod 0600 "${root}/run/howy-v2-update-v1.prepared"
 candidate_replace_output=$( \
     HOWY_V2_UPDATE_FORMAT=howy-v2-update-v1 \
@@ -419,7 +480,7 @@ candidate_replace_output=$( \
     HOWY_V2_UPDATE_SOURCE_PACKAGE=howy-rocm-mode0 \
     HOWY_V2_UPDATE_SOURCE_VERSION=0.1.0.r27.g0b76fa2-6 \
     HOWY_V2_UPDATE_TARGET_PACKAGE=howy-rocm \
-    HOWY_V2_UPDATE_TARGET_VERSION=2.0.0-1 \
+    HOWY_V2_UPDATE_TARGET_VERSION=2.0.1-1 \
         pacman_replace "${case_dir}" "${stable_rocm_archive}" 2>&1
 ) \
     || fail 'prepared candidate replacement failed'
@@ -464,7 +525,7 @@ printf '%s\n' \
     'source_package=howy-rocm-mode0' \
     'source_version=0.1.0.r27.g0b76fa2-6' \
     'target_package=howy-rocm' \
-    'target_version=2.0.0-1' \
+    'target_version=2.0.1-1' \
     'extra=malformed' > "${root}/run/howy-v2-update-v1.prepared"
 /usr/bin/chmod 0600 "${root}/run/howy-v2-update-v1.prepared"
 malformed_replace_output=$(pacman_replace "${case_dir}" "${stable_rocm_archive}" 2>&1) \
@@ -482,11 +543,29 @@ root="${case_dir}/root"
 for binary in /bin/bash /usr/bin/id /usr/bin/stat /usr/bin/sha256sum; do
     copy_runtime "${binary}" "${root}"
 done
+old_helper_expected_sha=$( \
+    "${GIT}" -C "${REPO_ROOT}" show \
+        "${OLD_STABLE_COMMIT}:scripts/howy-v2-update-admission" \
+        | /usr/bin/sha256sum
+)
+old_helper_expected_sha=${old_helper_expected_sha%% *}
+current_helper_sha=$(/usr/bin/sha256sum -- \
+    "${REPO_ROOT}/scripts/howy-v2-update-admission")
+current_helper_sha=${current_helper_sha%% *}
+[[ "${old_helper_expected_sha}" != "${current_helper_sha}" ]] \
+    || fail 'old stable fixture helper unexpectedly matches the current helper bytes'
 pacman_install "${case_dir}" "${stable_old_archive}" >/dev/null
 /usr/bin/cp -- "${root}/usr/share/libalpm/hooks/00-howy-update-admission.hook" \
     "${case_dir}/hooks/00-howy-update-admission.hook"
 /usr/bin/cp -- "${root}/usr/share/libalpm/hooks/05-howy-config-stash.hook" \
     "${case_dir}/hooks/05-howy-config-stash.hook"
+/usr/bin/cp -- "${root}/usr/share/libalpm/hooks/50-howy-benign-update.hook" \
+    "${case_dir}/hooks/50-howy-benign-update.hook"
+old_helper_installed_sha=$(/usr/bin/sha256sum -- \
+    "${root}/usr/lib/howy/howy-v2-update-admission")
+old_helper_installed_sha=${old_helper_installed_sha%% *}
+[[ "${old_helper_installed_sha}" == "${old_helper_expected_sha}" ]] \
+    || fail 'installed old stable admission helper differs from the immutable v2.0.0 bytes'
 /usr/bin/cp -- "${root}/var/lib/pacman/local/howy-cpu-2.0.0-1/desc" \
     "${case_dir}/stable-old-package-db.desc"
 [[ "$(<"${root}/usr/share/howy-v2-alpm/stable-update-payload")" == 'old stable bytes' ]] \
@@ -519,17 +598,57 @@ stable_new_sha=${stable_new_sha%% *}
         'source_package=howy-cpu' \
         'source_version=2.0.0-1' \
         'target_package=howy-cpu' \
-        'target_version=2.0.0-1'
+        'target_version=2.0.1-1'
 } > "${root}/run/howy-v2-update-v1.prepared"
 /usr/bin/chmod 0600 "${root}/run/howy-v2-update-v1.prepared"
-pacman_install "${case_dir}" "${stable_new_archive}" >/dev/null \
-    || fail 'same-name stable update with the exact prepared sentinel failed'
-pacman_query "${case_dir}" howy-cpu >/dev/null \
-    || fail 'admitted same-name stable update lost its package database entry'
+
+set +e
+prepared_direct_output=$(pacman_install "${case_dir}" "${stable_new_archive}" 2>&1)
+prepared_direct_status=$?
+set -e
+[[ "${prepared_direct_status}" -ne 0 ]] \
+    || fail 'direct prepared v2.0.0 to v2.0.1 update bypassed the old admission helper'
+[[ "${prepared_direct_output}" \
+    == *'prepared source and target versions must both be 2.0.0-1'* ]] \
+    || fail "old helper version refusal was not reported: ${prepared_direct_output}"
+[[ "$(<"${root}/usr/share/howy-v2-alpm/stable-update-payload")" == 'old stable bytes' ]] \
+    || fail 'old helper refusal changed installed payload bytes'
+[[ ! -e "${root}/config-stash.calls" && ! -e "${root}/benign-hook.calls" ]] \
+    || fail 'old helper refusal continued to later fixture hooks'
+
+override_dir="${root}/run/howy-v2-update-hook-override"
+override_path="${override_dir}/00-howy-update-admission.hook"
+/usr/bin/mkdir -m 0700 -- "${override_dir}"
+/usr/bin/ln -s -- /dev/null "${override_path}"
+override_dir_metadata=$( \
+    "${UNSHARE}" --user --map-root-user --mount -- \
+        /usr/bin/stat -c '%u:%g:%a' -- "${override_dir}"
+)
+override_link_metadata=$( \
+    "${UNSHARE}" --user --map-root-user --mount -- \
+        /usr/bin/stat -c '%u:%g' -- "${override_path}"
+)
+[[ "${override_dir_metadata}" == '0:0:700' ]] \
+    || fail "isolated override directory metadata is not root:root 0700: ${override_dir_metadata}"
+[[ "${override_link_metadata}" == '0:0' \
+    && "$(/usr/bin/readlink -- "${override_path}")" == /dev/null ]] \
+    || fail 'isolated override is not the exact root-owned admission-hook symlink to /dev/null'
+
+pacman_install_with_hook_override \
+    "${case_dir}" "${stable_new_archive}" "${override_dir}" >/dev/null \
+    || fail 'same-name stable update with the higher-priority symlink override failed'
+[[ "$(pacman_query "${case_dir}" howy-cpu)" == 'howy-cpu 2.0.1-1' ]] \
+    || fail 'admitted v2.0.0 to v2.0.1 stable update has the wrong package database entry'
 [[ "$(<"${root}/usr/share/howy-v2-alpm/stable-update-payload")" == 'new stable bytes' ]] \
     || fail 'admitted same-name stable update did not install new payload bytes'
 [[ "$(<"${root}/config-stash.calls")" == stash-release-n ]] \
     || fail 'admitted same-name stable update did not continue to the 05 config stash hook'
+[[ "$(<"${root}/benign-hook.calls")" == benign-hook-ran ]] \
+    || fail 'higher-priority admission override disabled or skipped the benign fixture hook'
+/usr/bin/rm -- "${override_path}"
+/usr/bin/rmdir -- "${override_dir}"
+[[ ! -e "${override_dir}" && ! -L "${override_dir}" ]] \
+    || fail 'isolated exact override cleanup retained state'
 
 case_dir=$(new_root removal-abort)
 root="${case_dir}/root"
@@ -562,4 +681,9 @@ pacman_query "${case_dir}" howy-cpu >/dev/null \
 [[ "$(<"${root}/remove-helper.calls")" == 'stop howy.socket' ]] \
     || fail 'removal helper did not fail at the isolated socket stop as arranged'
 
-printf '%s\n' 'v2 isolated ALPM: exact runtime capability, conflict-only predecessor replacement, PAM alias, stable update admission, and removal abort passed'
+printf 'v2 isolated ALPM compatibility evidence: old_commit=%s old_helper_sha256=%s direct_prepared_status=%s override_dir=%s override_link=/dev/null benign_hook=ran target=howy-cpu-2.0.1-1\n' \
+    "${OLD_STABLE_COMMIT}" \
+    "${old_helper_installed_sha}" \
+    "${prepared_direct_status}" \
+    "${override_dir_metadata}"
+printf '%s\n' 'v2 isolated ALPM: exact runtime capability, conflict-only predecessor replacement, PAM alias, stable update admission override, and removal abort passed'

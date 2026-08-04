@@ -66,13 +66,13 @@ persistent `.mxr` compiled-model cache on subsequent boots.
 
 ## Install and Run on Arch Linux
 
-The canonical release is the `2.0.0-1` Arch split package family:
+The canonical release is the `2.0.1-1` Arch split package family:
 
 | Intended ONNX Runtime path | Howy archive |
 |----------------------------|--------------|
-| CPU | `howy-cpu-2.0.0-1-x86_64.pkg.tar.zst` |
-| ROCm/MIGraphX | `howy-rocm-2.0.0-1-x86_64.pkg.tar.zst` |
-| CUDA | `howy-cuda-2.0.0-1-x86_64.pkg.tar.zst` |
+| CPU | `howy-cpu-2.0.1-1-x86_64.pkg.tar.zst` |
+| ROCm/MIGraphX | `howy-rocm-2.0.1-1-x86_64.pkg.tar.zst` |
+| CUDA | `howy-cuda-2.0.1-1-x86_64.pkg.tar.zst` |
 
 Install or choose the desired system ONNX Runtime provider first. Every Howy
 variant depends on the exact virtual capability `onnxruntime=1.28.0`; for
@@ -95,7 +95,7 @@ makepkg --cleanbuild --clean
 # Example: confirm the ROCm provider and required virtual capability, then install.
 pacman -Q onnxruntime-opt-rocm
 pacman -T 'onnxruntime=1.28.0'
-sudo pacman -U ./howy-rocm-2.0.0-1-x86_64.pkg.tar.zst
+sudo pacman -U ./howy-rocm-2.0.1-1-x86_64.pkg.tar.zst
 ```
 
 Use `pacman -U` only for a fresh install with no existing Howy package/control
@@ -110,16 +110,19 @@ helper distributed beside the release archive:
 
 ```bash
 # From the v2 release checkout:
-sudo ./scripts/howy-v2-update ./howy-rocm-2.0.0-1-x86_64.pkg.tar.zst
+sudo ./scripts/howy-v2-update ./howy-rocm-2.0.1-1-x86_64.pkg.tar.zst
 
 # Or with the standalone helper beside the downloaded archive:
-sudo ./howy-v2-update ./howy-rocm-2.0.0-1-x86_64.pkg.tar.zst
+sudo ./howy-v2-update ./howy-rocm-2.0.1-1-x86_64.pkg.tar.zst
 ```
 
-After v2 is installed, later same-v2 updates use the installed helper:
+The installed v2.0.0 helper predates the v2.0.1 admission bridge. Use the
+v2.0.1 checkout or standalone helper shown above for the first
+`2.0.0-1` → `2.0.1-1` update. After v2.0.1 is installed, later same-v2
+updates use the installed helper:
 
 ```bash
-sudo howy-v2-update ./howy-rocm-2.0.0-1-x86_64.pkg.tar.zst
+sudo howy-v2-update ./howy-rocm-2.0.1-1-x86_64.pkg.tar.zst
 ```
 
 Verify downloaded helpers and archives against their published SHA-256
@@ -158,7 +161,8 @@ camera device), and provision Mode 1 before enabling authentication:
 
 ```bash
 sudo howy-download-models
-sudo howy security provision --mode 1
+sudo howy security provision --mode 1 --presence confirm
+sudo howy security set-presence confirm
 sudo howy security enable
 ```
 
@@ -180,6 +184,51 @@ sudo systemctl enable --now howy.socket howy.service
 
 Package and local development installs intentionally enable neither activation
 policy automatically.
+
+### Presence confirmation
+
+Stable Mode 0 and Mode 1 installations can change the presence policy in both
+enabled and disabled states without reprovisioning storage:
+
+```bash
+sudo howy security set-presence confirm
+sudo howy security set-presence off
+```
+
+Selecting `confirm` ensures that `sudo` is in the presence PAM-service
+allowlist and manages exactly `/etc/sudoers.d/90-howy-pam-prompt` as a
+root-owned, single-link regular file with mode `0440` and these exact bytes:
+
+```sudoers
+Defaults !pam_silent
+```
+
+The command accepts only an absent managed path or that exact file. It creates
+an absent file atomically without replacement, verifies it, and runs the full
+`/usr/bin/visudo -cf /etc/sudoers` check before changing the Howy config or
+receipt. A pre-existing exact file is retained and still validated. A missing
+sudo/visudo installation, missing required sudoers path, validation failure, or
+different content, ownership, mode, object type, or link state causes
+confirmation to be refused without overwriting the path. If a later
+confirmation change fails, Howy removes only the exact override it created for
+that attempt; it never removes a pre-existing exact override on that failure.
+
+Selecting `off` changes the Howy config/receipt first, then removes only the
+exact managed file. An absent path succeeds. A differing path is retained and
+reported as uncertain after presence has been set to off. Repeating either
+command still performs these ensure/validate/remove checks.
+
+Sudo 1.9.16 and newer enables `pam_silent` by default, which supplies
+`PAM_SILENT` during PAM authentication. Howy deliberately cancels a required
+confirmation under `PAM_SILENT` without opening the camera; the managed
+`Defaults !pam_silent` setting permits sudo's PAM conversation to display the
+prompt. Enter (an empty response) or exact uppercase `OK` confirms one scan;
+any other response cancels and falls through to the next configured PAM method.
+Password fallback still depends on the administrator's PAM stack.
+
+Package installation and updates do not add/remove this sudoers file or edit
+PAM policy. Only an explicit root `howy security set-presence confirm|off`
+command manages it.
 
 ```bash
 # Optional accelerator prewarm, then deployment check.

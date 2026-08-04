@@ -40,6 +40,7 @@ use howy_common::provisioning::{
 
 use super::command::{
     CommandSpec, KeySelection, credential_encrypt_command, readiness_command, readiness_unit_name,
+    visudo_validation_command,
 };
 
 pub const MODE1_DROPIN_BYTES: &[u8] = b"[Service]\n\
@@ -51,6 +52,9 @@ SetCredential=howy.storage.mode1.source:/etc/credstore.encrypted/howy.storage.mo
 pub const MODE0_DROPIN_BYTES: &[u8] = b"[Service]\n\
 LoadCredentialEncrypted=\n\
 SetCredential=\n";
+
+pub const PAM_PROMPT_SUDOERS_PATH: &str = "/etc/sudoers.d/90-howy-pam-prompt";
+pub const PAM_PROMPT_SUDOERS_BYTES: &[u8] = b"Defaults !pam_silent\n";
 
 /// Compile-time pins for the exact packaged fragments reviewed by the
 /// transaction engine. Effective-unit trust is never learned from arbitrary
@@ -364,6 +368,7 @@ pub trait SecurityRuntime {
         plaintext: &[u8],
     ) -> SecurityResult<Vec<u8>>;
     fn run_readiness(&mut self, command: &CommandSpec) -> SecurityResult<Vec<u8>>;
+    fn run_checked_command(&mut self, command: &CommandSpec) -> SecurityResult<Vec<u8>>;
     fn preview_verifier(&mut self, config: &[u8]) -> SecurityResult<VerifierResultV1>;
     fn namespace_nonempty(&mut self) -> SecurityResult<bool>;
     fn security_info(&mut self) -> SecurityResult<Option<SecurityInfoResult>>;
@@ -410,13 +415,6 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
                 "security mode 2 is unavailable until its feasibility gate passes".into(),
             ));
         }
-        if request.mode == ProvisionMode::Plaintext
-            && request.presence == ProvisionPresence::Confirm
-        {
-            return Err(SecurityError::Refused(
-                "presence confirmation is unavailable for security mode 0".into(),
-            ));
-        }
         if !request.confirmed {
             return Err(SecurityError::Refused(
                 "security migration requires explicit confirmation".into(),
@@ -431,7 +429,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             }
             engine.runtime.require_systemd_261()?;
             match request.mode {
-                ProvisionMode::Plaintext => engine.provision_plaintext(),
+                ProvisionMode::Plaintext => engine.provision_plaintext(request.presence),
                 ProvisionMode::CachedAead => engine.provision_mode1(request),
                 ProvisionMode::EphemeralAead => unreachable!(),
             }
@@ -474,6 +472,696 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             let _ = engine.recover_locked()?;
             engine.cleanup_locked(request)
         })
+    }
+
+    pub fn set_presence(&mut self, presence: ProvisionPresence) -> SecurityResult<SecurityOutcome> {
+        self.runtime.require_root()?;
+        self.runtime.acquire_lock()?;
+        self.require_presence_controls_clear()?;
+        self.runtime.validate_package_marker()?;
+
+        let target = self.prepare_presence_target(presence)?;
+        match presence {
+            ProvisionPresence::Confirm => self.set_presence_confirm(target),
+            ProvisionPresence::Off => self.set_presence_off(target),
+        }
+    }
+
+    fn set_presence_confirm(&mut self, target: PresenceTarget) -> SecurityResult<SecurityOutcome> {
+        let sudoers = self.observe_managed_sudoers_override().map_err(|error| {
+            SecurityError::Refused(format!(
+                "managed sudoers override is unavailable or differs and was retained: {error}"
+            ))
+        })?;
+        let needs_transaction =
+            target.is_changed() || matches!(sudoers, ManagedSudoersOverride::Absent(_));
+        let transaction_id = needs_transaction
+            .then(|| self.runtime.transaction_id())
+            .transpose()?;
+
+        let created = match sudoers {
+            ManagedSudoersOverride::Absent(parent) => Some(
+                self.create_managed_sudoers_override(
+                    transaction_id
+                        .as_deref()
+                        .expect("absent override requires transaction ID"),
+                    &parent,
+                )?,
+            ),
+            ManagedSudoersOverride::Exact(_) => None,
+        };
+
+        let result = (|| -> SecurityResult<bool> {
+            self.runtime
+                .run_checked_command(&visudo_validation_command())
+                .map_err(|error| {
+                    SecurityError::Refused(format!(
+                        "full sudoers validation failed; presence was not changed: {error}"
+                    ))
+                })?;
+            if !target.is_changed() {
+                return Ok(false);
+            }
+            self.apply_presence_target(
+                &target,
+                transaction_id
+                    .as_deref()
+                    .expect("changed presence requires transaction ID"),
+            )?;
+            Ok(true)
+        })();
+
+        let changed = match result {
+            Ok(changed) => changed,
+            Err(error) => {
+                return Err(self.cleanup_created_sudoers_after_error(error, created.as_ref()));
+            }
+        };
+        let message = match (changed, created.is_some()) {
+            (true, true) => "Presence policy set to confirm; created managed sudoers override.",
+            (true, false) => {
+                "Presence policy set to confirm; retained and validated managed sudoers override."
+            }
+            (false, true) => {
+                "Presence policy already set to confirm; created managed sudoers override."
+            }
+            (false, false) => {
+                "Presence policy already set to confirm; retained and validated managed sudoers override."
+            }
+        };
+        Ok(SecurityOutcome {
+            messages: vec![message.into()],
+            cleanup_command: None,
+        })
+    }
+
+    fn set_presence_off(&mut self, target: PresenceTarget) -> SecurityResult<SecurityOutcome> {
+        let changed = if target.is_changed() {
+            let transaction_id = self.runtime.transaction_id()?;
+            self.apply_presence_target(&target, &transaction_id)?;
+            true
+        } else {
+            false
+        };
+        let removed = self.remove_managed_sudoers_override()?;
+        let message = match (changed, removed) {
+            (true, true) => "Presence policy set to off; removed managed sudoers override.",
+            (true, false) => "Presence policy set to off; managed sudoers override was absent.",
+            (false, true) => {
+                "Presence policy already set to off; removed managed sudoers override."
+            }
+            (false, false) => {
+                "Presence policy already set to off; managed sudoers override was absent, no changes made."
+            }
+        };
+        Ok(SecurityOutcome {
+            messages: vec![message.into()],
+            cleanup_command: None,
+        })
+    }
+
+    fn apply_presence_target(
+        &mut self,
+        target: &PresenceTarget,
+        transaction_id: &str,
+    ) -> SecurityResult<()> {
+        let config_plan = self.prepare_presence_exchange_plan(
+            transaction_id,
+            howy_common::paths::CONFIG_FILE,
+            &target.config_file,
+            &target.config_bytes,
+        )?;
+        let receipt_plan = target
+            .receipt
+            .as_ref()
+            .map(|receipt| {
+                self.prepare_presence_exchange_plan(
+                    transaction_id,
+                    SECURITY_RECEIPT_PATH,
+                    &receipt.file,
+                    &receipt.bytes,
+                )
+            })
+            .transpose()?;
+
+        let (service, socket) = self.stable_unit_pair()?;
+        if service.rollback_target() == Some(StableRollbackTarget::ActiveRunning)
+            && socket.rollback_target() == Some(StableRollbackTarget::InactiveDead)
+        {
+            return Err(SecurityError::Refused(
+                "active howy.service with inactive howy.socket is unsupported".into(),
+            ));
+        }
+        if target.config_disabled
+            && service.rollback_target() == Some(StableRollbackTarget::ActiveRunning)
+        {
+            return Err(SecurityError::Refused(
+                "disabled config with active howy.service cannot preserve prior activity".into(),
+            ));
+        }
+
+        let mutation = self.apply_presence_change(&target, &config_plan, receipt_plan.as_ref());
+        let restoration = self.restore_presence_units(&service, &socket);
+        match (mutation, restoration) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(restoration)) => Err(SecurityError::Uncertain(format!(
+                "presence policy was written but prior unit activity could not be restored: {restoration}"
+            ))),
+            (Err(error), Err(restoration)) => Err(SecurityError::Uncertain(format!(
+                "{error}; prior unit activity could not be restored: {restoration}"
+            ))),
+        }
+    }
+
+    fn observe_managed_sudoers_override(&mut self) -> SecurityResult<ManagedSudoersOverride> {
+        let observation = self
+            .runtime
+            .observe_atomic_target(PAM_PROMPT_SUDOERS_PATH, PAM_PROMPT_SUDOERS_BYTES.len())?;
+        let parent = &observation.parent_directory;
+        if parent.path != "/etc/sudoers.d"
+            || parent.object_type != FileObjectType::Directory
+            || parent.uid != 0
+            || parent.gid != 0
+            || parent.permissions & 0o022 != 0
+            || parent.link_count == 0
+            || parent.device_id == 0
+            || parent.inode == 0
+        {
+            return Err(SecurityError::operation(
+                "managed sudoers parent metadata is unsafe",
+            ));
+        }
+        let Some(file) = observation.target else {
+            return Ok(ManagedSudoersOverride::Absent(parent.clone()));
+        };
+        let exact = file.bytes == PAM_PROMPT_SUDOERS_BYTES
+            && file.metadata.object_type == FileObjectType::RegularFile
+            && file.metadata.uid == 0
+            && file.metadata.gid == 0
+            && file.metadata.permissions == 0o440
+            && file.metadata.link_count == 1
+            && file.metadata.byte_length == PAM_PROMPT_SUDOERS_BYTES.len() as u64
+            && file.device_id != 0
+            && file.inode != 0
+            && file.parent_device_id == parent.device_id
+            && file.parent_inode == parent.inode
+            && file.parent_uid == parent.uid
+            && file.parent_gid == parent.gid
+            && file.parent_permissions == parent.permissions
+            && file.parent_link_count == parent.link_count;
+        if !exact {
+            return Err(SecurityError::operation(
+                "managed sudoers path has differing content, metadata, or link state",
+            ));
+        }
+        Ok(ManagedSudoersOverride::Exact(file))
+    }
+
+    fn create_managed_sudoers_override(
+        &mut self,
+        transaction_id: &str,
+        parent: &DirectoryIdentityV1,
+    ) -> SecurityResult<AtomicFileIdentityV1> {
+        let plan = AtomicWritePlanV1::new(
+            transaction_id,
+            PAM_PROMPT_SUDOERS_PATH,
+            parent.clone(),
+            AtomicExpectedTargetV1::Absent,
+            0,
+            0,
+            0o440,
+            None,
+            PAM_PROMPT_SUDOERS_BYTES,
+            AtomicWriteKindV1::NoReplace,
+        )
+        .map_err(|error| SecurityError::operation(error.to_string()))?;
+        if plan.target_path != PAM_PROMPT_SUDOERS_PATH
+            || plan.operation != AtomicWriteKindV1::NoReplace
+            || !matches!(plan.expected_target, AtomicExpectedTargetV1::Absent)
+            || plan.backup_path.is_some()
+            || plan.uid != 0
+            || plan.gid != 0
+            || plan.permissions != 0o440
+            || plan.timestamps.is_some()
+            || plan.byte_length != PAM_PROMPT_SUDOERS_BYTES.len() as u64
+            || plan.bytes_sha256 != Sha256Digest::from_bytes(PAM_PROMPT_SUDOERS_BYTES)
+        {
+            return Err(SecurityError::operation(
+                "managed sudoers publication plan is invalid",
+            ));
+        }
+        let publication = self.publish_unjournaled_atomic(&plan, PAM_PROMPT_SUDOERS_BYTES)?;
+        let identity = publication.target.clone();
+        let verification = self
+            .observe_managed_sudoers_override()
+            .and_then(|observed| match observed {
+                ManagedSudoersOverride::Exact(file) if file.atomic_identity() == identity => Ok(()),
+                ManagedSudoersOverride::Exact(_) | ManagedSudoersOverride::Absent(_) => {
+                    Err(SecurityError::operation(
+                        "created managed sudoers override failed exact verification",
+                    ))
+                }
+            });
+        if let Err(error) = verification {
+            return Err(self.cleanup_created_sudoers_after_error(error, Some(&identity)));
+        }
+        if let Err(error) = self.runtime.remove_atomic_backup(&plan, &publication) {
+            return Err(self.cleanup_created_sudoers_after_error(error, Some(&identity)));
+        }
+        Ok(identity)
+    }
+
+    fn cleanup_created_sudoers_after_error(
+        &mut self,
+        error: SecurityError,
+        created: Option<&AtomicFileIdentityV1>,
+    ) -> SecurityError {
+        let Some(created) = created else {
+            return error;
+        };
+        let cleanup = self
+            .runtime
+            .remove_file_exact(PAM_PROMPT_SUDOERS_PATH, created)
+            .and_then(|()| match self.observe_managed_sudoers_override() {
+                Ok(ManagedSudoersOverride::Absent(_)) => Ok(()),
+                Ok(ManagedSudoersOverride::Exact(_)) => Err(SecurityError::Uncertain(
+                    "newly created managed sudoers override remained after cleanup".into(),
+                )),
+                Err(cleanup) => Err(cleanup),
+            });
+        match cleanup {
+            Ok(()) => error,
+            Err(cleanup) => SecurityError::Uncertain(format!(
+                "confirmation failed: {error}; exact newly created managed sudoers override cleanup also failed: {cleanup}"
+            )),
+        }
+    }
+
+    fn remove_managed_sudoers_override(&mut self) -> SecurityResult<bool> {
+        let preliminary = self
+            .runtime
+            .read_file(PAM_PROMPT_SUDOERS_PATH, PAM_PROMPT_SUDOERS_BYTES.len());
+        match preliminary {
+            Ok(None) => return Ok(false),
+            Ok(Some(_)) => {}
+            Err(error) => {
+                return Err(SecurityError::Uncertain(format!(
+                    "presence is off but the differing managed sudoers path was retained: {error}"
+                )));
+            }
+        }
+        let observed = self.observe_managed_sudoers_override().map_err(|error| {
+            SecurityError::Uncertain(format!(
+                "presence is off but the differing managed sudoers path was retained: {error}"
+            ))
+        })?;
+        let ManagedSudoersOverride::Exact(file) = observed else {
+            return Ok(false);
+        };
+        self.runtime
+            .remove_file_exact(PAM_PROMPT_SUDOERS_PATH, &file.atomic_identity())
+            .map_err(|error| {
+                SecurityError::Uncertain(format!(
+                    "presence is off but exact managed sudoers override removal failed: {error}"
+                ))
+            })?;
+        match self.observe_managed_sudoers_override() {
+            Ok(ManagedSudoersOverride::Absent(_)) => Ok(true),
+            Ok(ManagedSudoersOverride::Exact(_)) => Err(SecurityError::Uncertain(
+                "presence is off but managed sudoers override remained after removal".into(),
+            )),
+            Err(error) => Err(SecurityError::Uncertain(format!(
+                "presence is off but managed sudoers override absence could not be verified: {error}"
+            ))),
+        }
+    }
+
+    fn require_presence_controls_clear(&mut self) -> SecurityResult<()> {
+        if self
+            .runtime
+            .read_file(SECURITY_JOURNAL_PATH, MAX_JOURNAL_BYTES)?
+            .is_some()
+        {
+            return Err(SecurityError::Refused(
+                "active provisioning journal blocks presence changes".into(),
+            ));
+        }
+        if self
+            .runtime
+            .read_file(SECURITY_TRANSACTION_GUARD_PATH, 256)?
+            .is_some()
+        {
+            return Err(SecurityError::Refused(
+                "active provisioning guard blocks presence changes".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn prepare_presence_target(
+        &mut self,
+        presence: ProvisionPresence,
+    ) -> SecurityResult<PresenceTarget> {
+        let config_file = self
+            .runtime
+            .read_file(howy_common::paths::CONFIG_FILE, MAX_CONFIG_BYTES)?
+            .ok_or_else(|| SecurityError::Refused("security config is missing".into()))?;
+        config_file.validate_regular(0, 0, 0o600)?;
+        let source = std::str::from_utf8(&config_file.bytes)
+            .map_err(|_| SecurityError::Refused("security config is not UTF-8".into()))?;
+        let config: HowyConfig = toml::from_str(source)
+            .map_err(|_| SecurityError::Refused("security config is malformed".into()))?;
+        config.validate().map_err(|error| {
+            SecurityError::Refused(format!("security config is invalid: {error}"))
+        })?;
+
+        let receipt = self.read_canonical_presence_receipt()?;
+        let config_disabled = config.core.disabled;
+        match config.security.embedding_mode {
+            EmbeddingSecurityMode::Plaintext => {
+                if receipt.is_some() {
+                    return Err(SecurityError::Refused(
+                        "active Mode 1 receipt conflicts with Mode 0 config".into(),
+                    ));
+                }
+                Ok(PresenceTarget {
+                    config_bytes: build_presence_config(config, presence)?,
+                    config_file,
+                    config_disabled,
+                    receipt: None,
+                })
+            }
+            EmbeddingSecurityMode::AeadCached => match receipt {
+                Some((receipt_file, receipt)) => {
+                    validate_receipted_config(&config_file, &receipt)?;
+                    let (config_bytes, receipt) =
+                        build_receipted_presence_target(config, &receipt, presence)?;
+                    Ok(PresenceTarget {
+                        config_file,
+                        config_bytes,
+                        config_disabled,
+                        receipt: Some(PresenceReceiptTarget {
+                            file: receipt_file,
+                            bytes: receipt
+                                .deterministic_bytes()
+                                .map_err(|error| SecurityError::operation(error.to_string()))?,
+                            receipt,
+                        }),
+                    })
+                }
+                None => {
+                    if !config.core.disabled {
+                        return Err(SecurityError::Refused(
+                            "unreceipted Mode 1 config must be disabled".into(),
+                        ));
+                    }
+                    let artifact = self.runtime.read_file(
+                        MODE1_CREDENTIAL_PATH,
+                        howy_common::provisioning::SYSTEMD_CREDENTIAL_TEXT_SIZE_MAX,
+                    )?;
+                    let dropin = self
+                        .runtime
+                        .read_file(MODE1_DROPIN_PATH, MAX_DROPIN_BYTES)?;
+                    let namespace_nonempty = self.runtime.namespace_nonempty()?;
+                    if artifact.is_some() || dropin.is_some() || namespace_nonempty {
+                        return Err(SecurityError::Refused(
+                            "unreceipted Mode 1 config has a Mode 1 object or record".into(),
+                        ));
+                    }
+                    Ok(PresenceTarget {
+                        config_bytes: build_presence_config(config, presence)?,
+                        config_file,
+                        config_disabled,
+                        receipt: None,
+                    })
+                }
+            },
+            EmbeddingSecurityMode::AeadEphemeral => Err(SecurityError::Refused(
+                "security mode 2 does not support presence changes".into(),
+            )),
+            EmbeddingSecurityMode::ReservedFuture => Err(SecurityError::Refused(
+                "unsupported security mode does not support presence changes".into(),
+            )),
+        }
+    }
+
+    fn read_canonical_presence_receipt(
+        &mut self,
+    ) -> SecurityResult<Option<(ObservedFile, ProvisioningReceiptV1)>> {
+        self.runtime
+            .read_file(SECURITY_RECEIPT_PATH, MAX_RECEIPT_BYTES)?
+            .map(|file| {
+                file.validate_regular(0, 0, 0o600)?;
+                let receipt = ProvisioningReceiptV1::parse(&file.bytes)
+                    .map_err(|_| SecurityError::Refused("Mode 1 receipt is malformed".into()))?;
+                let canonical = receipt
+                    .deterministic_bytes()
+                    .map_err(|error| SecurityError::operation(error.to_string()))?;
+                if file.bytes != canonical {
+                    return Err(SecurityError::Refused(
+                        "Mode 1 receipt is not canonical".into(),
+                    ));
+                }
+                Ok((file, receipt))
+            })
+            .transpose()
+    }
+
+    fn prepare_presence_exchange_plan(
+        &mut self,
+        transaction_id: &str,
+        path: &str,
+        current: &ObservedFile,
+        bytes: &[u8],
+    ) -> SecurityResult<AtomicWritePlanV1> {
+        let plan =
+            self.prepare_atomic_plan(transaction_id, path, bytes, 0, 0, 0o600, None, false)?;
+        if plan.operation != AtomicWriteKindV1::Exchange
+            || plan.expected_target != AtomicExpectedTargetV1::Present(current.atomic_identity())
+        {
+            return Err(SecurityError::operation(
+                "presence publication target changed while plans were prepared",
+            ));
+        }
+        Ok(plan)
+    }
+
+    fn apply_presence_change(
+        &mut self,
+        target: &PresenceTarget,
+        config_plan: &AtomicWritePlanV1,
+        receipt_plan: Option<&AtomicWritePlanV1>,
+    ) -> SecurityResult<()> {
+        self.stop_units_under_one_deadline()?;
+        let config_publication =
+            self.publish_unjournaled_atomic(config_plan, &target.config_bytes)?;
+
+        let receipt_publication = match (&target.receipt, receipt_plan) {
+            (Some(receipt), Some(plan)) => {
+                match self.publish_unjournaled_atomic_classified(plan, &receipt.bytes) {
+                    UnjournaledAtomicPublication::Committed(publication) => Some(publication),
+                    UnjournaledAtomicPublication::NotCommitted(publication_error) => {
+                        let rollback = self.rollback_presence_config(
+                            config_plan,
+                            &config_publication,
+                            &target.config_file,
+                        );
+                        return match rollback {
+                            Ok(()) => Err(publication_error),
+                            Err(rollback_error) => Err(SecurityError::Uncertain(format!(
+                                "receipt publication failed: {publication_error}; exact old config rollback also failed: {rollback_error}"
+                            ))),
+                        };
+                    }
+                    UnjournaledAtomicPublication::Uncertain(error) => return Err(error),
+                }
+            }
+            (None, None) => None,
+            _ => {
+                return Err(SecurityError::operation(
+                    "presence receipt target and publication plan disagree",
+                ));
+            }
+        };
+
+        self.verify_presence_publication(
+            howy_common::paths::CONFIG_FILE,
+            MAX_CONFIG_BYTES,
+            &target.config_bytes,
+            &config_publication,
+        )?;
+        if let (Some(receipt), Some(publication)) = (&target.receipt, &receipt_publication) {
+            self.verify_presence_publication(
+                SECURITY_RECEIPT_PATH,
+                MAX_RECEIPT_BYTES,
+                &receipt.bytes,
+                publication,
+            )?;
+            let live = ProvisioningReceiptV1::parse(&receipt.bytes)
+                .map_err(|error| SecurityError::operation(error.to_string()))?;
+            if live != receipt.receipt {
+                return Err(SecurityError::operation(
+                    "published receipt structure differs from target",
+                ));
+            }
+        }
+
+        if let (Some(plan), Some(publication)) = (receipt_plan, &receipt_publication) {
+            self.runtime.remove_atomic_backup(plan, publication)?;
+        }
+        self.runtime
+            .remove_atomic_backup(config_plan, &config_publication)
+    }
+
+    fn publish_unjournaled_atomic(
+        &mut self,
+        plan: &AtomicWritePlanV1,
+        bytes: &[u8],
+    ) -> SecurityResult<AtomicWriteObservationV1> {
+        match self.publish_unjournaled_atomic_classified(plan, bytes) {
+            UnjournaledAtomicPublication::Committed(observation) => Ok(observation),
+            UnjournaledAtomicPublication::NotCommitted(error)
+            | UnjournaledAtomicPublication::Uncertain(error) => Err(error),
+        }
+    }
+
+    fn publish_unjournaled_atomic_classified(
+        &mut self,
+        plan: &AtomicWritePlanV1,
+        bytes: &[u8],
+    ) -> UnjournaledAtomicPublication {
+        let staged = match self.runtime.create_atomic_stage(plan, bytes) {
+            Ok(staged) => staged,
+            Err(error) => return UnjournaledAtomicPublication::NotCommitted(error),
+        };
+        match self.runtime.commit_atomic_stage(plan, &staged) {
+            Ok(observation) => UnjournaledAtomicPublication::Committed(observation),
+            Err(publication_error) => {
+                match self.runtime.reconcile_atomic_write(plan, Some(&staged)) {
+                    Ok(AtomicWriteReconciliation::Committed(observation)) => {
+                        UnjournaledAtomicPublication::Committed(observation)
+                    }
+                    Ok(AtomicWriteReconciliation::NotCommitted) => {
+                        UnjournaledAtomicPublication::NotCommitted(publication_error)
+                    }
+                    Err(reconciliation_error) => {
+                        UnjournaledAtomicPublication::Uncertain(SecurityError::Uncertain(format!(
+                            "atomic publication failed and could not be reconciled: {publication_error}; {reconciliation_error}"
+                        )))
+                    }
+                }
+            }
+        }
+    }
+
+    fn rollback_presence_config(
+        &mut self,
+        config_plan: &AtomicWritePlanV1,
+        publication: &AtomicWriteObservationV1,
+        old_config: &ObservedFile,
+    ) -> SecurityResult<()> {
+        let old_identity = old_config.atomic_identity();
+        if publication.backup.as_ref() != Some(&old_identity) {
+            return Err(SecurityError::Uncertain(
+                "published config backup is not the exact old config".into(),
+            ));
+        }
+        let rollback_plan = AtomicWritePlanV1::new(
+            &config_plan.transaction_id,
+            howy_common::paths::CONFIG_FILE,
+            config_plan.parent_directory.clone(),
+            AtomicExpectedTargetV1::Present(publication.target.clone()),
+            0,
+            0,
+            0o600,
+            Some(old_config.metadata.restorable_timestamps.clone()),
+            &old_config.bytes,
+            AtomicWriteKindV1::Exchange,
+        )
+        .map_err(|error| SecurityError::operation(error.to_string()))?;
+        if rollback_plan.staging_path == config_plan.staging_path {
+            return Err(SecurityError::Uncertain(
+                "config rollback stage unexpectedly aliases the published backup".into(),
+            ));
+        }
+        let rollback_stage = self
+            .runtime
+            .create_atomic_stage(&rollback_plan, &old_config.bytes)?;
+        let rollback = match self
+            .runtime
+            .commit_atomic_stage(&rollback_plan, &rollback_stage)
+        {
+            Ok(observation) => observation,
+            Err(error) => match self
+                .runtime
+                .reconcile_atomic_write(&rollback_plan, Some(&rollback_stage))
+            {
+                Ok(AtomicWriteReconciliation::Committed(observation)) => observation,
+                Ok(AtomicWriteReconciliation::NotCommitted) => return Err(error),
+                Err(reconciliation) => {
+                    return Err(SecurityError::Uncertain(format!(
+                        "config rollback failed and could not be reconciled: {error}; {reconciliation}"
+                    )));
+                }
+            },
+        };
+        self.verify_presence_publication(
+            howy_common::paths::CONFIG_FILE,
+            MAX_CONFIG_BYTES,
+            &old_config.bytes,
+            &rollback,
+        )?;
+        self.runtime
+            .remove_atomic_backup(&rollback_plan, &rollback)?;
+        self.runtime
+            .remove_file_exact(&config_plan.staging_path, &old_identity)
+    }
+
+    fn verify_presence_publication(
+        &mut self,
+        path: &str,
+        maximum: usize,
+        expected_bytes: &[u8],
+        publication: &AtomicWriteObservationV1,
+    ) -> SecurityResult<()> {
+        let file = self
+            .runtime
+            .read_file(path, maximum)?
+            .ok_or_else(|| SecurityError::operation("published presence file disappeared"))?;
+        file.validate_regular(0, 0, 0o600)?;
+        if file.bytes != expected_bytes || file.atomic_identity() != publication.target {
+            return Err(SecurityError::operation(
+                "published presence file bytes or metadata differ from target",
+            ));
+        }
+        Ok(())
+    }
+
+    fn restore_presence_units(
+        &mut self,
+        service: &StableUnitState,
+        socket: &StableUnitState,
+    ) -> SecurityResult<()> {
+        let mut failures = Vec::new();
+        if socket.rollback_target() == Some(StableRollbackTarget::ActiveListening)
+            && let Err(error) = self.runtime.start_unit(UnitKind::Socket)
+        {
+            failures.push(format!("socket start: {error}"));
+        }
+        if service.rollback_target() == Some(StableRollbackTarget::ActiveRunning)
+            && let Err(error) = self.runtime.start_unit(UnitKind::Service)
+        {
+            failures.push(format!("service start: {error}"));
+        }
+        if let Err(error) = self.verify_restored_targets(service, socket) {
+            failures.push(format!("stable state verification: {error}"));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(SecurityError::Uncertain(failures.join("; ")))
+        }
     }
 
     pub fn package_reconcile(
@@ -822,7 +1510,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
             .read_file(BASE_SOCKET_UNIT_PATH, MAX_DROPIN_BYTES)?
             .ok_or_else(|| SecurityError::operation("base howy.socket is missing"))?;
 
-        let state = if howy_config_bridge::validate_bootstrap_config(&config.bytes).is_ok() {
+        let state = if validate_package_bootstrap_config(&config).is_ok() {
             config.validate_regular(0, 0, 0o600)?;
             if artifact.is_some() || dropin.is_some() || namespace_nonempty {
                 return Err(SecurityError::Refused(
@@ -2587,7 +3275,10 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
         Ok(())
     }
 
-    fn provision_plaintext(&mut self) -> SecurityResult<SecurityOutcome> {
+    fn provision_plaintext(
+        &mut self,
+        presence: ProvisionPresence,
+    ) -> SecurityResult<SecurityOutcome> {
         let supervisor =
             self.begin_supervised_transaction(SupervisorOperationV1::ProvisionMode0, None)?;
         let config = self
@@ -2596,7 +3287,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
         if let Some(config) = &config {
             config.validate_regular(0, 0, 0o600)?;
         }
-        let enabled_config = build_enabled_mode0_config(config.as_ref())?;
+        let enabled_config = build_enabled_mode0_config(config.as_ref(), presence)?;
         let prompt_required = config_prompt_required(&enabled_config)?;
         let transaction_id = supervisor.transaction_id.clone();
         let service = supervisor
@@ -5320,6 +6011,44 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PresenceReceiptTarget {
+    file: ObservedFile,
+    bytes: Vec<u8>,
+    receipt: ProvisioningReceiptV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PresenceTarget {
+    config_file: ObservedFile,
+    config_bytes: Vec<u8>,
+    config_disabled: bool,
+    receipt: Option<PresenceReceiptTarget>,
+}
+
+impl PresenceTarget {
+    fn is_changed(&self) -> bool {
+        self.config_file.bytes != self.config_bytes
+            || self
+                .receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.file.bytes != receipt.bytes)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManagedSudoersOverride {
+    Absent(DirectoryIdentityV1),
+    Exact(ObservedFile),
+}
+
+#[derive(Debug)]
+enum UnjournaledAtomicPublication {
+    Committed(AtomicWriteObservationV1),
+    NotCommitted(SecurityError),
+    Uncertain(SecurityError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PackageMode1Live {
     config: ObservedFile,
     artifact: ObservedFile,
@@ -5510,6 +6239,22 @@ fn validate_package_mode0_config(config: &ObservedFile) -> SecurityResult<()> {
     validate_package_mode0_config_semantics(config)
 }
 
+fn validate_package_bootstrap_config(config: &ObservedFile) -> SecurityResult<()> {
+    config.validate_regular(0, 0, 0o600)?;
+    let source = std::str::from_utf8(&config.bytes)
+        .map_err(|_| SecurityError::operation("bootstrap config is not UTF-8"))?;
+    let parsed: HowyConfig = toml::from_str(source)
+        .map_err(|_| SecurityError::operation("bootstrap config is invalid"))?;
+    parsed.validate().map_err(SecurityError::operation)?;
+    if parsed.security.embedding_mode != EmbeddingSecurityMode::AeadCached || !parsed.core.disabled
+    {
+        return Err(SecurityError::Refused(
+            "config is not a valid disabled Mode 1 bootstrap".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_package_legacy_candidate_mode0_config(config: &ObservedFile) -> SecurityResult<()> {
     let expected_permissions = if config.metadata.permissions == 0o644 {
         0o644
@@ -5526,13 +6271,8 @@ fn validate_package_mode0_config_semantics(config: &ObservedFile) -> SecurityRes
     let parsed: HowyConfig =
         toml::from_str(source).map_err(|_| SecurityError::operation("Mode 0 config is invalid"))?;
     parsed.validate().map_err(SecurityError::operation)?;
-    if parsed.security.embedding_mode != EmbeddingSecurityMode::Plaintext
-        || parsed.core.disabled
-        || parsed.presence.mode != PresenceMode::Off
-    {
-        return Err(SecurityError::Refused(
-            "config is not exact enabled Mode 0".into(),
-        ));
+    if parsed.security.embedding_mode != EmbeddingSecurityMode::Plaintext {
+        return Err(SecurityError::Refused("config is not valid Mode 0".into()));
     }
     Ok(())
 }
@@ -5620,13 +6360,7 @@ fn build_disabled_mode1_config(
     parsed.security.embedding_mode = EmbeddingSecurityMode::AeadCached;
     parsed.security.key_epoch = MODE1_KEY_EPOCH;
     parsed.security.cached.credential_name = MODE1_CREDENTIAL_NAME.into();
-    parsed.presence.mode = match presence {
-        ProvisionPresence::Off => PresenceMode::Off,
-        ProvisionPresence::Confirm => PresenceMode::Confirm,
-    };
-    if presence == ProvisionPresence::Confirm && parsed.presence.allowed_pam_services.is_empty() {
-        parsed.presence.allowed_pam_services = vec!["sudo".into()];
-    }
+    apply_presence_policy(&mut parsed, presence);
     parsed.validate().map_err(SecurityError::operation)?;
     let bytes = toml::to_string_pretty(&parsed)
         .map_err(|_| SecurityError::operation("candidate configuration serialization failed"))?
@@ -5639,7 +6373,69 @@ fn build_disabled_mode1_config(
     Ok(bytes)
 }
 
-fn build_enabled_mode0_config(config: Option<&ObservedFile>) -> SecurityResult<Vec<u8>> {
+fn build_presence_config(
+    mut config: HowyConfig,
+    presence: ProvisionPresence,
+) -> SecurityResult<Vec<u8>> {
+    apply_presence_policy(&mut config, presence);
+    serialize_presence_config(&config)
+}
+
+fn build_receipted_presence_target(
+    config: HowyConfig,
+    receipt: &ProvisioningReceiptV1,
+    presence: ProvisionPresence,
+) -> SecurityResult<(Vec<u8>, ProvisioningReceiptV1)> {
+    let mut disabled = config;
+    disabled.core.disabled = true;
+    apply_presence_policy(&mut disabled, presence);
+    let disabled_bytes = serialize_presence_config(&disabled)?;
+    let prepared = prepare_config_enable_patch(&disabled_bytes)
+        .map_err(|error| SecurityError::operation(error.to_string()))?;
+    let config_bytes = match receipt.state {
+        ReceiptState::ProvisionedDisabled => disabled_bytes,
+        ReceiptState::Enabled => prepared.enabled_bytes,
+    };
+
+    let mut rebuilt = receipt.clone();
+    rebuilt.config_patch = prepared.contract;
+    rebuilt.verifier.output.config_sha256 = match rebuilt.state {
+        ReceiptState::ProvisionedDisabled => rebuilt.config_patch.disabled_sha256.clone(),
+        ReceiptState::Enabled => rebuilt.config_patch.enabled_sha256.clone(),
+    };
+    rebuilt.verifier = VerifierReceipt::new(rebuilt.verifier.output.clone())
+        .map_err(|error| SecurityError::operation(error.to_string()))?;
+
+    let mut expected = receipt.clone();
+    expected.config_patch = rebuilt.config_patch.clone();
+    expected.verifier.output.config_sha256 = rebuilt.verifier.output.config_sha256.clone();
+    expected.verifier.output_sha256 = rebuilt.verifier.output_sha256.clone();
+    if rebuilt != expected {
+        return Err(SecurityError::operation(
+            "presence change altered an immutable Mode 1 receipt field",
+        ));
+    }
+    rebuilt
+        .validate()
+        .map_err(|error| SecurityError::operation(error.to_string()))?;
+    Ok((config_bytes, rebuilt))
+}
+
+fn serialize_presence_config(config: &HowyConfig) -> SecurityResult<Vec<u8>> {
+    config.validate().map_err(SecurityError::operation)?;
+    let bytes = toml::to_string_pretty(config)
+        .map_err(|_| SecurityError::operation("presence config serialization failed"))?
+        .into_bytes();
+    if bytes.len() > MAX_CONFIG_BYTES {
+        return Err(SecurityError::operation("presence config is too large"));
+    }
+    Ok(bytes)
+}
+
+fn build_enabled_mode0_config(
+    config: Option<&ObservedFile>,
+    presence: ProvisionPresence,
+) -> SecurityResult<Vec<u8>> {
     let mut parsed = match config {
         Some(file) => toml::from_str::<HowyConfig>(
             std::str::from_utf8(&file.bytes)
@@ -5650,7 +6446,7 @@ fn build_enabled_mode0_config(config: Option<&ObservedFile>) -> SecurityResult<V
     };
     parsed.core.disabled = false;
     parsed.security.embedding_mode = EmbeddingSecurityMode::Plaintext;
-    parsed.presence.mode = PresenceMode::Off;
+    apply_presence_policy(&mut parsed, presence);
     parsed.validate().map_err(SecurityError::operation)?;
     let bytes = toml::to_string_pretty(&parsed)
         .map_err(|_| SecurityError::operation("Mode 0 configuration serialization failed"))?
@@ -5675,11 +6471,27 @@ fn config_prompt_required(bytes: &[u8]) -> SecurityResult<bool> {
 fn require_requested_presence(bytes: &[u8], requested: ProvisionPresence) -> SecurityResult<()> {
     if config_prompt_required(bytes)? != (requested == ProvisionPresence::Confirm) {
         return Err(SecurityError::Refused(
-            "receipted Mode 1 presence differs from the requested provision-time presence; runtime toggles are unsupported"
+            "receipted Mode 1 presence differs from the requested provision-time presence; use `howy security set-presence off|confirm`"
                 .into(),
         ));
     }
     Ok(())
+}
+
+fn apply_presence_policy(config: &mut HowyConfig, presence: ProvisionPresence) {
+    config.presence.mode = match presence {
+        ProvisionPresence::Off => PresenceMode::Off,
+        ProvisionPresence::Confirm => PresenceMode::Confirm,
+    };
+    if presence == ProvisionPresence::Confirm
+        && !config
+            .presence
+            .allowed_pam_services
+            .iter()
+            .any(|service| service == "sudo")
+    {
+        config.presence.allowed_pam_services.push("sudo".into());
+    }
 }
 
 fn bump_generation(generation: &mut u64) -> SecurityResult<()> {
