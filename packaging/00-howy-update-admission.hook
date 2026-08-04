@@ -1,0 +1,13 @@
+[Trigger]
+Operation = Upgrade
+Type = Package
+Target = howy-cpu
+Target = howy-rocm
+Target = howy-cuda
+
+[Action]
+Description = Verifying Howy stable update admission
+When = PreTransaction
+Exec = /usr/lib/howy/howy-v2-update-admission
+AbortOnFail
+NeedsTargets

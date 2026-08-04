@@ -1,0 +1,273 @@
+diff --git a/crates/howy-cli/src/security/engine.rs b/crates/howy-cli/src/security/engine.rs
+index e8c151b548ade251f512675967bb8f9bcf2758a4..02926abcb2a7d67d9a3d582f761a324c56be7104 100644
+--- a/crates/howy-cli/src/security/engine.rs
++++ b/crates/howy-cli/src/security/engine.rs
+@@ -882,6 +882,22 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+         self.runtime.boundary("supervisor-directories-ready")
+     }
+ 
++    fn reconcile_recorded_security_directories(
++        &mut self,
++        journal: &mut SupervisorJournalV1,
++    ) -> SecurityResult<()> {
++        if let Some(intent) = journal.security_directories.last()
++            && intent.observed_directory.is_none()
++        {
++            let observed = self.runtime.ensure_security_directory(intent)?;
++            self.runtime
++                .boundary("directory-created-before-observation")?;
++            self.persist_directory_observation(journal, observed)?;
++        }
++        self.runtime
++            .verify_security_directories(&journal.security_directories)
++    }
++
+     fn provision_mode1(&mut self, request: ProvisionRequest) -> SecurityResult<SecurityOutcome> {
+         self.refuse_receipted_presence_mismatch(request.presence)?;
+         let supervisor =
+@@ -2595,11 +2611,15 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+         if journal.phase == SupervisorPhaseV1::Guarded {
+             self.advance_supervisor(&mut journal, SupervisorPhaseV1::UnitsStopped)?;
+         }
+-        if journal.phase == SupervisorPhaseV1::UnitsStopped {
++        if journal.phase == SupervisorPhaseV1::UnitsStopped && !journal.supervisor_failed {
+             self.prepare_security_directories(&mut journal)?;
+         }
+-        self.runtime
+-            .verify_security_directories(&journal.security_directories)?;
++        if journal.supervisor_failed {
++            self.reconcile_recorded_security_directories(&mut journal)?;
++        } else {
++            self.runtime
++                .verify_security_directories(&journal.security_directories)?;
++        }
+         if journal.operation == SupervisorOperationV1::CleanupUnadopted {
+             return self.recover_cleanup_supervisor(journal);
+         }
+@@ -2617,7 +2637,10 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+         restore_unit_target(self.runtime, socket)?;
+         restore_unit_target(self.runtime, service)?;
+         self.verify_restored_targets(service, socket)?;
+-        if journal.phase != SupervisorPhaseV1::UnitsRestored {
++        // A failed UnitsStopped journal may contain only a valid directory
++        // prefix, which cannot be serialized as UnitsRestored. Keep that exact
++        // journal until rollback and unit restoration succeed, then remove it.
++        if journal.phase != SupervisorPhaseV1::UnitsRestored && !journal.supervisor_failed {
+             self.advance_supervisor(&mut journal, SupervisorPhaseV1::UnitsRestored)?;
+         }
+         self.remove_current_journal()?;
+@@ -2757,7 +2780,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+         restore_unit_target(self.runtime, &socket)?;
+         restore_unit_target(self.runtime, &service)?;
+         self.verify_restored_targets(&service, &socket)?;
+-        if journal.phase != SupervisorPhaseV1::UnitsRestored {
++        if journal.phase != SupervisorPhaseV1::UnitsRestored && !journal.supervisor_failed {
+             self.advance_supervisor(journal, SupervisorPhaseV1::UnitsRestored)?;
+         }
+         self.remove_current_journal()?;
+diff --git a/crates/howy-cli/src/security/tests.rs b/crates/howy-cli/src/security/tests.rs
+index 444f14663201a362f9d6aee007d6934f23dc62f4..97361669c53775a4e6ddb98a36587c3076318812 100644
+--- a/crates/howy-cli/src/security/tests.rs
++++ b/crates/howy-cli/src/security/tests.rs
+@@ -672,6 +672,7 @@ impl SecurityRuntime for FakeRuntime {
+         &mut self,
+         directories: &[SecurityDirectoryRecordV1],
+     ) -> SecurityResult<()> {
++        self.events.push("directories:verify".into());
+         for expected in directories {
+             let Some((inode, permissions)) = self.directories.get(&expected.path) else {
+                 return Err(SecurityError::Uncertain(
+@@ -1225,6 +1226,7 @@ impl SecurityRuntime for FakeRuntime {
+                 _ => unreachable!(),
+             }
+         }
++        self.fail_after(name)?;
+         if self.crash_at == Some(self.boundary_count) || self.crash_name == Some(name) {
+             Err(SecurityError::InjectedCrash(format!(
+                 "injected crash at {name}"
+@@ -1767,6 +1769,7 @@ fn crash_after_mkdir_before_observation_recovers_from_durable_absence_intent() {
+ 
+     let journal = SupervisorJournalV1::parse(&runtime.files[SECURITY_JOURNAL_PATH].bytes).unwrap();
+     assert_eq!(journal.phase, SupervisorPhaseV1::UnitsStopped);
++    assert!(!journal.supervisor_failed);
+     assert_eq!(journal.security_directories.len(), 1);
+     let intent = &journal.security_directories[0];
+     assert!(!intent.preexisted);
+@@ -1776,12 +1779,177 @@ fn crash_after_mkdir_before_observation_recovers_from_durable_absence_intent() {
+     assert!(runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
+ 
+     runtime.crash_name = None;
++    runtime.events.clear();
+     SecurityEngine::new(&mut runtime).recover().unwrap();
++    assert_eq!(
++        runtime
++            .events
++            .iter()
++            .filter(|event| event.starts_with("directory:plan:"))
++            .count(),
++        howy_common::provisioning::REQUIRED_SECURITY_DIRECTORIES.len() - 1
++    );
++    assert_eq!(
++        runtime
++            .events
++            .iter()
++            .filter(|event| event.starts_with("directory:ensure:"))
++            .count(),
++        howy_common::provisioning::REQUIRED_SECURITY_DIRECTORIES.len()
++    );
++    assert!(
++        runtime
++            .events
++            .iter()
++            .any(|event| event == "directories:verify")
++    );
++    assert!(
++        runtime
++            .events
++            .iter()
++            .any(|event| event == "directories:rollback")
++    );
++    assert!(runtime.directories.is_empty());
++    assert!(!runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
++    assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
++}
++
++#[test]
++fn failed_first_directory_admission_recovers_without_retrying_unrecorded_directory() {
++    let mut runtime = FakeRuntime::fresh();
++    runtime.service.unit_file_state = UnitFileState::Disabled;
++    runtime.socket.unit_file_state = UnitFileState::Static;
++    let service_before = runtime.service.clone();
++    let socket_before = runtime.socket.clone();
++    runtime.next_inode += 1;
++    runtime.directories.insert(
++        howy_common::provisioning::HOWY_CONFIG_DIRECTORY.into(),
++        (runtime.next_inode, 0o755),
++    );
++
++    assert!(matches!(
++        provision(&mut runtime),
++        Err(SecurityError::Uncertain(_))
++    ));
++    let journal = SupervisorJournalV1::parse(&runtime.files[SECURITY_JOURNAL_PATH].bytes).unwrap();
++    assert_eq!(journal.phase, SupervisorPhaseV1::UnitsStopped);
++    assert!(journal.supervisor_failed);
++    assert!(journal.security_directories.is_empty());
++    assert!(journal.atomic_writes.is_empty());
++    assert!(runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
++
++    runtime.events.clear();
++    SecurityEngine::new(&mut runtime).recover().unwrap();
++
++    assert!(runtime.events.iter().all(|event| {
++        !event.starts_with("directory:plan:") && !event.starts_with("directory:ensure:")
++    }));
++    assert!(
++        runtime
++            .events
++            .iter()
++            .any(|event| event == "directories:verify")
++    );
++    assert!(
++        runtime
++            .events
++            .iter()
++            .any(|event| event == "directories:rollback")
++    );
++    assert_eq!(runtime.service, service_before);
++    assert_eq!(runtime.socket, socket_before);
++    assert_eq!(
++        runtime.directories[howy_common::provisioning::HOWY_CONFIG_DIRECTORY].1,
++        0o755
++    );
++    assert!(!runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
++    assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
++}
++
++#[test]
++fn failed_supervisor_rolls_back_only_recorded_created_directories() {
++    let mut runtime = FakeRuntime::fresh();
++    runtime.fail_after = Some("directory-observation-synced");
++
++    assert!(matches!(
++        provision(&mut runtime),
++        Err(SecurityError::Uncertain(_))
++    ));
++    let journal = SupervisorJournalV1::parse(&runtime.files[SECURITY_JOURNAL_PATH].bytes).unwrap();
++    assert_eq!(journal.phase, SupervisorPhaseV1::UnitsStopped);
++    assert!(journal.supervisor_failed);
++    assert_eq!(journal.security_directories.len(), 1);
++    assert!(journal.security_directories[0].observed_directory.is_some());
++    let recorded_path = journal.security_directories[0].path.clone();
++    assert!(runtime.directories.contains_key(&recorded_path));
++
++    runtime.events.clear();
++    SecurityEngine::new(&mut runtime).recover().unwrap();
++
++    assert!(runtime.events.iter().all(|event| {
++        !event.starts_with("directory:plan:") && !event.starts_with("directory:ensure:")
++    }));
++    let verified = runtime
++        .events
++        .iter()
++        .position(|event| event == "directories:verify")
++        .unwrap();
++    let rolled_back = runtime
++        .events
++        .iter()
++        .position(|event| event == "directories:rollback")
++        .unwrap();
++    assert!(verified < rolled_back);
++    assert!(!runtime.directories.contains_key(&recorded_path));
+     assert!(runtime.directories.is_empty());
+     assert!(!runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
+     assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+ }
+ 
++#[test]
++fn inconsistent_failed_recorded_directory_remains_uncertain_and_guarded() {
++    let mut runtime = FakeRuntime::fresh();
++    runtime.fail_after = Some("directory-created-before-observation");
++
++    assert!(matches!(
++        provision(&mut runtime),
++        Err(SecurityError::Uncertain(_))
++    ));
++    let journal = SupervisorJournalV1::parse(&runtime.files[SECURITY_JOURNAL_PATH].bytes).unwrap();
++    assert!(journal.supervisor_failed);
++    assert_eq!(journal.security_directories.len(), 1);
++    assert!(journal.security_directories[0].observed_directory.is_none());
++    let recorded_path = journal.security_directories[0].path.clone();
++    runtime.directories.get_mut(&recorded_path).unwrap().1 = 0o755;
++
++    runtime.events.clear();
++    assert!(matches!(
++        SecurityEngine::new(&mut runtime).recover(),
++        Err(SecurityError::Uncertain(_))
++    ));
++    assert!(
++        runtime
++            .events
++            .iter()
++            .all(|event| !event.starts_with("directory:plan:"))
++    );
++    assert!(
++        runtime
++            .events
++            .iter()
++            .any(|event| event == &format!("directory:ensure:{recorded_path}"))
++    );
++    assert!(runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
++    assert!(runtime.files.contains_key(SECURITY_JOURNAL_PATH));
++    let retained = SupervisorJournalV1::parse(&runtime.files[SECURITY_JOURNAL_PATH].bytes).unwrap();
++    assert!(retained.supervisor_failed);
++    assert!(
++        retained.security_directories[0]
++            .observed_directory
++            .is_none()
++    );
++}
++
+ #[test]
+ fn recovery_rejects_required_directory_identity_or_policy_changes() {
+     for mutation in ["inode", "mode"] {

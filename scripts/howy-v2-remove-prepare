@@ -1,0 +1,77 @@
+#!/bin/bash
+
+set -uo pipefail
+export LC_ALL=C
+
+refuse() {
+    printf 'howy-v2-remove-prepare: refusal: %s\n' "$*" >&2
+    return 1
+}
+
+require_unit_property() {
+    local unit="$1"
+    local property="$2"
+    local expected="$3"
+    local value
+
+    if ! value=$(/usr/bin/systemctl show --property="${property}" --value "${unit}"); then
+        refuse "could not inspect ${property} for ${unit}"
+        return 1
+    fi
+    if [[ "${value}" != "${expected}" ]]; then
+        refuse "${unit} ${property} is ${value:-empty}, expected ${expected}"
+        return 1
+    fi
+}
+
+prepare_removal() {
+    if ! /usr/bin/systemctl stop howy.socket; then
+        refuse 'could not stop howy.socket'
+        return 1
+    fi
+    if ! /usr/bin/systemctl stop howy.service; then
+        refuse 'could not stop howy.service'
+        return 1
+    fi
+    if ! /usr/bin/systemctl disable howy.socket howy.service; then
+        refuse 'could not disable howy.socket and howy.service'
+        return 1
+    fi
+    if ! require_unit_property howy.socket ActiveState inactive; then
+        return 1
+    fi
+    if ! require_unit_property howy.service ActiveState inactive; then
+        return 1
+    fi
+    if ! require_unit_property howy.socket UnitFileState disabled; then
+        return 1
+    fi
+    if ! require_unit_property howy.service UnitFileState disabled; then
+        return 1
+    fi
+}
+
+main() {
+    local root_id
+
+    if [[ "$#" -ne 0 ]]; then
+        refuse 'this helper accepts no arguments'
+        return 1
+    fi
+    if ! root_id=$(/usr/bin/id -u); then
+        refuse 'could not determine the effective user'
+        return 1
+    fi
+    if [[ "${root_id}" != 0 ]]; then
+        refuse 'this helper must run as root'
+        return 1
+    fi
+    prepare_removal
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+elif [[ "${HOWY_V2_REMOVE_PREPARE_INTERNAL_TEST:-0}" != 1 ]]; then
+    printf '%s\n' 'howy-v2-remove-prepare: refusal: sourcing requires HOWY_V2_REMOVE_PREPARE_INTERNAL_TEST=1' >&2
+    return 1
+fi

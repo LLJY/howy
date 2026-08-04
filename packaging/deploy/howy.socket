@@ -1,0 +1,12 @@
+[Unit]
+Description=Howy Face Authentication Socket
+Documentation=https://github.com/LLJY/howy
+
+[Socket]
+ListenStream=/run/howy/howy.sock
+SocketMode=0666
+DirectoryMode=0755
+RuntimeDirectory=howy
+
+[Install]
+WantedBy=sockets.target

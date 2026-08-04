@@ -1,0 +1,120 @@
+diff --git a/crates/howy-pam/src/lib.rs b/crates/howy-pam/src/lib.rs
+index 316575e..dd51012 100644
+--- a/crates/howy-pam/src/lib.rs
++++ b/crates/howy-pam/src/lib.rs
+@@ -301,9 +301,6 @@ unsafe fn authenticate_user_with(
+     auth_ceiling: Duration,
+     mut fill_nonce: impl FnMut(&mut [u8; PROMPT_NONCE_BYTES]) -> Result<(), ()>,
+ ) -> libc::c_int {
+-    if flags & PAM_SILENT != 0 {
+-        return PAM_AUTHINFO_UNAVAIL;
+-    }
+     if pamh.is_null() {
+         return PAM_SYSTEM_ERR;
+     }
+@@ -1181,21 +1178,94 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn pam_silent_performs_no_pam_lookup_prompt_or_ipc() {
+-        let mut items = MockPamItems {
+-            username: ptr::null(),
+-            service: ptr::null(),
+-            rhost: ptr::null(),
+-            conversation: ptr::null(),
+-            user_calls: Cell::new(0),
+-            item_calls: Cell::new(0),
++    fn pam_silent_prompt_off_uses_fresh_authenticate_v1_connection_without_conversation() {
++        reset_allocations();
++        let username = CString::new("alice").unwrap();
++        let service = CString::new("sudo").unwrap();
++        let mut conversation_state = MockConversation::bytes(b"OK");
++        let conversation = PamConv {
++            conv: Some(mock_conversation),
++            appdata_ptr: ptr::from_mut(&mut conversation_state).cast(),
+         };
++        let mut items = mock_items(&username, Some(&service), None, Some(&conversation));
++        let (first_client, mut first_daemon) = UnixStream::pair().unwrap();
++        let first = std::thread::spawn(move || {
++            let request: Request = recv_message(&mut first_daemon).unwrap();
++            let Some(Cmd::BeginAuthV1(begin)) = request.cmd else {
++                panic!("silent PAM must still begin with BeginAuthV1")
++            };
++            assert_eq!(begin.username, "alice");
++            assert_eq!(begin.client_nonce, [0x11; PROMPT_NONCE_BYTES]);
++            let policy = begin.policy.unwrap();
++            assert_eq!(policy.pam_service, "sudo");
++            assert_eq!(policy.origin, PromptOriginV1::Local as i32);
++            send_message(
++                &mut first_daemon,
++                &Response::error_code(PROMPT_PROTOCOL_INCOMPATIBLE_ERROR, "prompt mode is off"),
++            )
++            .unwrap();
++            let retry: std::io::Result<Request> = recv_message(&mut first_daemon);
++            assert!(retry.is_err(), "fallback must use a fresh connection");
++        });
++        let (second_client, mut second_daemon) = UnixStream::pair().unwrap();
++        let second = std::thread::spawn(move || {
++            let request: Request = recv_message(&mut second_daemon).unwrap();
++            assert!(matches!(request.cmd, Some(Cmd::AuthenticateV1(_))));
++            assert!(!matches!(request.cmd, Some(Cmd::Authenticate(_))));
++            send_message(&mut second_daemon, &Response::success(0, "desk", 0.9, 1.0)).unwrap();
++        });
+         assert_eq!(
+-            run_adaptive_auth(&mut items, Vec::new(), PAM_SILENT),
++            run_adaptive_auth(&mut items, vec![first_client, second_client], PAM_SILENT),
++            PAM_SUCCESS
++        );
++        first.join().unwrap();
++        second.join().unwrap();
++        assert_eq!(items.user_calls.get(), 1);
++        assert_eq!(items.item_calls.get(), 2);
++        assert_eq!(conversation_state.calls, 0);
++        assert_cleanup(0, 0);
++    }
++
++    #[test]
++    fn pam_silent_prompt_required_cancels_without_getting_or_invoking_conversation() {
++        reset_allocations();
++        let username = CString::new("alice").unwrap();
++        let service = CString::new("sudo").unwrap();
++        let mut conversation_state = MockConversation::bytes(b"OK");
++        let conversation = PamConv {
++            conv: Some(mock_conversation),
++            appdata_ptr: ptr::from_mut(&mut conversation_state).cast(),
++        };
++        let mut items = mock_items(&username, Some(&service), None, Some(&conversation));
++        let (client, mut daemon) = UnixStream::pair().unwrap();
++        let daemon_thread = std::thread::spawn(move || {
++            let request: Request = recv_message(&mut daemon).unwrap();
++            let Some(Cmd::BeginAuthV1(begin)) = request.cmd else {
++                panic!("silent PAM must still begin with BeginAuthV1")
++            };
++            assert_eq!(begin.username, "alice");
++            assert_eq!(begin.client_nonce, [0x11; PROMPT_NONCE_BYTES]);
++            let policy = begin.policy.unwrap();
++            assert_eq!(policy.pam_service, "sudo");
++            assert_eq!(policy.origin, PromptOriginV1::Local as i32);
++            send_message(
++                &mut daemon,
++                &Response::prompt_required_v1([0x22; 32], [0x11; 32], 30_000, 10_000),
++            )
++            .unwrap();
++            let cancel: Request = recv_message(&mut daemon).unwrap();
++            assert!(matches!(cancel.cmd, Some(Cmd::CancelAuthV1(_))));
++            send_message(&mut daemon, &Response::auth_cancelled_v1([0x11; 32])).unwrap();
++        });
++        assert_eq!(
++            run_adaptive_auth(&mut items, vec![client], PAM_SILENT),
+             PAM_AUTHINFO_UNAVAIL
+         );
+-        assert_eq!(items.user_calls.get(), 0);
+-        assert_eq!(items.item_calls.get(), 0);
++        daemon_thread.join().unwrap();
++        assert_eq!(items.user_calls.get(), 1);
++        assert_eq!(items.item_calls.get(), 2);
++        assert_eq!(conversation_state.calls, 0);
++        assert_cleanup(0, 0);
+     }
+ 
+     #[test]

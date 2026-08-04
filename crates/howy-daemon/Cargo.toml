@@ -61,6 +61,7 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bincode = { workspace = true }
+toml = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
@@ -75,5 +76,8 @@ linux-keyutils = { workspace = true }
 
 # Hex encoding for frame data
 hex = "0.4"
-sha2 = "0.10"
+sha2 = { workspace = true }
 zeroize = { version = "=1.9.0", features = ["derive"] }
+
+[dev-dependencies]
+aes-gcm = { workspace = true }

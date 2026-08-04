@@ -6,8 +6,16 @@ license.workspace = true
 description = "Shared types, IPC protocol, and configuration for howy"
 
 [dependencies]
+aes-gcm = { workspace = true }
+# Feature-only direct dependencies: keep AES-GCM's owned key schedule and
+# GHASH/Polyval state zeroizing even though aes-gcm does not propagate them.
+aes = { workspace = true }
+ghash = { workspace = true }
+getrandom = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
 bincode = { workspace = true }
 prost = { workspace = true }
 thiserror = { workspace = true }

@@ -1,0 +1,109 @@
+_howy_prepared_update_exists() {
+  _howy_prepared=/run/howy-v2-update-v1.prepared
+  [ -f "${_howy_prepared}" ] && [ ! -L "${_howy_prepared}" ] || return 1
+  [ "$(/usr/bin/stat -c '%u:%g:%a' -- "${_howy_prepared}" 2>/dev/null)" = '0:0:600' ] \
+    || return 1
+
+  _howy_line_number=0
+  _howy_format=
+  _howy_archive=
+  _howy_archive_sha256=
+  _howy_source_package=
+  _howy_source_version=
+  _howy_target_package=
+  _howy_target_version=
+  while IFS= read -r _howy_line; do
+    _howy_line_number=$((_howy_line_number + 1))
+    _howy_key=${_howy_line%%=*}
+    _howy_value=${_howy_line#*=}
+    [ "${_howy_key}" != "${_howy_line}" ] || return 1
+    case "${_howy_line_number}:${_howy_key}" in
+      1:format)
+        [ "${_howy_value}" = howy-v2-update-v1 ] || return 1
+        _howy_format=${_howy_value}
+        ;;
+      2:archive) _howy_archive=${_howy_value} ;;
+      3:archive_sha256) _howy_archive_sha256=${_howy_value} ;;
+      4:source_package) _howy_source_package=${_howy_value} ;;
+      5:source_version) _howy_source_version=${_howy_value} ;;
+      6:target_package) _howy_target_package=${_howy_value} ;;
+      7:target_version) _howy_target_version=${_howy_value} ;;
+      *) return 1 ;;
+    esac
+  done < "${_howy_prepared}"
+  [ "${_howy_line_number}" -eq 7 ] || return 1
+  case "${_howy_archive}" in /*) ;; *) return 1 ;; esac
+  [ "${#_howy_archive_sha256}" -eq 64 ] || return 1
+  case "${_howy_archive_sha256}" in *[!0-9a-f]*) return 1 ;; esac
+  case "${_howy_source_package}" in
+    howy-cpu-git|howy-rocm-git|howy-cuda-git|howy-rocm-mode0|howy-cpu|howy-rocm|howy-cuda) ;;
+    *) return 1 ;;
+  esac
+  [ -n "${_howy_source_version}" ] || return 1
+  case "${_howy_target_package}" in howy-cpu|howy-rocm|howy-cuda) ;; *) return 1 ;; esac
+  [ "${_howy_target_version}" = 2.0.1-1 ] || return 1
+
+  [ "${HOWY_V2_UPDATE_FORMAT-}" = "${_howy_format}" ] || return 1
+  [ "${HOWY_V2_UPDATE_ARCHIVE-}" = "${_howy_archive}" ] || return 1
+  [ "${HOWY_V2_UPDATE_ARCHIVE_SHA256-}" = "${_howy_archive_sha256}" ] || return 1
+  [ "${HOWY_V2_UPDATE_SOURCE_PACKAGE-}" = "${_howy_source_package}" ] || return 1
+  [ "${HOWY_V2_UPDATE_SOURCE_VERSION-}" = "${_howy_source_version}" ] || return 1
+  [ "${HOWY_V2_UPDATE_TARGET_PACKAGE-}" = "${_howy_target_package}" ] || return 1
+  [ "${HOWY_V2_UPDATE_TARGET_VERSION-}" = "${_howy_target_version}" ] || return 1
+
+  [ -f "${_howy_archive}" ] && [ ! -L "${_howy_archive}" ] || return 1
+  _howy_actual_archive_sha256=$(/usr/bin/sha256sum -- "${_howy_archive}" 2>/dev/null) \
+    || return 1
+  [ "${_howy_actual_archive_sha256%% *}" = "${_howy_archive_sha256}" ]
+}
+
+post_install() {
+  if _howy_prepared_update_exists; then
+    printf '%s\n' 'Howy updater prepared this transaction; configuration completion is deferred to howy-v2-update.' >&2
+    return 0
+  fi
+
+  if ! /usr/lib/howy/howy-config-bridge bootstrap-release-n; then
+    printf '%s\n' 'Howy refused to replace /etc/howy/config.toml; the existing object was left untouched.' >&2
+    return 1
+  fi
+
+  printf '%s\n' 'sudo howy security provision --mode 1'
+  printf '%s\n' 'sudo howy security enable'
+}
+
+post_upgrade() {
+  if ! /usr/lib/howy/howy-config-bridge complete-release-n; then
+    printf '%s\n' 'Howy could not verify/restore the release-N configuration; the positive service start marker remains absent.' >&2
+    return 1
+  fi
+
+  printf '%s\n' 'Howy preserved /etc/howy/config.toml during this upgrade.'
+  printf '%s\n' 'Updates with a security receipt require /usr/bin/howy-v2-update; package reconciliation does not run inside pacman.'
+}
+
+pre_remove() {
+  if ! /usr/lib/howy/howy-config-bridge stash-release-n; then
+    printf '%s\n' 'Howy could not create the exact removal stash; no package script modified the configuration.' >&2
+    return 1
+  fi
+  if ! /usr/lib/howy/howy-v2-remove-prepare; then
+    printf '%s\n' 'Howy could not re-confirm inactive, disabled units during its defensive pre-remove scriptlet.' >&2
+    return 1
+  fi
+}
+
+post_remove() {
+  if ! /usr/bin/systemctl daemon-reload; then
+    printf '%s\n' 'Howy could not reload the systemd manager after removal.' >&2
+    return 1
+  fi
+  if [ -e /var/lib/howy-package-bootstrap.complete ] \
+    || [ -L /var/lib/howy-package-bootstrap.complete ]; then
+    printf '%s\n' 'Howy retained an unexpected package marker for explicit review; package scripts refuse broad marker deletion.' >&2
+    return 1
+  fi
+
+  printf '%s\n' 'Howy package scripts preserved configuration, receipts, credentials, encrypted records, and enrolled records.'
+  printf '%s\n' 'The exact pre-remove config state remains under /var/lib/howy/config-bridge; pacman backup policy may also retain /etc/howy/config.toml.pacsave.'
+}

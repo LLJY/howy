@@ -27,6 +27,20 @@ message Request {
     CheckCredentialReq  check_credential = 7;
     RevokeCredentialReq revoke_credential = 8;
     EnrollBatchReq    enroll_batch       = 9;
+    EnrollmentPresenceReq enrollment_presence = 10;
+    ListEnrollmentsReq list_enrollments = 11;
+    RemoveEnrollmentReq remove_enrollment = 12;
+    ClearEnrollmentsReq clear_enrollments = 13;
+    ReloadStorageReq reload_storage = 14;
+    SecurityInfoReq security_info = 15;
+    // Versioned daemon-owned enrollment operations. Legacy tags 2 and 9 are
+    // retained only so current daemons can reject old clients explicitly.
+    EnrollV1Req enroll_v1 = 16;
+    EnrollBatchV1Req enroll_batch_v1 = 17;
+    BeginAuthV1Req begin_auth_v1 = 18;
+    CommitAuthV1Req commit_auth_v1 = 19;
+    CancelAuthV1Req cancel_auth_v1 = 20;
+    AuthenticateV1Req authenticate_v1 = 21;
   }
 }
 
@@ -43,6 +57,14 @@ message Response {
     CredentialInvalid   credential_invalid = 8;
     Error               error              = 9;
     EnrollBatchResult   enroll_batch_done  = 10;
+    EnrollmentPresenceResult enrollment_presence = 11;
+    ListEnrollmentsResult list_enrollments = 12;
+    RemoveEnrollmentResult remove_enrollment = 13;
+    ClearEnrollmentsResult clear_enrollments = 14;
+    ReloadStorageResult reload_storage = 15;
+    SecurityInfoResult security_info = 16;
+    PromptRequiredV1 prompt_required_v1 = 17;
+    AuthCancelledV1 auth_cancelled_v1 = 18;
   }
 }
 
@@ -59,12 +81,60 @@ message AuthenticateReq {
   uint32 timeout  = 2;
 }
 
-// Enroll a new face model for a user.
-// The daemon captures frames and returns the best face embedding.
+enum PromptOriginV1 {
+  PROMPT_ORIGIN_V1_UNSPECIFIED = 0;
+  PROMPT_ORIGIN_V1_LOCAL = 1;
+  PROMPT_ORIGIN_V1_REMOTE = 2;
+}
+
+message PromptPolicyContextV1 {
+  string pam_service = 1;
+  reserved 2, 3;
+  PromptOriginV1 origin = 4;
+}
+
+message BeginAuthV1Req {
+  uint32 protocol_version = 1;
+  string username = 2;
+  reserved 3;
+  bytes client_nonce = 4;
+  PromptPolicyContextV1 policy = 5;
+}
+
+message CommitAuthV1Req {
+  uint32 protocol_version = 1;
+  bytes transaction_token = 2;
+  bytes client_nonce = 3;
+}
+
+message CancelAuthV1Req {
+  uint32 protocol_version = 1;
+  bytes transaction_token = 2;
+  bytes client_nonce = 3;
+}
+
+message AuthenticateV1Req {
+  // Versioned prompt-off one-shot operation. Legacy daemons treat top-level
+  // tag 21 as unknown before they can dispatch authentication or camera work.
+  uint32 protocol_version = 1;
+  string username = 2;
+  uint32 timeout = 3;
+}
+
+// Enroll a new face model for a user. Capture, inference, and persistence stay
+// daemon-owned; the response contains metadata only.
 message EnrollReq {
   string username = 1;
   // Human-readable label (e.g. "laptop IR", "office webcam").
   string label    = 2;
+  reserved 3;
+}
+
+// Version 1 daemon-owned live enrollment. The distinct top-level operation tag
+// makes this request unknown to legacy daemons before they can open a camera.
+message EnrollV1Req {
+  string username = 1;
+  string label = 2;
 }
 
 // Detect faces in a single raw frame (for testing/preview).
@@ -108,6 +178,44 @@ message EnrollBatchReq {
   string label       = 3;
 }
 
+// Version 1 daemon-owned batch enrollment. The distinct top-level operation
+// tag makes this request unknown to legacy daemons before directory traversal.
+message EnrollBatchV1Req {
+  string username = 1;
+  string session_dir = 2;
+  string label = 3;
+}
+
+// Check whether a user has a candidate enrollment record. This is authorized
+// for root or the matching UID and never returns enrollment metadata.
+message EnrollmentPresenceReq {
+  string username = 1;
+}
+
+// Root-only metadata listing.
+message ListEnrollmentsReq {
+  string username = 1;
+}
+
+// Root-only stable-ID removal guarded by the generation returned by list.
+message RemoveEnrollmentReq {
+  string username = 1;
+  bytes enrollment_id = 2;
+  uint64 expected_generation = 3;
+}
+
+// Root-only clear guarded by the generation returned by list.
+message ClearEnrollmentsReq {
+  string username = 1;
+  uint64 expected_generation = 2;
+}
+
+// Root-only storage revalidation.
+message ReloadStorageReq {}
+
+// Root-only security diagnostics.
+message SecurityInfoReq {}
+
 // ============================================================
 // Response messages
 // ============================================================
@@ -134,15 +242,35 @@ message AuthFailed {
   string reason           = 3;
 }
 
-// Face enrollment succeeded.
-message EnrollSuccess {
-  // The 512-dimensional ArcFace embedding.
-  repeated float embedding = 1;
-  // Face detection confidence score.
-  float det_score          = 2;
+message PromptRequiredV1 {
+  uint32 protocol_version = 1;
+  bytes transaction_token = 2;
+  bytes client_nonce = 3;
+  uint32 prompt_timeout_ms = 4;
+  uint32 commit_response_timeout_ms = 5;
 }
 
-// Face detection result (for testing).
+message AuthCancelledV1 {
+  uint32 protocol_version = 1;
+  bytes client_nonce = 2;
+}
+
+// Face enrollment succeeded.
+message EnrollSuccess {
+  reserved 1;
+  // Face detection confidence score.
+  float det_score          = 2;
+  // Stable, nonzero 16-byte enrollment identifier.
+  bytes enrollment_id      = 3;
+  // Generation committed by the daemon.
+  uint64 generation        = 4;
+  // Total enrollments after commit.
+  uint32 total_count       = 5;
+  // Confirms daemon-owned storage enrollment semantics.
+  uint32 enrollment_protocol_version = 6;
+}
+
+// Face detection result (for testing/preview). Contains detection metadata only.
 message DetectResult {
   repeated DetectedFace faces = 1;
   double elapsed_ms           = 2;
@@ -150,6 +278,8 @@ message DetectResult {
 
 // A single detected face.
 message DetectedFace {
+  // Former ArcFace embedding field. Reserved so diagnostic IPC can never reuse it.
+  reserved 7;
   // Bounding box: x1, y1, x2, y2 in pixels.
   int32 x1 = 1;
   int32 y1 = 2;
@@ -159,8 +289,6 @@ message DetectedFace {
   repeated float landmarks = 5;
   // Detection confidence.
   float score = 6;
-  // Face embedding (populated only if requested).
-  repeated float embedding = 7;
 }
 
 // Pong response to health check.
@@ -170,14 +298,20 @@ message Pong {}
 message DaemonInfo {
   // Active execution provider name.
   string provider        = 1;
-  // Path to the face detector ONNX model.
+  // Retained for wire compatibility. Public status always leaves this empty.
   string detector_model  = 2;
-  // Path to the face recognizer ONNX model.
+  // Retained for wire compatibility. Public status always leaves this empty.
   string recognizer_model = 3;
   // Embedding dimensionality (512 for ArcFace).
   uint32 embedding_dim   = 4;
   // Daemon uptime in seconds.
   uint64 uptime_secs     = 5;
+  // Stable numeric embedding storage mode (0, 1, 2, or reserved 3).
+  uint32 active_security_mode = 6;
+  // Whether clients must use the future prompt transaction before capture.
+  bool prompt_required = 7;
+  // Whether the active storage mode is currently available to the daemon.
+  bool storage_ready = 8;
 }
 
 // Cached credential is valid — face scan can be skipped.
@@ -189,6 +323,8 @@ message CredentialInvalid {}
 // Error response.
 message Error {
   string message = 1;
+  // Stable machine-readable category. Empty for legacy/general errors.
+  string code = 2;
 }
 
 // Result of batch enrollment processing.
@@ -203,4 +339,94 @@ message EnrollBatchResult {
   double elapsed_ms       = 4;
   // Human-readable per-frame rejection reasons (frame_name: reason).
   repeated string rejection_details = 5;
+  // Generation committed by the daemon, or the captured generation if none accepted.
+  uint64 generation = 6;
+  // Total enrollments after processing.
+  uint32 total_count = 7;
+}
+
+message EnrollmentPresenceResult {
+  bool candidate = 1;
+  reserved 2;
+}
+
+message EnrollmentMetadataEntry {
+  bytes enrollment_id = 1;
+  string label = 2;
+  uint64 created_unix_seconds = 3;
+}
+
+message ListEnrollmentsResult {
+  uint64 generation = 1;
+  repeated EnrollmentMetadataEntry entries = 2;
+}
+
+message RemoveEnrollmentResult {
+  uint64 generation = 1;
+  bytes removed_enrollment_id = 2;
+}
+
+message ClearEnrollmentsResult {
+  // Always 0 after a successful clear.
+  uint64 generation = 1;
+  uint32 removed_count = 2;
+}
+
+message ReloadStorageResult {
+  bool storage_ready = 1;
+  uint32 candidate_records = 2;
+  uint32 mode_mismatch_records = 3;
+  uint32 key_mismatch_records = 4;
+  uint32 model_mismatch_records = 5;
+  uint32 corrupt_records = 6;
+}
+
+message NamespaceDiagnostic {
+  uint32 mode = 1;
+  string path = 2;
+  bool active = 3;
+  bool implemented = 4;
+}
+
+enum SecurityBackendStateV1 {
+  SECURITY_BACKEND_STATE_V1_UNSPECIFIED = 0;
+  SECURITY_BACKEND_STATE_V1_READY = 1;
+  SECURITY_BACKEND_STATE_V1_UNAVAILABLE = 2;
+}
+
+enum SecurityReadinessStateV1 {
+  SECURITY_READINESS_STATE_V1_UNSPECIFIED = 0;
+  SECURITY_READINESS_STATE_V1_READY = 1;
+  SECURITY_READINESS_STATE_V1_UNAVAILABLE = 2;
+}
+
+enum SecurityPoisonStateV1 {
+  SECURITY_POISON_STATE_V1_UNSPECIFIED = 0;
+  SECURITY_POISON_STATE_V1_NOT_POISONED = 1;
+  SECURITY_POISON_STATE_V1_POISONED = 2;
+}
+
+message SecurityInfoResult {
+  string detector_model = 1;
+  string recognizer_model = 2;
+  uint32 active_security_mode = 3;
+  uint64 key_epoch = 4;
+  bool storage_ready = 5;
+  bool prompt_required = 6;
+  repeated NamespaceDiagnostic namespaces = 7;
+  // SHA-256 of the exact raw bytes parsed from the retained config descriptor.
+  string config_sha256 = 8;
+  // Present only for a live encrypted mode that consumed this exact credential.
+  string credential_name = 9;
+  // Nonsecret source path configured by the unit-provided companion; this is
+  // not a claim that the daemon observed or parsed the encrypted envelope.
+  string configured_credential_source = 10;
+  SecurityBackendStateV1 backend_state = 11;
+  SecurityReadinessStateV1 readiness_state = 12;
+  SecurityPoisonStateV1 poison_state = 13;
+  string daemon_invocation_id = 14;
+  string daemon_version = 15;
+  string build_identity = 16;
+  string binary_absolute_path = 17;
+  string binary_sha256 = 18;
 }

@@ -1,6 +1,6 @@
-pkgbase = howy-git
+pkgbase = howy
 	pkgdesc = Linux face authentication daemon — a howdy replacement
-	pkgver = 0.1.0.r19.g4aceddb
+	pkgver = 2.0.1
 	pkgrel = 1
 	url = https://github.com/LLJY/howy
 	arch = x86_64
@@ -8,52 +8,89 @@ pkgbase = howy-git
 	makedepends = cargo
 	makedepends = clang
 	makedepends = git
-	makedepends = onnxruntime-cpu
+	makedepends = onnxruntime=1.28.0
 	makedepends = protobuf
-	source = howy-git::git+https://github.com/LLJY/howy.git
+	makedepends = systemd>=261
+	source = howy::git+https://github.com/LLJY/howy.git#commit=623bb91ab6ef15b0fad6199df37e687445975f12
 	sha256sums = SKIP
 
-pkgname = howy-cpu-git
-	pkgdesc = Linux face authentication daemon using ONNX Runtime CPU backend
-	depends = onnxruntime-cpu
+pkgname = howy-cpu
+	pkgdesc = Linux face authentication daemon intended for ONNX Runtime CPU backend
+	install = howy.install
+	depends = diffutils
+	depends = onnxruntime=1.28.0
 	depends = pam
+	depends = systemd>=261
 	optdepends = curl: download default ONNX models
 	optdepends = ffmpeg: optional camera fallback when native V4L2 mmap capture fails
 	optdepends = unzip: extract default ONNX models
 	optdepends = uv: run the bundled howy-enroll helper
 	optdepends = v4l-utils: inspect and tune camera controls
-	provides = howy=0.1.0.r19.g4aceddb
+	optdepends = tpm2-tss: TPM-backed systemd credential provisioning
+	provides = howy=2.0.1
+	provides = howdy=2.0.1
 	conflicts = howy
-	conflicts = howy-rocm-git
-	conflicts = howy-cuda-git
-	backup = etc/howy/config.toml
-
-pkgname = howy-rocm-git
-	pkgdesc = Linux face authentication daemon using ONNX Runtime ROCm backend
-	depends = onnxruntime-rocm
-	depends = pam
-	optdepends = curl: download default ONNX models
-	optdepends = ffmpeg: optional camera fallback when native V4L2 mmap capture fails
-	optdepends = unzip: extract default ONNX models
-	optdepends = uv: run the bundled howy-enroll helper
-	optdepends = v4l-utils: inspect and tune camera controls
-	provides = howy=0.1.0.r19.g4aceddb
-	conflicts = howy
-	conflicts = howy-cpu-git
-	conflicts = howy-cuda-git
-	backup = etc/howy/config.toml
-
-pkgname = howy-cuda-git
-	pkgdesc = Linux face authentication daemon using ONNX Runtime CUDA backend
-	depends = onnxruntime-cuda
-	depends = pam
-	optdepends = curl: download default ONNX models
-	optdepends = ffmpeg: optional camera fallback when native V4L2 mmap capture fails
-	optdepends = unzip: extract default ONNX models
-	optdepends = uv: run the bundled howy-enroll helper
-	optdepends = v4l-utils: inspect and tune camera controls
-	provides = howy=0.1.0.r19.g4aceddb
-	conflicts = howy
+	conflicts = howy-git
 	conflicts = howy-cpu-git
 	conflicts = howy-rocm-git
+	conflicts = howy-cuda-git
+	conflicts = howy-rocm-mode0
+	conflicts = howdy
+	conflicts = howdy-git
+	conflicts = howy-rocm
+	conflicts = howy-cuda
+	backup = etc/howy/config.toml
+
+pkgname = howy-rocm
+	pkgdesc = Linux face authentication daemon intended for ONNX Runtime ROCm backend
+	install = howy.install
+	depends = diffutils
+	depends = onnxruntime=1.28.0
+	depends = pam
+	depends = systemd>=261
+	optdepends = curl: download default ONNX models
+	optdepends = ffmpeg: optional camera fallback when native V4L2 mmap capture fails
+	optdepends = unzip: extract default ONNX models
+	optdepends = uv: run the bundled howy-enroll helper
+	optdepends = v4l-utils: inspect and tune camera controls
+	optdepends = tpm2-tss: TPM-backed systemd credential provisioning
+	provides = howy=2.0.1
+	provides = howdy=2.0.1
+	conflicts = howy
+	conflicts = howy-git
+	conflicts = howy-cpu-git
+	conflicts = howy-rocm-git
+	conflicts = howy-cuda-git
+	conflicts = howy-rocm-mode0
+	conflicts = howdy
+	conflicts = howdy-git
+	conflicts = howy-cpu
+	conflicts = howy-cuda
+	backup = etc/howy/config.toml
+
+pkgname = howy-cuda
+	pkgdesc = Linux face authentication daemon intended for ONNX Runtime CUDA backend
+	install = howy.install
+	depends = diffutils
+	depends = onnxruntime=1.28.0
+	depends = pam
+	depends = systemd>=261
+	optdepends = curl: download default ONNX models
+	optdepends = ffmpeg: optional camera fallback when native V4L2 mmap capture fails
+	optdepends = unzip: extract default ONNX models
+	optdepends = uv: run the bundled howy-enroll helper
+	optdepends = v4l-utils: inspect and tune camera controls
+	optdepends = tpm2-tss: TPM-backed systemd credential provisioning
+	provides = howy=2.0.1
+	provides = howdy=2.0.1
+	conflicts = howy
+	conflicts = howy-git
+	conflicts = howy-cpu-git
+	conflicts = howy-rocm-git
+	conflicts = howy-cuda-git
+	conflicts = howy-rocm-mode0
+	conflicts = howdy
+	conflicts = howdy-git
+	conflicts = howy-cpu
+	conflicts = howy-rocm
 	backup = etc/howy/config.toml

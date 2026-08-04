@@ -1,0 +1,147 @@
+pkgname=howy-rocm-mode0
+pkgver=0.1.0.r27.g0b76fa2
+pkgrel=7
+pkgdesc='Bounded Howy Mode 0/1 provisioning candidate using ONNX Runtime ROCm'
+arch=('x86_64')
+url='https://github.com/LLJY/howy'
+license=('GPL-2.0-only')
+depends=(
+  'glibc'
+  'gcc-libs'
+  'onnxruntime-opt-rocm'
+  'pam'
+  'systemd>=261'
+)
+makedepends=(
+  'cargo'
+  'clang'
+  'git'
+  'patch'
+  'protobuf'
+  'onnxruntime-opt-rocm'
+)
+provides=(
+  "howy=${pkgver}"
+  'howdy'
+)
+conflicts=(
+  'howy'
+  'howdy'
+  'howdy-git'
+  'howy-ab-rocm'
+  'howy-cpu-git'
+  'howy-rocm-git'
+  'howy-cuda-git'
+)
+replaces=('howdy-git')
+options=('!debug' '!ccache' '!distcc')
+backup=('etc/howy/config.toml')
+
+_commit='0b76fa23ad3883ccfa8edd38210766f97cdbb71a'
+source=(
+  "${pkgname}::git+https://github.com/LLJY/howy.git#commit=${_commit}"
+  'config.toml'
+  'README.md'
+  'pam-silent-mode0.patch'
+  'provision-presence.patch'
+  'failed-supervisor-recovery.patch'
+  'real-prefix-recovery.patch'
+  'systemd-socket-running.patch'
+  'package-capability.marker'
+)
+sha256sums=(
+  'SKIP'
+  '6274ba14a1fc305bdda829446e5d81a17ac62a27fe751ccfc63c6e76c2803d9d'
+  '6ad995b0f74fc0bfa538fed29562cc1ed916163e4c734d89c741515a9f0359db'
+  'f590342128d7bd9557d239bbc0445c2866e8a11237ee41674d4a22ffb7714aa0'
+  '0fd4461184697896ccb63deef7e77cd908feb47bd57cb52b00c8e4e4b8c1ac7b'
+  '6298228b7910fab52aef97e715b7e58296497df9f5f50e5f731fd5c60d6ae148'
+  'dce86a5eacd0dd7b3396e178ee6d7da5858b7301c888359cfe229e3c534f01eb'
+  'c5f616cd9300ef2d365cb07c07aef62dd31328699d0ff7e08a2d92b041711446'
+  'a64bd401c902bff59ef60e5364b16ab148a1642fdd5bde60824586a9520ca246'
+)
+
+prepare() {
+  cd "${srcdir}/${pkgname}"
+
+  local actual_commit
+  actual_commit=$(git rev-parse HEAD)
+  if [[ "${actual_commit}" != "${_commit}" ]]; then
+    printf 'source revision mismatch: expected %s, got %s\n' \
+      "${_commit}" "${actual_commit}" >&2
+    return 1
+  fi
+
+  patch -Np1 -i "${srcdir}/pam-silent-mode0.patch"
+  patch -Np1 -i "${srcdir}/provision-presence.patch"
+  patch -Np1 -i "${srcdir}/failed-supervisor-recovery.patch"
+  patch -Np1 -i "${srcdir}/real-prefix-recovery.patch"
+  patch -Np1 -i "${srcdir}/systemd-socket-running.patch"
+
+  export CARGO_HOME="${srcdir}/cargo-home"
+  export CARGO_TARGET_DIR="${srcdir}/cargo-target"
+  export CARGO_BUILD_RUSTFLAGS='-C target-cpu=x86-64'
+  export CARGO_INCREMENTAL=0
+  export ORT_LIB_PATH=/usr/lib
+  export ORT_PREFER_DYNAMIC_LINK=1
+
+  cargo fetch --locked
+}
+
+build() {
+  cd "${srcdir}/${pkgname}"
+
+  export CARGO_HOME="${srcdir}/cargo-home"
+  export CARGO_TARGET_DIR="${srcdir}/cargo-target"
+  export CARGO_BUILD_RUSTFLAGS='-C target-cpu=x86-64'
+  export CARGO_INCREMENTAL=0
+  export ORT_LIB_PATH=/usr/lib
+  export ORT_PREFER_DYNAMIC_LINK=1
+
+  cargo build --frozen --release \
+    -p howy-daemon \
+    --bin howyd
+  cargo build --frozen --release \
+    -p howy-cli \
+    --bin howy
+  cargo build --frozen --release \
+    -p howy-pam \
+    --lib
+}
+
+check() {
+  cd "${srcdir}/${pkgname}"
+
+  export CARGO_HOME="${srcdir}/cargo-home"
+  export CARGO_TARGET_DIR="${srcdir}/cargo-target"
+  export CARGO_BUILD_RUSTFLAGS='-C target-cpu=x86-64'
+  export CARGO_INCREMENTAL=0
+  export ORT_LIB_PATH=/usr/lib
+  export ORT_PREFER_DYNAMIC_LINK=1
+
+  cargo test --frozen -p howy-common -p howy-cli
+}
+
+package() {
+  local source_root="${srcdir}/${pkgname}"
+  local target="${srcdir}/cargo-target/release"
+
+  install -Dm755 "${target}/howyd" "${pkgdir}/usr/bin/howyd"
+  install -Dm755 "${target}/howy" "${pkgdir}/usr/bin/howy"
+  install -Dm644 "${target}/libpam_howy.so" \
+    "${pkgdir}/usr/lib/security/pam_howy.so"
+  ln -s pam_howy.so "${pkgdir}/usr/lib/security/pam_howdy.so"
+  install -dm700 "${pkgdir}/etc/howy"
+  install -Dm600 "${srcdir}/config.toml" \
+    "${pkgdir}/etc/howy/config.toml"
+  install -Dm644 "${source_root}/systemd/howy.service" \
+    "${pkgdir}/usr/lib/systemd/system/howy.service"
+  install -Dm644 "${source_root}/systemd/howy.socket" \
+    "${pkgdir}/usr/lib/systemd/system/howy.socket"
+  install -Dm600 "${srcdir}/package-capability.marker" \
+    "${pkgdir}/var/lib/howy-package-bootstrap.complete"
+  install -Dm644 "${srcdir}/README.md" \
+    "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 "${source_root}/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

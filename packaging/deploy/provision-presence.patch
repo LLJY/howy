@@ -1,0 +1,922 @@
+diff --git a/crates/howy-cli/src/main.rs b/crates/howy-cli/src/main.rs
+index e300aaf60e8be8ca4489fd75f1b2f0aa80e852a8..53892e3c0e3a8cb120ddac8f6732353d42bf9d2f 100644
+--- a/crates/howy-cli/src/main.rs
++++ b/crates/howy-cli/src/main.rs
+@@ -40,6 +40,21 @@ impl From<CliKeySelection> for security::KeySelection {
+     }
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
++enum CliProvisionPresence {
++    Off,
++    Confirm,
++}
++
++impl From<CliProvisionPresence> for security::ProvisionPresence {
++    fn from(value: CliProvisionPresence) -> Self {
++        match value {
++            CliProvisionPresence::Off => Self::Off,
++            CliProvisionPresence::Confirm => Self::Confirm,
++        }
++    }
++}
++
+ #[derive(Subcommand)]
+ enum SecurityCommands {
+     /// Provision an explicit storage security mode transactionally.
+@@ -48,6 +63,8 @@ enum SecurityCommands {
+         mode: u8,
+         #[arg(long, value_enum, default_value = "auto")]
+         with_key: CliKeySelection,
++        #[arg(long, value_enum)]
++        presence: Option<CliProvisionPresence>,
+         #[arg(long)]
+         adopt_existing: bool,
+     },
+@@ -210,6 +227,7 @@ fn cmd_security(command: SecurityCommands, assume_yes: bool) -> Result<()> {
+         SecurityCommands::Provision {
+             mode,
+             with_key,
++            presence,
+             adopt_existing,
+         } => {
+             let mode = match mode {
+@@ -218,6 +236,7 @@ fn cmd_security(command: SecurityCommands, assume_yes: bool) -> Result<()> {
+                 2 => security::ProvisionMode::EphemeralAead,
+                 _ => unreachable!("clap restricts security mode"),
+             };
++            let presence = resolve_provision_presence(mode, presence.map(Into::into));
+             let confirmed = if assume_yes {
+                 true
+             } else {
+@@ -230,6 +249,7 @@ fn cmd_security(command: SecurityCommands, assume_yes: bool) -> Result<()> {
+             };
+             engine.provision(security::ProvisionRequest {
+                 mode,
++                presence,
+                 with_key: with_key.into(),
+                 adopt_existing,
+                 confirmed,
+@@ -259,6 +279,18 @@ fn cmd_security(command: SecurityCommands, assume_yes: bool) -> Result<()> {
+     Ok(())
+ }
+ 
++fn resolve_provision_presence(
++    mode: security::ProvisionMode,
++    requested: Option<security::ProvisionPresence>,
++) -> security::ProvisionPresence {
++    requested.unwrap_or(match mode {
++        security::ProvisionMode::Plaintext | security::ProvisionMode::EphemeralAead => {
++            security::ProvisionPresence::Off
++        }
++        security::ProvisionMode::CachedAead => security::ProvisionPresence::Confirm,
++    })
++}
++
+ fn prompt_yes(prompt: &str) -> Result<bool> {
+     print!("{prompt}");
+     io::stdout().flush()?;
+@@ -747,8 +779,9 @@ fn configure_private_umask(command: &mut Command) {
+ #[cfg(test)]
+ mod tests {
+     use super::{
+-        Cli, Commands, SecurityCommands, configure_private_umask, select_enrollment,
+-        test_auth_request, validate_batch_enrollment_result, validate_live_enrollment_result,
++        Cli, CliProvisionPresence, Commands, SecurityCommands, configure_private_umask,
++        resolve_provision_presence, select_enrollment, test_auth_request,
++        validate_batch_enrollment_result, validate_live_enrollment_result,
+     };
+     use clap::Parser;
+     use howy_common::protocol::{
+@@ -831,6 +864,79 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn security_provision_presence_parses_and_resolves_mode_defaults() {
++        fn parse_presence(arguments: &[&str]) -> Option<CliProvisionPresence> {
++            let cli = Cli::try_parse_from(arguments).unwrap();
++            let Commands::Security {
++                command: SecurityCommands::Provision { presence, .. },
++            } = cli.command
++            else {
++                panic!("expected security provision")
++            };
++            presence
++        }
++
++        assert_eq!(
++            parse_presence(&["howy", "security", "provision", "--mode", "1"]),
++            None
++        );
++        assert_eq!(
++            parse_presence(&[
++                "howy",
++                "security",
++                "provision",
++                "--mode",
++                "1",
++                "--presence",
++                "off",
++            ]),
++            Some(CliProvisionPresence::Off)
++        );
++        assert_eq!(
++            parse_presence(&[
++                "howy",
++                "security",
++                "provision",
++                "--mode",
++                "1",
++                "--presence",
++                "confirm",
++            ]),
++            Some(CliProvisionPresence::Confirm)
++        );
++        assert!(
++            Cli::try_parse_from([
++                "howy",
++                "security",
++                "provision",
++                "--mode",
++                "1",
++                "--presence",
++                "prompt",
++            ])
++            .is_err()
++        );
++
++        use super::security::{ProvisionMode, ProvisionPresence};
++        assert_eq!(
++            resolve_provision_presence(ProvisionMode::Plaintext, None),
++            ProvisionPresence::Off
++        );
++        assert_eq!(
++            resolve_provision_presence(ProvisionMode::CachedAead, None),
++            ProvisionPresence::Confirm
++        );
++        for (mode, presence) in [
++            (ProvisionMode::Plaintext, ProvisionPresence::Off),
++            (ProvisionMode::Plaintext, ProvisionPresence::Confirm),
++            (ProvisionMode::CachedAead, ProvisionPresence::Off),
++            (ProvisionMode::CachedAead, ProvisionPresence::Confirm),
++        ] {
++            assert_eq!(resolve_provision_presence(mode, Some(presence)), presence);
++        }
++    }
++
+     #[test]
+     fn test_command_uses_only_versioned_authenticate_without_preflight_or_legacy_retry() {
+         let request = test_auth_request("alice");
+diff --git a/crates/howy-cli/src/security/engine.rs b/crates/howy-cli/src/security/engine.rs
+index c9872a45133671f4a72dca52822db26296e3e1f4..e8c151b548ade251f512675967bb8f9bcf2758a4 100644
+--- a/crates/howy-cli/src/security/engine.rs
++++ b/crates/howy-cli/src/security/engine.rs
+@@ -65,9 +65,16 @@ pub enum ProvisionMode {
+     EphemeralAead,
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ProvisionPresence {
++    Off,
++    Confirm,
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct ProvisionRequest {
+     pub mode: ProvisionMode,
++    pub presence: ProvisionPresence,
+     pub with_key: KeySelection,
+     pub adopt_existing: bool,
+     pub confirmed: bool,
+@@ -362,6 +369,13 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+                 "security mode 2 is unavailable until its feasibility gate passes".into(),
+             ));
+         }
++        if request.mode == ProvisionMode::Plaintext
++            && request.presence == ProvisionPresence::Confirm
++        {
++            return Err(SecurityError::Refused(
++                "presence confirmation is unavailable for security mode 0".into(),
++            ));
++        }
+         if !request.confirmed {
+             return Err(SecurityError::Refused(
+                 "security migration requires explicit confirmation".into(),
+@@ -869,6 +883,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+     }
+ 
+     fn provision_mode1(&mut self, request: ProvisionRequest) -> SecurityResult<SecurityOutcome> {
++        self.refuse_receipted_presence_mismatch(request.presence)?;
+         let supervisor =
+             self.begin_supervised_transaction(SupervisorOperationV1::ProvisionMode1, None)?;
+         let namespace_nonempty = self.runtime.namespace_nonempty()?;
+@@ -898,6 +913,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+             (&config, existing_receipt, &existing_artifact)
+             && receipt_matches_live(receipt, config, artifact, self.runtime)?
+         {
++            require_requested_presence(&config.bytes, request.presence)?;
+             return match receipt.state {
+                 ReceiptState::ProvisionedDisabled => self.verify_disabled_idempotent(
+                     config,
+@@ -1057,7 +1073,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+         };
+         self.runtime.boundary("credential-ready")?;
+ 
+-        let disabled_config = build_disabled_mode1_config(config.as_ref())?;
++        let disabled_config = build_disabled_mode1_config(config.as_ref(), request.presence)?;
+         let config_patch = prepare_config_enable_patch(&disabled_config)
+             .map_err(|error| SecurityError::operation(error.to_string()))?;
+         let expected_verifier = self.runtime.preview_verifier(&disabled_config)?;
+@@ -1194,6 +1210,28 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+         }
+     }
+ 
++    fn refuse_receipted_presence_mismatch(
++        &mut self,
++        requested: ProvisionPresence,
++    ) -> SecurityResult<()> {
++        let config = self
++            .runtime
++            .read_file(howy_common::paths::CONFIG_FILE, MAX_CONFIG_BYTES)?;
++        let receipt = self.read_receipt()?;
++        let (Some(config), Some(receipt)) = (config, receipt) else {
++            return Ok(());
++        };
++        config.validate_regular(0, 0, 0o600)?;
++        let expected_config = match receipt.state {
++            ReceiptState::ProvisionedDisabled => &receipt.config_patch.disabled_sha256,
++            ReceiptState::Enabled => &receipt.config_patch.enabled_sha256,
++        };
++        if config.sha256() == *expected_config {
++            require_requested_presence(&config.bytes, requested)?;
++        }
++        Ok(())
++    }
++
+     #[allow(clippy::too_many_arguments)]
+     fn verify_disabled_idempotent(
+         &mut self,
+@@ -1377,6 +1415,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+             receipt,
+             supervisor.prior_daemon_invocation_id.as_deref(),
+             &receipt.config_patch.enabled_sha256,
++            &config.bytes,
+         )?;
+         self.require_public_status(&status)?;
+         self.revalidate_receipted_live(receipt, &config.bytes, &receipt_file.sha256(), &readiness)?;
+@@ -1390,6 +1429,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+             receipt,
+             supervisor.prior_daemon_invocation_id.as_deref(),
+             &receipt.config_patch.enabled_sha256,
++            &config.bytes,
+         )?;
+         self.require_public_status(&final_status)?;
+         if final_status.daemon_invocation_id != status.daemon_invocation_id {
+@@ -1782,6 +1822,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+             enabled_receipt,
+             prior_invocation,
+             &journal.planned_hashes.enabled_config_sha256,
++            enabled_config,
+         )?;
+         self.require_public_status(&status)?;
+         self.advance_mode1(journal, JournalPhase::UnitsStarted)?;
+@@ -1813,6 +1854,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+             enabled_receipt,
+             None,
+             &journal.planned_hashes.enabled_config_sha256,
++            enabled_config,
+         )?;
+         self.require_public_status(&final_status)?;
+         if final_status.daemon_invocation_id != status.daemon_invocation_id {
+@@ -2975,6 +3017,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+                     &enabled_receipt,
+                     journal.prior_daemon_invocation_id.as_deref(),
+                     &journal.planned_hashes.enabled_config_sha256,
++                    &enabled,
+                 )?;
+                 self.require_public_status(&started_status)?;
+                 self.require_effective_mode1(&enabled_receipt.effective_units)?;
+@@ -3008,6 +3051,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+                     &enabled_receipt,
+                     journal.prior_daemon_invocation_id.as_deref(),
+                     &journal.planned_hashes.enabled_config_sha256,
++                    &enabled,
+                 )?;
+                 self.require_public_status(&final_status)?;
+                 if final_status.daemon_invocation_id != started_status.daemon_invocation_id {
+@@ -3272,7 +3316,7 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+                 "disabled daemon unexpectedly returned root status".into(),
+             ));
+         }
+-        self.require_disabled_public_status()
++        self.require_disabled_public_status(&config.bytes)
+     }
+ 
+     fn validate_disabled_live(&mut self, journal: &ProvisioningJournalV1) -> SecurityResult<()> {
+@@ -3476,13 +3520,13 @@ impl<'a, R: SecurityRuntime> SecurityEngine<'a, R> {
+         .map_err(|error| SecurityError::operation(error.to_string()))
+     }
+ 
+-    fn require_disabled_public_status(&mut self) -> SecurityResult<()> {
++    fn require_disabled_public_status(&mut self, config: &[u8]) -> SecurityResult<()> {
+         let public = self.runtime.daemon_info()?;
+         validate_daemon_info_for_activation(
+             public.as_ref(),
+             DaemonInfoExpectation {
+                 active_security_mode: EmbeddingSecurityMode::AeadCached as u32,
+-                prompt_required: true,
++                prompt_required: config_prompt_required(config)?,
+                 storage_ready: false,
+                 disabled: true,
+             },
+@@ -4577,7 +4621,10 @@ fn stable_cleanup_unit(observation: UnitObservation) -> SecurityResult<StableUni
+     })
+ }
+ 
+-fn build_disabled_mode1_config(config: Option<&ObservedFile>) -> SecurityResult<Vec<u8>> {
++fn build_disabled_mode1_config(
++    config: Option<&ObservedFile>,
++    presence: ProvisionPresence,
++) -> SecurityResult<Vec<u8>> {
+     let mut parsed = match config {
+         Some(file) => toml::from_str::<HowyConfig>(
+             std::str::from_utf8(&file.bytes)
+@@ -4590,8 +4637,11 @@ fn build_disabled_mode1_config(config: Option<&ObservedFile>) -> SecurityResult<
+     parsed.security.embedding_mode = EmbeddingSecurityMode::AeadCached;
+     parsed.security.key_epoch = MODE1_KEY_EPOCH;
+     parsed.security.cached.credential_name = MODE1_CREDENTIAL_NAME.into();
+-    parsed.presence.mode = PresenceMode::Confirm;
+-    if parsed.presence.allowed_pam_services.is_empty() {
++    parsed.presence.mode = match presence {
++        ProvisionPresence::Off => PresenceMode::Off,
++        ProvisionPresence::Confirm => PresenceMode::Confirm,
++    };
++    if presence == ProvisionPresence::Confirm && parsed.presence.allowed_pam_services.is_empty() {
+         parsed.presence.allowed_pam_services = vec!["sudo".into()];
+     }
+     parsed.validate().map_err(SecurityError::operation)?;
+@@ -4617,6 +4667,7 @@ fn build_enabled_mode0_config(config: Option<&ObservedFile>) -> SecurityResult<V
+     };
+     parsed.core.disabled = false;
+     parsed.security.embedding_mode = EmbeddingSecurityMode::Plaintext;
++    parsed.presence.mode = PresenceMode::Off;
+     parsed.validate().map_err(SecurityError::operation)?;
+     let bytes = toml::to_string_pretty(&parsed)
+         .map_err(|_| SecurityError::operation("Mode 0 configuration serialization failed"))?
+@@ -4638,6 +4689,16 @@ fn config_prompt_required(bytes: &[u8]) -> SecurityResult<bool> {
+     Ok(config.presence.mode == PresenceMode::Confirm)
+ }
+ 
++fn require_requested_presence(bytes: &[u8], requested: ProvisionPresence) -> SecurityResult<()> {
++    if config_prompt_required(bytes)? != (requested == ProvisionPresence::Confirm) {
++        return Err(SecurityError::Refused(
++            "receipted Mode 1 presence differs from the requested provision-time presence; runtime toggles are unsupported"
++                .into(),
++        ));
++    }
++    Ok(())
++}
++
+ fn bump_generation(generation: &mut u64) -> SecurityResult<()> {
+     *generation = generation
+         .checked_add(1)
+@@ -4815,16 +4876,21 @@ fn validate_enabled_status(
+     receipt: &ProvisioningReceiptV1,
+     prior_invocation: Option<&str>,
+     config_sha256: &Sha256Digest,
++    config: &[u8],
+ ) -> SecurityResult<()> {
++    let config_bytes_sha256 = Sha256Digest::from_bytes(config);
++    let prompt_required = config_prompt_required(config)?;
+     let states = status
+         .validate_strict()
+         .map_err(|error| SecurityError::operation(error.to_string()))?;
+-    if status.active_security_mode != 1
++    if config_bytes_sha256 != *config_sha256
++        || config_bytes_sha256 != receipt.config_patch.enabled_sha256
++        || status.active_security_mode != 1
+         || status.key_epoch != 1
+         || status.config_sha256 != config_sha256.as_str()
+         || status.credential_name != MODE1_CREDENTIAL_NAME
+         || status.configured_credential_source != MODE1_CREDENTIAL_PATH
+-        || !status.prompt_required
++        || status.prompt_required != prompt_required
+         || states.backend != SecurityBackendStateV1::Ready
+         || states.readiness != SecurityReadinessStateV1::Ready
+         || states.poison != SecurityPoisonStateV1::NotPoisoned
+diff --git a/crates/howy-cli/src/security/mod.rs b/crates/howy-cli/src/security/mod.rs
+index 1028eb019bf26beee29dac73c26015ea258afd61..c08f5070c52a0d4d12a7faf28c2706c629329a87 100644
+--- a/crates/howy-cli/src/security/mod.rs
++++ b/crates/howy-cli/src/security/mod.rs
+@@ -3,7 +3,9 @@ mod engine;
+ mod real;
+ 
+ pub use command::KeySelection;
+-pub use engine::{CleanupRequest, ProvisionMode, ProvisionRequest, SecurityEngine};
++pub use engine::{
++    CleanupRequest, ProvisionMode, ProvisionPresence, ProvisionRequest, SecurityEngine,
++};
+ pub use real::RealSecurityRuntime;
+ 
+ #[cfg(test)]
+diff --git a/crates/howy-cli/src/security/real_tests.rs b/crates/howy-cli/src/security/real_tests.rs
+index 48de6dd1d9fae399b71288d78acf11dbcea11397..e1cd0330133bec86ed6fa4089564025c700b43f9 100644
+--- a/crates/howy-cli/src/security/real_tests.rs
++++ b/crates/howy-cli/src/security/real_tests.rs
+@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
+ 
+ use super::*;
+ use crate::security::engine::{
+-    CleanupRequest, ProvisionMode, ProvisionRequest, SecretKeyMaterial, SecurityEngine,
+-    SecurityRuntime,
++    CleanupRequest, ProvisionMode, ProvisionPresence, ProvisionRequest, SecretKeyMaterial,
++    SecurityEngine, SecurityRuntime,
+ };
+ use howy_common::config::EmbeddingSecurityMode;
+ use howy_common::provisioning::{JournalPhase, SECURITY_RECEIPT_PATH};
+@@ -2013,6 +2013,7 @@ fn prepare_rooted_unadopted(root: &Path) -> (RootedEngineRuntime, Sha256Digest)
+         SecurityEngine::new(&mut runtime)
+             .provision(ProvisionRequest {
+                 mode: ProvisionMode::CachedAead,
++                presence: ProvisionPresence::Confirm,
+                 with_key: KeySelection::Host,
+                 adopt_existing: false,
+                 confirmed: true,
+@@ -2053,6 +2054,7 @@ fn rooted_activation_failures_recreate_and_rejournal_the_exact_guard_before_reco
+         SecurityEngine::new(&mut runtime)
+             .provision(ProvisionRequest {
+                 mode: ProvisionMode::CachedAead,
++                presence: ProvisionPresence::Confirm,
+                 with_key: KeySelection::Host,
+                 adopt_existing: false,
+                 confirmed: true,
+@@ -2117,6 +2119,7 @@ fn rooted_activation_failures_recreate_and_rejournal_the_exact_guard_before_reco
+     SecurityEngine::new(&mut blocked)
+         .provision(ProvisionRequest {
+             mode: ProvisionMode::CachedAead,
++            presence: ProvisionPresence::Confirm,
+             with_key: KeySelection::Host,
+             adopt_existing: false,
+             confirmed: true,
+@@ -2261,6 +2264,7 @@ fn full_engine_uses_rooted_real_filesystem_with_fake_transport() {
+     SecurityEngine::new(&mut runtime)
+         .provision(ProvisionRequest {
+             mode: ProvisionMode::CachedAead,
++            presence: ProvisionPresence::Confirm,
+             with_key: KeySelection::Host,
+             adopt_existing: false,
+             confirmed: true,
+@@ -2310,6 +2314,7 @@ fn full_engine_uses_rooted_real_filesystem_with_fake_transport() {
+             SecurityEngine::new(&mut crash)
+                 .provision(ProvisionRequest {
+                     mode: ProvisionMode::CachedAead,
++                    presence: ProvisionPresence::Confirm,
+                     with_key: KeySelection::Host,
+                     adopt_existing: false,
+                     confirmed: true,
+@@ -2328,6 +2333,7 @@ fn full_engine_uses_rooted_real_filesystem_with_fake_transport() {
+         SecurityEngine::new(&mut cleanup)
+             .provision(ProvisionRequest {
+                 mode: ProvisionMode::CachedAead,
++                presence: ProvisionPresence::Confirm,
+                 with_key: KeySelection::Host,
+                 adopt_existing: false,
+                 confirmed: true,
+@@ -2365,6 +2371,7 @@ fn full_engine_uses_rooted_real_filesystem_with_fake_transport() {
+         SecurityEngine::new(&mut replacement)
+             .provision(ProvisionRequest {
+                 mode: ProvisionMode::CachedAead,
++                presence: ProvisionPresence::Confirm,
+                 with_key: KeySelection::Host,
+                 adopt_existing: false,
+                 confirmed: true,
+diff --git a/crates/howy-cli/src/security/tests.rs b/crates/howy-cli/src/security/tests.rs
+index b83571ac10ee49a23a5ae099bbd18901161fe1ca..444f14663201a362f9d6aee007d6934f23dc62f4 100644
+--- a/crates/howy-cli/src/security/tests.rs
++++ b/crates/howy-cli/src/security/tests.rs
+@@ -26,8 +26,9 @@ use howy_common::provisioning::{
+ use super::command::{CommandSpec, KeySelection};
+ use super::engine::{
+     AtomicTargetObservation, AtomicWriteReconciliation, CleanupRequest, MODE0_DROPIN_BYTES,
+-    MODE1_DROPIN_BYTES, ObservedFile, ProvisionMode, ProvisionRequest, SecretKeyMaterial,
+-    SecurityEngine, SecurityError, SecurityOutcome, SecurityResult, SecurityRuntime,
++    MODE1_DROPIN_BYTES, ObservedFile, ProvisionMode, ProvisionPresence, ProvisionRequest,
++    SecretKeyMaterial, SecurityEngine, SecurityError, SecurityOutcome, SecurityResult,
++    SecurityRuntime,
+ };
+ 
+ #[derive(Clone)]
+@@ -113,6 +114,7 @@ struct FakeRuntime {
+     cleanup_mutation: Option<&'static str>,
+     cleanup_pre_guard_mutation: Option<&'static str>,
+     public_status_mutation: Option<&'static str>,
++    root_prompt_override: Option<bool>,
+ }
+ 
+ impl FakeRuntime {
+@@ -160,6 +162,7 @@ impl FakeRuntime {
+             cleanup_mutation: None,
+             cleanup_pre_guard_mutation: None,
+             public_status_mutation: None,
++            root_prompt_override: None,
+         };
+         runtime.put(
+             BASE_SERVICE_UNIT_PATH,
+@@ -1048,7 +1051,10 @@ impl SecurityRuntime for FakeRuntime {
+ 
+     fn security_info(&mut self) -> SecurityResult<Option<SecurityInfoResult>> {
+         self.events.push("security-info".into());
+-        let status = self.status();
++        let mut status = self.status();
++        if let (Some(status), Some(prompt_required)) = (&mut status, self.root_prompt_override) {
++            status.prompt_required = prompt_required;
++        }
+         self.fail_after("status")?;
+         Ok(status)
+     }
+@@ -1411,8 +1417,16 @@ fn host_envelope_text() -> Vec<u8> {
+ }
+ 
+ fn provision(runtime: &mut FakeRuntime) -> SecurityResult<SecurityOutcome> {
++    provision_with_presence(runtime, ProvisionPresence::Confirm)
++}
++
++fn provision_with_presence(
++    runtime: &mut FakeRuntime,
++    presence: ProvisionPresence,
++) -> SecurityResult<SecurityOutcome> {
+     SecurityEngine::new(runtime).provision(ProvisionRequest {
+         mode: ProvisionMode::CachedAead,
++        presence,
+         with_key: KeySelection::Host,
+         adopt_existing: false,
+         confirmed: true,
+@@ -1424,6 +1438,7 @@ fn mode2_refuses_before_lock_or_any_persistent_side_effect() {
+     let mut runtime = FakeRuntime::fresh();
+     let result = SecurityEngine::new(&mut runtime).provision(ProvisionRequest {
+         mode: ProvisionMode::EphemeralAead,
++        presence: ProvisionPresence::Off,
+         with_key: KeySelection::Auto,
+         adopt_existing: false,
+         confirmed: true,
+@@ -1434,6 +1449,27 @@ fn mode2_refuses_before_lock_or_any_persistent_side_effect() {
+     assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+ }
+ 
++#[test]
++fn mode0_confirm_refuses_before_any_durable_or_key_mutation() {
++    let mut runtime = FakeRuntime::fresh();
++    let result = SecurityEngine::new(&mut runtime).provision(ProvisionRequest {
++        mode: ProvisionMode::Plaintext,
++        presence: ProvisionPresence::Confirm,
++        with_key: KeySelection::Auto,
++        adopt_existing: false,
++        confirmed: true,
++    });
++
++    assert!(matches!(result, Err(SecurityError::Refused(_))));
++    assert_eq!(runtime.events, ["require-root"]);
++    assert!(!runtime.locked);
++    assert_eq!(runtime.transaction_id_counter, 0);
++    assert!(runtime.directories.is_empty());
++    assert!(!runtime.files.contains_key(SECURITY_JOURNAL_PATH));
++    assert!(!runtime.files.contains_key(SECURITY_TRANSACTION_GUARD_PATH));
++    assert!(!runtime.files.contains_key(MODE1_CREDENTIAL_PATH));
++}
++
+ #[test]
+ fn fresh_mode1_provisions_exact_disabled_objects_without_secret_records() {
+     let mut runtime = FakeRuntime::fresh();
+@@ -1510,6 +1546,65 @@ fn fresh_mode1_provisions_exact_disabled_objects_without_secret_records() {
+     }));
+ }
+ 
++#[test]
++fn mode1_presence_controls_allowlist_and_receipts_disabled_and_enabled_configs() {
++    let mut runtime = FakeRuntime::fresh();
++    let mut prior = HowyConfig::legacy_defaults();
++    prior.presence.allowed_pam_services.clear();
++    let prior = toml::to_string_pretty(&prior).unwrap();
++    runtime.put(howy_common::paths::CONFIG_FILE, prior.as_bytes(), 0o600);
++
++    provision_with_presence(&mut runtime, ProvisionPresence::Off).unwrap();
++    let disabled_bytes = runtime.files[howy_common::paths::CONFIG_FILE].bytes.clone();
++    let disabled: HowyConfig =
++        toml::from_str(std::str::from_utf8(&disabled_bytes).unwrap()).unwrap();
++    assert!(disabled.core.disabled);
++    assert_eq!(
++        disabled.presence.mode,
++        howy_common::config::PresenceMode::Off
++    );
++    assert!(disabled.presence.allowed_pam_services.is_empty());
++    let disabled_receipt = runtime.receipt();
++    assert_eq!(disabled_receipt.state, ReceiptState::ProvisionedDisabled);
++    assert_eq!(
++        disabled_receipt.config_patch.disabled_sha256,
++        Sha256Digest::from_bytes(&disabled_bytes)
++    );
++
++    SecurityEngine::new(&mut runtime).enable().unwrap();
++    let enabled_bytes = runtime.files[howy_common::paths::CONFIG_FILE].bytes.clone();
++    let enabled: HowyConfig = toml::from_str(std::str::from_utf8(&enabled_bytes).unwrap()).unwrap();
++    assert!(!enabled.core.disabled);
++    assert_eq!(
++        enabled.presence.mode,
++        howy_common::config::PresenceMode::Off
++    );
++    assert!(enabled.presence.allowed_pam_services.is_empty());
++    let enabled_receipt = runtime.receipt();
++    assert_eq!(enabled_receipt.state, ReceiptState::Enabled);
++    assert_eq!(
++        enabled_receipt.config_patch.enabled_sha256,
++        Sha256Digest::from_bytes(&enabled_bytes)
++    );
++    assert!(!runtime.status().unwrap().prompt_required);
++
++    let mut confirm = FakeRuntime::fresh();
++    let mut prior = HowyConfig::legacy_defaults();
++    prior.presence.allowed_pam_services.clear();
++    let prior = toml::to_string_pretty(&prior).unwrap();
++    confirm.put(howy_common::paths::CONFIG_FILE, prior.as_bytes(), 0o600);
++    provision_with_presence(&mut confirm, ProvisionPresence::Confirm).unwrap();
++    let config: HowyConfig = toml::from_str(
++        std::str::from_utf8(&confirm.files[howy_common::paths::CONFIG_FILE].bytes).unwrap(),
++    )
++    .unwrap();
++    assert_eq!(
++        config.presence.mode,
++        howy_common::config::PresenceMode::Confirm
++    );
++    assert_eq!(config.presence.allowed_pam_services, ["sudo"]);
++}
++
+ #[test]
+ fn guarded_snapshot_precedes_stop_and_units_stopped_precedes_directory_creation() {
+     let mut runtime = FakeRuntime::fresh();
+@@ -1624,6 +1719,7 @@ fn fresh_directory_metadata_is_exact_and_rollback_removes_only_created_empty_pat
+         SecurityEngine::new(&mut rollback)
+             .provision(ProvisionRequest {
+                 mode: ProvisionMode::Plaintext,
++                presence: ProvisionPresence::Off,
+                 with_key: KeySelection::Auto,
+                 adopt_existing: false,
+                 confirmed: true,
+@@ -1645,6 +1741,7 @@ fn fresh_directory_metadata_is_exact_and_rollback_removes_only_created_empty_pat
+         SecurityEngine::new(&mut preserve)
+             .provision(ProvisionRequest {
+                 mode: ProvisionMode::Plaintext,
++                presence: ProvisionPresence::Off,
+                 with_key: KeySelection::Auto,
+                 adopt_existing: false,
+                 confirmed: true,
+@@ -1723,7 +1820,12 @@ fn provision_then_enable_reruns_readiness_patches_one_token_and_validates_status
+     assert_eq!(enabled.len(), disabled.len() + 1);
+     let config: HowyConfig = toml::from_str(std::str::from_utf8(enabled).unwrap()).unwrap();
+     assert!(!config.core.disabled);
++    assert_eq!(
++        config.presence.mode,
++        howy_common::config::PresenceMode::Confirm
++    );
+     assert_eq!(runtime.receipt().state, ReceiptState::Enabled);
++    assert!(runtime.status().unwrap().prompt_required);
+     assert_eq!(
+         runtime
+             .events
+@@ -1775,6 +1877,7 @@ fn activation_rejects_every_malformed_or_mismatched_public_status() {
+     assert!(matches!(
+         SecurityEngine::new(&mut mode0).provision(ProvisionRequest {
+             mode: ProvisionMode::Plaintext,
++            presence: ProvisionPresence::Off,
+             with_key: KeySelection::Auto,
+             adopt_existing: false,
+             confirmed: true,
+@@ -1827,6 +1930,61 @@ fn disabled_reprovision_is_idempotent_strong_reverification_without_replacement(
+     );
+ }
+ 
++#[test]
++fn mode1_reprovision_requires_the_exact_receipted_presence_before_mutation() {
++    fn assert_mismatch_refused_without_mutation(runtime: &mut FakeRuntime) {
++        let files_before: BTreeMap<_, _> = runtime
++            .files
++            .iter()
++            .map(|(path, file)| (path.clone(), file.bytes.clone()))
++            .collect();
++        let directories_before = runtime.directories.clone();
++        let transactions_before = runtime.transaction_id_counter;
++        runtime.events.clear();
++
++        let result = provision_with_presence(runtime, ProvisionPresence::Confirm);
++
++        assert!(matches!(result, Err(SecurityError::Refused(_))));
++        assert_eq!(runtime.transaction_id_counter, transactions_before);
++        assert_eq!(runtime.directories, directories_before);
++        assert_eq!(
++            runtime
++                .files
++                .iter()
++                .map(|(path, file)| (path.clone(), file.bytes.clone()))
++                .collect::<BTreeMap<_, _>>(),
++            files_before
++        );
++        assert!(runtime.events.iter().all(|event| {
++            event != "guard:create"
++                && event != "journal:sync"
++                && event != "rng-mlock"
++                && event != "systemd-creds"
++                && !event.starts_with("directory:ensure:")
++        }));
++    }
++
++    let mut runtime = FakeRuntime::fresh();
++    provision_with_presence(&mut runtime, ProvisionPresence::Off).unwrap();
++    assert!(
++        provision_with_presence(&mut runtime, ProvisionPresence::Off)
++            .unwrap()
++            .messages[0]
++            .contains("reverified")
++    );
++    let mut disabled_mismatch = runtime.clone();
++    assert_mismatch_refused_without_mutation(&mut disabled_mismatch);
++
++    SecurityEngine::new(&mut runtime).enable().unwrap();
++    assert!(
++        provision_with_presence(&mut runtime, ProvisionPresence::Off)
++            .unwrap()
++            .messages[0]
++            .contains("strongly reverified")
++    );
++    assert_mismatch_refused_without_mutation(&mut runtime);
++}
++
+ #[test]
+ fn final_disabled_namespace_mismatch_reguards_stops_and_retains_recovery() {
+     let mut runtime = FakeRuntime::fresh();
+@@ -1917,12 +2075,17 @@ fn cleanup_refuses_path_replacement_between_admission_and_unlink() {
+ #[test]
+ fn explicit_mode0_is_transactional_keyless_and_preserves_encrypted_artifact() {
+     let mut runtime = FakeRuntime::fresh();
++    let mut prior = HowyConfig::legacy_defaults();
++    prior.presence.mode = howy_common::config::PresenceMode::Confirm;
++    let prior = toml::to_string_pretty(&prior).unwrap();
++    runtime.put(howy_common::paths::CONFIG_FILE, prior.as_bytes(), 0o600);
+     runtime.put(MODE1_CREDENTIAL_PATH, &host_envelope_text(), 0o600);
+     runtime.put(MODE1_DROPIN_PATH, MODE1_DROPIN_BYTES, 0o600);
+     let artifact_before = runtime.files[MODE1_CREDENTIAL_PATH].bytes.clone();
+     let outcome = SecurityEngine::new(&mut runtime)
+         .provision(ProvisionRequest {
+             mode: ProvisionMode::Plaintext,
++            presence: ProvisionPresence::Off,
+             with_key: KeySelection::Auto,
+             adopt_existing: false,
+             confirmed: true,
+@@ -1940,6 +2103,7 @@ fn explicit_mode0_is_transactional_keyless_and_preserves_encrypted_artifact() {
+         EmbeddingSecurityMode::Plaintext
+     );
+     assert!(!config.core.disabled);
++    assert_eq!(config.presence.mode, howy_common::config::PresenceMode::Off);
+     assert!(runtime.commands.is_empty());
+ }
+ 
+@@ -1951,6 +2115,7 @@ fn explicit_mode0_refuses_unsafe_config_metadata_before_journaling() {
+ 
+     let result = SecurityEngine::new(&mut runtime).provision(ProvisionRequest {
+         mode: ProvisionMode::Plaintext,
++        presence: ProvisionPresence::Off,
+         with_key: KeySelection::Auto,
+         adopt_existing: false,
+         confirmed: true,
+@@ -2113,6 +2278,7 @@ fn recovery_rejects_invocation_presence_mismatches_for_every_journal_schema() {
+         SecurityEngine::new(&mut mode0_runtime)
+             .provision(ProvisionRequest {
+                 mode: ProvisionMode::Plaintext,
++                presence: ProvisionPresence::Off,
+                 with_key: KeySelection::Auto,
+                 adopt_existing: false,
+                 confirmed: true,
+@@ -2155,6 +2321,7 @@ fn existing_artifact_requires_explicit_adoption() {
+ 
+     let result = SecurityEngine::new(&mut runtime).provision(ProvisionRequest {
+         mode: ProvisionMode::CachedAead,
++        presence: ProvisionPresence::Confirm,
+         with_key: KeySelection::Host,
+         adopt_existing: true,
+         confirmed: true,
+@@ -2182,6 +2349,7 @@ fn different_mode_artifact_never_bypasses_explicit_adoption_and_readiness() {
+     SecurityEngine::new(&mut runtime)
+         .provision(ProvisionRequest {
+             mode: ProvisionMode::CachedAead,
++            presence: ProvisionPresence::Confirm,
+             with_key: KeySelection::Host,
+             adopt_existing: true,
+             confirmed: true,
+@@ -2225,6 +2393,7 @@ fn different_mode_receipt_alone_is_not_live_binding_or_implicit_adoption() {
+     SecurityEngine::new(&mut runtime)
+         .provision(ProvisionRequest {
+             mode: ProvisionMode::CachedAead,
++            presence: ProvisionPresence::Confirm,
+             with_key: KeySelection::Host,
+             adopt_existing: true,
+             confirmed: true,
+@@ -2356,6 +2525,7 @@ fn every_mode0_boundary_crash_recovers_without_deleting_encrypted_data() {
+     SecurityEngine::new(&mut baseline)
+         .provision(ProvisionRequest {
+             mode: ProvisionMode::Plaintext,
++            presence: ProvisionPresence::Off,
+             with_key: KeySelection::Auto,
+             adopt_existing: false,
+             confirmed: true,
+@@ -2368,6 +2538,7 @@ fn every_mode0_boundary_crash_recovers_without_deleting_encrypted_data() {
+         runtime.crash_at = Some(crash_at);
+         let result = SecurityEngine::new(&mut runtime).provision(ProvisionRequest {
+             mode: ProvisionMode::Plaintext,
++            presence: ProvisionPresence::Off,
+             with_key: KeySelection::Auto,
+             adopt_existing: false,
+             confirmed: true,
+@@ -2536,6 +2707,7 @@ fn activation_and_restore_failures_always_reguard_stop_and_retain_the_journal()
+     assert!(matches!(
+         SecurityEngine::new(&mut mode0).provision(ProvisionRequest {
+             mode: ProvisionMode::Plaintext,
++            presence: ProvisionPresence::Off,
+             with_key: KeySelection::Auto,
+             adopt_existing: false,
+             confirmed: true,
+@@ -2585,6 +2757,7 @@ fn terminal_unit_restore_journals_recover_idempotently_before_removal() {
+     assert!(matches!(
+         SecurityEngine::new(&mut mode0).provision(ProvisionRequest {
+             mode: ProvisionMode::Plaintext,
++            presence: ProvisionPresence::Off,
+             with_key: KeySelection::Auto,
+             adopt_existing: false,
+             confirmed: true,
+@@ -2805,6 +2978,7 @@ fn active_reverification_and_mode0_reject_an_old_daemon_invocation() {
+     assert!(matches!(
+         SecurityEngine::new(&mut mode0).provision(ProvisionRequest {
+             mode: ProvisionMode::Plaintext,
++            presence: ProvisionPresence::Off,
+             with_key: KeySelection::Auto,
+             adopt_existing: false,
+             confirmed: true,
+@@ -2914,6 +3088,52 @@ fn recovery_revalidates_disabled_artifacts_after_rerunning_readiness() {
+     assert!(runtime.files.contains_key(SECURITY_JOURNAL_PATH));
+ }
+ 
++#[test]
++fn mode1_off_disabled_and_enabled_recovery_revalidate_exact_prompt_status() {
++    let mut disabled = FakeRuntime::fresh();
++    disabled.fail_after = Some("disabled-units-restored");
++    assert!(matches!(
++        provision_with_presence(&mut disabled, ProvisionPresence::Off),
++        Err(SecurityError::Uncertain(_))
++    ));
++    SecurityEngine::new(&mut disabled).recover().unwrap();
++    let disabled_config: HowyConfig = toml::from_str(
++        std::str::from_utf8(&disabled.files[howy_common::paths::CONFIG_FILE].bytes).unwrap(),
++    )
++    .unwrap();
++    assert!(disabled_config.core.disabled);
++    assert_eq!(
++        disabled_config.presence.mode,
++        howy_common::config::PresenceMode::Off
++    );
++    assert_eq!(disabled.receipt().state, ReceiptState::ProvisionedDisabled);
++
++    let mut activation = FakeRuntime::fresh();
++    provision_with_presence(&mut activation, ProvisionPresence::Off).unwrap();
++    activation.fail_after = Some("status");
++    assert!(matches!(
++        SecurityEngine::new(&mut activation).enable(),
++        Err(SecurityError::Uncertain(_))
++    ));
++    let mut mismatched = activation.clone();
++
++    SecurityEngine::new(&mut activation).recover().unwrap();
++    assert_eq!(activation.receipt().state, ReceiptState::Enabled);
++    assert!(!activation.status().unwrap().prompt_required);
++
++    mismatched.root_prompt_override = Some(true);
++    assert!(matches!(
++        SecurityEngine::new(&mut mismatched).recover(),
++        Err(SecurityError::Uncertain(_))
++    ));
++    assert!(mismatched.files.contains_key(SECURITY_JOURNAL_PATH));
++    assert!(
++        mismatched
++            .files
++            .contains_key(SECURITY_TRANSACTION_GUARD_PATH)
++    );
++}
++
+ #[test]
+ fn cleanup_requeries_and_refuses_malformed_concurrent_references() {
+     for mutation in ["config-malformed", "receipt-malformed", "dropin-malformed"] {
+@@ -3157,6 +3377,7 @@ fn mode0_clears_credentials_without_parsing_or_deleting_a_corrupt_mode1_artifact
+     SecurityEngine::new(&mut runtime)
+         .provision(ProvisionRequest {
+             mode: ProvisionMode::Plaintext,
++            presence: ProvisionPresence::Off,
+             with_key: KeySelection::Auto,
+             adopt_existing: false,
+             confirmed: true,
