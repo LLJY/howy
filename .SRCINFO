@@ -11,7 +11,7 @@ pkgbase = howy
 	makedepends = onnxruntime=1.28.0
 	makedepends = protobuf
 	makedepends = systemd>=261
-	source = howy::git+https://github.com/LLJY/howy.git#commit=d2a2f073032781145c17dc20209cfab332801794
+	source = howy::git+https://github.com/LLJY/howy.git#commit=623bb91ab6ef15b0fad6199df37e687445975f12
 	sha256sums = SKIP
 
 pkgname = howy-cpu
