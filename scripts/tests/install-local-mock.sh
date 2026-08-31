@@ -230,7 +230,7 @@ pacman() {
     [ "$#" -eq 3 ] && [ "$1" = -Qo ] && [ "$2" = -- ] \
         || fail "unexpected pacman invocation: $*"
     if [ "$3" = "${MOCK_PACMAN_OWNED_PATH}" ]; then
-        printf '%s is owned by howy-rocm 2.0.1-1\n' "$3"
+        printf '%s is owned by howy-rocm 2.0.1-2\n' "$3"
         return 0
     fi
     if [ "$3" = "${MOCK_PACMAN_ERROR_PATH}" ]; then

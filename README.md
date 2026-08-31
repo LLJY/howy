@@ -66,17 +66,17 @@ persistent `.mxr` compiled-model cache on subsequent boots.
 
 ## Install and Run on Arch Linux
 
-The canonical release is the `2.0.1-1` Arch split package family:
+The canonical release is the `2.0.1-2` Arch split package family:
 
 | Intended ONNX Runtime path | Howy archive |
 |----------------------------|--------------|
-| CPU | `howy-cpu-2.0.1-1-x86_64.pkg.tar.zst` |
-| ROCm/MIGraphX | `howy-rocm-2.0.1-1-x86_64.pkg.tar.zst` |
-| CUDA | `howy-cuda-2.0.1-1-x86_64.pkg.tar.zst` |
+| CPU | `howy-cpu-2.0.1-2-x86_64.pkg.tar.zst` |
+| ROCm/MIGraphX | `howy-rocm-2.0.1-2-x86_64.pkg.tar.zst` |
+| CUDA | `howy-cuda-2.0.1-2-x86_64.pkg.tar.zst` |
 
 Install or choose the desired system ONNX Runtime provider first. Every Howy
-variant depends on the exact virtual capability `onnxruntime=1.28.0`; for
-example, `onnxruntime-opt-rocm` version 1.28.0 provides that capability. The
+variant depends on the exact virtual capability `onnxruntime=1.29.0`; for
+example, `onnxruntime-opt-rocm` version 1.29.0 provides that capability. The
 exact dependency prevents a provider with incompatible versioned C API symbols
 from silently replacing the library used to build Howy. The Howy variant name
 records the intended provider but does not install, switch, or override the
@@ -94,8 +94,8 @@ makepkg --cleanbuild --clean
 ```bash
 # Example: confirm the ROCm provider and required virtual capability, then install.
 pacman -Q onnxruntime-opt-rocm
-pacman -T 'onnxruntime=1.28.0'
-sudo pacman -U ./howy-rocm-2.0.1-1-x86_64.pkg.tar.zst
+pacman -T 'onnxruntime=1.29.0'
+sudo pacman -U ./howy-rocm-2.0.1-2-x86_64.pkg.tar.zst
 ```
 
 Use `pacman -U` only for a fresh install with no existing Howy package/control
@@ -103,55 +103,18 @@ state. Substitute the archive matching the provider selected above.
 
 ### Supported updates
 
-Do not update a predecessor or an installed v2 package with raw `pacman -U`.
-Release-N and candidate predecessors do not contain the updater. For the first
-v2 migration, run it from the checked-out v2 release or use the standalone
-helper distributed beside the release archive:
+Do not update an installed Howy package with raw `pacman -U`. The
+`2.0.1-1` → `2.0.1-2` change is an ONNX Runtime ABI rebuild: publish the
+matching Howy archive through a temporary local repository and perform one full
+`pacman -Syu` transaction so Howy, ONNX Runtime, protobuf, and related ABI
+packages move together. Stop both Howy units first, suppress only the installed
+`00-howy-update-admission.hook` for that transaction, then run
+`howy package reconcile` and restore the prior unit intent. The release process
+verifies the exact old hook bytes before applying that one-transaction override.
 
-```bash
-# From the v2 release checkout:
-sudo ./scripts/howy-v2-update ./howy-rocm-2.0.1-1-x86_64.pkg.tar.zst
-
-# Or with the standalone helper beside the downloaded archive:
-sudo ./howy-v2-update ./howy-rocm-2.0.1-1-x86_64.pkg.tar.zst
-```
-
-The installed v2.0.0 helper predates the v2.0.1 admission bridge. Use the
-v2.0.1 checkout or standalone helper shown above for the first
-`2.0.0-1` → `2.0.1-1` update. After v2.0.1 is installed, later same-v2
-updates use the installed helper:
-
-```bash
-sudo howy-v2-update ./howy-rocm-2.0.1-1-x86_64.pkg.tar.zst
-```
-
-Verify downloaded helpers and archives against their published SHA-256
-checksums before running them.
-
-The helper accepts relative or absolute archive paths. It supports the exact
-matching transition from release-N `howy-{cpu,rocm,cuda}-git`
-`0.1.0.r26.g2dfe39e-1`, ROCm candidate `howy-rocm-mode0` revisions 4–7, or the
-same installed stable v2 variant. Cross-variant, skipped, partial, and unknown
-states are refused before pacman runs.
-
-The helper verifies the package identity/version and archive SHA-256, preserves
-configuration, receipt, data, and unit intent, supplies the expected conflict
-answer to pacman, and reconciles security receipts against the installed v2
-bytes. Transitional systemd states are normalized to stable active/inactive
-intent rather than blocking recovery. Mode 1 reconciliation preserves the
-existing authenticated AEAD evidence while rebinding package-derived daemon,
-unit, and drop-in identities. Migrating legacy candidate Mode 0 atomically adds
-only the explicit empty-credential drop-in; it does not change embedding mode or
-migrate model or enrollment data.
-
-Any failure after backup creation leaves the units stopped and retains
-`/var/lib/howy/v2-update-backup-v1`. After inspecting the reported state, rerun
-the updater with the exact same archive. The helper always reruns that exact
-archive through pacman. If the predecessor remains installed, it repeats the
-original transition and restores the backed-up config while verifying receipt
-preservation. If the target is installed, it reruns a same-name stable update
-and retains the live config and receipt rather than restoring stale snapshots.
-Successful finalization removes the exact retained backup.
+The historical `howy-v2-update` helper remains for the earlier migrations that
+end at `2.0.1-1`; it is not the ORT 1.29 migration runner. Verify archives
+against their published SHA-256 checksums before installing them.
 
 ### Initial setup and daemon activation
 

@@ -1880,6 +1880,7 @@ assert_contains 'PKGBUILD canonical base' "${pkgbuild_text}" 'pkgbase=howy'
 assert_contains 'PKGBUILD canonical variants' "${pkgbuild_text}" \
     'pkgname=(howy-cpu howy-rocm howy-cuda)'
 assert_contains 'PKGBUILD exact version' "${pkgbuild_text}" 'pkgver=2.0.1'
+assert_contains 'PKGBUILD ABI rebuild release' "${pkgbuild_text}" 'pkgrel=2'
 assert_not_contains 'PKGBUILD has zero automatic replacements' "${pkgbuild_text}" 'replaces='
 assert_contains 'relative PAM compatibility alias' "${pkgbuild_text}" \
     'ln -s pam_howy.so "${pkgdir}/usr/lib/security/pam_howdy.so"'
@@ -1896,9 +1897,9 @@ assert_contains 'removal hook package path and mode' "${pkgbuild_text}" \
 assert_count 'config backup declarations' "${pkgbuild_text}" \
     "backup=('etc/howy/config.toml')" 3
 assert_count 'PKGBUILD ABI-pinned virtual ONNX Runtime build dependency' "${pkgbuild_text}" \
-    "  'onnxruntime=1.28.0'" 1
+    "  'onnxruntime=1.29.0'" 1
 assert_count 'PKGBUILD ABI-pinned virtual ONNX Runtime runtime dependencies' "${pkgbuild_text}" \
-    "  depends=('diffutils' 'onnxruntime=1.28.0' 'pam' 'systemd>=261')" 3
+    "  depends=('diffutils' 'onnxruntime=1.29.0' 'pam' 'systemd>=261')" 3
 assert_count 'PKGBUILD direct diffutils runtime dependencies' "${pkgbuild_text}" \
     "'diffutils'" 3
 for concrete_runtime in onnxruntime-cpu onnxruntime-rocm onnxruntime-cuda; do
@@ -1915,9 +1916,9 @@ assert_count '.SRCINFO config backup declarations' "${srcinfo_text}" \
     $'\tbackup = etc/howy/config.toml' 3
 assert_count '.SRCINFO has zero automatic replacements' "${srcinfo_text}" $'\treplaces = ' 0
 assert_count '.SRCINFO ABI-pinned virtual ONNX Runtime build dependency' "${srcinfo_text}" \
-    $'\tmakedepends = onnxruntime=1.28.0' 1
+    $'\tmakedepends = onnxruntime=1.29.0' 1
 assert_count '.SRCINFO ABI-pinned virtual ONNX Runtime runtime dependencies' "${srcinfo_text}" \
-    $'\tdepends = onnxruntime=1.28.0' 3
+    $'\tdepends = onnxruntime=1.29.0' 3
 assert_count '.SRCINFO direct diffutils runtime dependencies' "${srcinfo_text}" \
     $'\tdepends = diffutils' 3
 for concrete_runtime in onnxruntime-cpu onnxruntime-rocm onnxruntime-cuda; do

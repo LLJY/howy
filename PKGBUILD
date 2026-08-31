@@ -1,7 +1,7 @@
 pkgbase=howy
 pkgname=(howy-cpu howy-rocm howy-cuda)
 pkgver=2.0.1
-pkgrel=1
+pkgrel=2
 pkgdesc='Linux face authentication daemon — a howdy replacement'
 arch=('x86_64')
 url='https://github.com/LLJY/howy'
@@ -10,7 +10,7 @@ makedepends=(
   'cargo'
   'clang'
   'git'
-  'onnxruntime=1.28.0'
+  'onnxruntime=1.29.0'
   'protobuf'
   'systemd>=261'
 )
@@ -95,7 +95,7 @@ _package_common() {
 
 package_howy-cpu() {
   pkgdesc='Linux face authentication daemon intended for ONNX Runtime CPU backend'
-  depends=('diffutils' 'onnxruntime=1.28.0' 'pam' 'systemd>=261')
+  depends=('diffutils' 'onnxruntime=1.29.0' 'pam' 'systemd>=261')
   optdepends=(
     'curl: download default ONNX models'
     'ffmpeg: optional camera fallback when native V4L2 mmap capture fails'
@@ -125,7 +125,7 @@ package_howy-cpu() {
 
 package_howy-rocm() {
   pkgdesc='Linux face authentication daemon intended for ONNX Runtime ROCm backend'
-  depends=('diffutils' 'onnxruntime=1.28.0' 'pam' 'systemd>=261')
+  depends=('diffutils' 'onnxruntime=1.29.0' 'pam' 'systemd>=261')
   optdepends=(
     'curl: download default ONNX models'
     'ffmpeg: optional camera fallback when native V4L2 mmap capture fails'
@@ -155,7 +155,7 @@ package_howy-rocm() {
 
 package_howy-cuda() {
   pkgdesc='Linux face authentication daemon intended for ONNX Runtime CUDA backend'
-  depends=('diffutils' 'onnxruntime=1.28.0' 'pam' 'systemd>=261')
+  depends=('diffutils' 'onnxruntime=1.29.0' 'pam' 'systemd>=261')
   optdepends=(
     'curl: download default ONNX models'
     'ffmpeg: optional camera fallback when native V4L2 mmap capture fails'
